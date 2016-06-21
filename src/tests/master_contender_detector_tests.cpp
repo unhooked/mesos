@@ -24,6 +24,8 @@
 #include <mesos/executor.hpp>
 #include <mesos/scheduler.hpp>
 
+#include <mesos/zookeeper/contender.hpp>
+
 #include <process/clock.hpp>
 #include <process/future.hpp>
 #include <process/owned.hpp>
@@ -33,16 +35,18 @@
 #include <stout/duration.hpp>
 #include <stout/gtest.hpp>
 #include <stout/nothing.hpp>
-#include <stout/os.hpp>
 #include <stout/path.hpp>
-#include <stout/protobuf.hpp>
 #include <stout/try.hpp>
 
 #include "common/protobuf_utils.hpp"
 
-#include "master/contender.hpp"
-#include "master/detector.hpp"
 #include "master/master.hpp"
+
+#include "master/contender/standalone.hpp"
+#include "master/contender/zookeeper.hpp"
+
+#include "master/detector/standalone.hpp"
+#include "master/detector/zookeeper.hpp"
 
 #include "messages/messages.hpp"
 
@@ -58,6 +62,16 @@ using namespace zookeeper;
 using mesos::internal::master::Master;
 
 using mesos::internal::slave::Slave;
+
+using mesos::master::contender::MASTER_CONTENDER_ZK_SESSION_TIMEOUT;
+using mesos::master::contender::MasterContender;
+using mesos::master::contender::StandaloneMasterContender;
+using mesos::master::contender::ZooKeeperMasterContender;
+
+using mesos::master::detector::MASTER_DETECTOR_ZK_SESSION_TIMEOUT;
+using mesos::master::detector::MasterDetector;
+using mesos::master::detector::StandaloneMasterDetector;
+using mesos::master::detector::ZooKeeperMasterDetector;
 
 using process::Clock;
 using process::Future;
@@ -297,7 +311,7 @@ TEST_F(ZooKeeperMasterContenderDetectorTest, ContenderPendingElection)
 
   EXPECT_TRUE(contended.isPending());
 
-  process::filter(NULL);
+  process::filter(nullptr);
 
   process::TestsFilter* filter =
     process::FilterTestEventListener::instance()->install();
@@ -426,7 +440,7 @@ TEST_F(ZooKeeperMasterContenderDetectorTest, NonRetryableFrrors)
                          "42",
                          (ACL_vector) {1, onlyCreatorCanAccess},
                          0,
-                         NULL);
+                         nullptr);
   ASSERT_ZK_GET("42", &authenticatedZk, "/test");
 
   // group3 cannot read the base path thus detector should fail.

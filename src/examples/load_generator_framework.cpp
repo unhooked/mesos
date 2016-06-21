@@ -132,7 +132,7 @@ class LoadGeneratorScheduler : public Scheduler
 {
 public:
   LoadGeneratorScheduler(double _qps, const Option<Duration>& _duration)
-    : generator(NULL), qps(_qps), duration(_duration) {}
+    : generator(nullptr), qps(_qps), duration(_duration) {}
 
   virtual ~LoadGeneratorScheduler()
   {
@@ -145,7 +145,7 @@ public:
   {
     LOG(INFO) << "Registered with " << masterInfo.pid();
 
-    if (generator == NULL) {
+    if (generator == nullptr) {
       LOG(INFO) << "Starting LoadGenerator at QPS: " << qps;
 
       generator = new LoadGenerator(driver, qps, duration);
@@ -158,7 +158,7 @@ public:
   {
     LOG(INFO) << "Reregistered with " << masterInfo.pid();
 
-    if (generator == NULL) {
+    if (generator == nullptr) {
       LOG(INFO) << "Starting LoadGenerator at QPS: " << qps;
       generator = new LoadGenerator(driver, qps, duration);
     }
@@ -169,7 +169,7 @@ public:
     LOG(INFO) << "Disconnected!";
 
     delete generator;
-    generator = NULL;
+    generator = nullptr;
 
     LOG(INFO) << "Stopped LoadGenerator";
   }
@@ -214,7 +214,7 @@ public:
   {
     // Terminating process with EXIT here because we cannot interrupt
     // LoadGenerator's long-running loop.
-    EXIT(1) << "Error received: " << error;
+    EXIT(EXIT_FAILURE) << "Error received: " << error;
   }
 
 private:
@@ -284,7 +284,7 @@ int main(int argc, char** argv)
 {
   Flags flags;
 
-  Try<Nothing> load = flags.load("MESOS_", argc, argv);
+  Try<flags::Warnings> load = flags.load("MESOS_", argc, argv);
 
   if (load.isError()) {
     cerr << flags.usage(load.error()) << endl;
@@ -313,6 +313,11 @@ int main(int argc, char** argv)
 
   // We want the logger to catch failure signals.
   mesos::internal::logging::initialize(argv[0], flags, true);
+
+  // Log any flag warnings (after logging is initialized).
+  foreach (const flags::Warning& warning, load->warnings) {
+    LOG(WARNING) << warning.message;
+  }
 
   LoadGeneratorScheduler scheduler(flags.qps.get(), flags.duration);
 

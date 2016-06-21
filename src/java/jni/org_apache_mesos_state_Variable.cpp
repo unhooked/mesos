@@ -18,9 +18,9 @@
 
 #include <string>
 
-#include "state/state.hpp"
+#include <mesos/state/state.hpp>
 
-using namespace mesos::internal::state;
+using mesos::state::Variable;
 
 extern "C" {
 
@@ -62,7 +62,7 @@ JNIEXPORT jobject JNICALL Java_org_apache_mesos_state_Variable_mutate
 
   Variable* variable = (Variable*) env->GetLongField(thiz, __variable);
 
-  jbyte* value = env->GetByteArrayElements(jvalue, NULL);
+  jbyte* value = env->GetByteArrayElements(jvalue, nullptr);
   jsize length = env->GetArrayLength(jvalue);
 
   // Mutate the variable and save a copy of the result.

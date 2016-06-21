@@ -37,6 +37,8 @@
 
 #include <mesos/authentication/authenticatee.hpp>
 
+#include <mesos/master/detector.hpp>
+
 #include <mesos/module/authenticatee.hpp>
 
 #include <mesos/scheduler/scheduler.hpp>
@@ -80,8 +82,6 @@
 #include "logging/flags.hpp"
 #include "logging/logging.hpp"
 
-#include "master/detector.hpp"
-
 #include "messages/messages.hpp"
 
 #include "module/manager.hpp"
@@ -95,6 +95,8 @@ using namespace mesos;
 using namespace mesos::internal;
 using namespace mesos::internal::master;
 using namespace mesos::scheduler;
+
+using mesos::master::detector::MasterDetector;
 
 using process::Clock;
 using process::DispatchEvent;
@@ -214,7 +216,7 @@ public:
       flags(_flags),
       implicitAcknowledgements(_implicitAcknowledgements),
       credential(_credential),
-      authenticatee(NULL),
+      authenticatee(nullptr),
       authenticating(None()),
       authenticated(false),
       reauthenticate(false)
@@ -283,7 +285,7 @@ protected:
       .onAny(defer(self(), &SchedulerProcess::detected, lambda::_1));
   }
 
-  void detected(const Future<Option<MasterInfo> >& _master)
+  void detected(const Future<Option<MasterInfo>>& _master)
   {
     if (!running.load()) {
       VLOG(1) << "Ignoring the master change because the driver is not"
@@ -294,7 +296,7 @@ protected:
     CHECK(!_master.isDiscarded());
 
     if (_master.isFailed()) {
-      EXIT(1) << "Failed to detect a master: " << _master.failure();
+      EXIT(EXIT_FAILURE) << "Failed to detect a master: " << _master.failure();
     }
 
     if (_master.get().isSome()) {
@@ -326,6 +328,7 @@ protected:
       LOG(INFO) << "New master detected at " << master.get().pid();
       link(master.get().pid());
 
+#ifdef HAS_AUTHENTICATION
       if (credential.isSome()) {
         // Authenticate with the master.
         // TODO(vinod): Do a backoff for authentication similar to what
@@ -342,6 +345,15 @@ protected:
         // (e.g., rate limiting tests).
         doReliableRegistration(flags.registration_backoff_factor);
       }
+#else
+      // Authentication not enabled on this platform. Proceed with registration
+      // without authentication.
+      reauthenticate = false;
+      LOG(INFO) << "Authentication is not available on this platform. "
+                   "Attempting to register without authentication";
+
+      doReliableRegistration(flags.registration_backoff_factor);
+#endif // HAS_AUTHENTICATION
     } else {
       // In this case, we don't actually invoke Scheduler::error
       // since we might get reconnected to a master imminently.
@@ -353,7 +365,7 @@ protected:
       .onAny(defer(self(), &SchedulerProcess::detected, lambda::_1));
   }
 
-
+#ifdef HAS_AUTHENTICATION
   void authenticate()
   {
     if (!running.load()) {
@@ -383,7 +395,7 @@ protected:
 
     CHECK_SOME(credential);
 
-    CHECK(authenticatee == NULL);
+    CHECK(authenticatee == nullptr);
 
     if (flags.authenticatee == scheduler::DEFAULT_AUTHENTICATEE) {
       LOG(INFO) << "Using default CRAM-MD5 authenticatee";
@@ -392,8 +404,9 @@ protected:
       Try<Authenticatee*> module =
         modules::ModuleManager::create<Authenticatee>(flags.authenticatee);
       if (module.isError()) {
-        EXIT(1) << "Could not create authenticatee module '"
-                << flags.authenticatee << "': " << module.error();
+        EXIT(EXIT_FAILURE)
+          << "Could not create authenticatee module '"
+          << flags.authenticatee << "': " << module.error();
       }
       LOG(INFO) << "Using '" << flags.authenticatee << "' authenticatee";
       authenticatee = module.get();
@@ -430,7 +443,7 @@ protected:
     }
 
     delete CHECK_NOTNULL(authenticatee);
-    authenticatee = NULL;
+    authenticatee = nullptr;
 
     CHECK_SOME(authenticating);
     const Future<bool>& future = authenticating.get();
@@ -493,6 +506,7 @@ protected:
       LOG(WARNING) << "Authentication timed out";
     }
   }
+#endif // HAS_AUTHENTICATION
 
   void drop(const Event& event, const string& message)
   {
@@ -668,7 +682,13 @@ protected:
         break;
       }
 
-      default: {
+      case Event::INVERSE_OFFERS:
+      case Event::RESCIND_INVERSE_OFFER:
+      case Event::HEARTBEAT: {
+        break;
+      }
+
+      case Event::UNKNOWN: {
         drop(event, "Unknown event");
         break;
       }
@@ -769,9 +789,13 @@ protected:
       return;
     }
 
+#ifdef HAS_AUTHENTICATION
     if (credential.isSome() && !authenticated) {
       return;
     }
+#else
+    authenticated = false;
+#endif // HAS_AUTHENTICATION
 
     VLOG(1) << "Sending SUBSCRIBE call to " << master.get().pid();
 
@@ -804,7 +828,7 @@ protected:
     // Determine the delay for next attempt by picking a random
     // duration between 0 and 'maxBackoff'.
     // TODO(vinod): Use random numbers from <random> header.
-    Duration delay = maxBackoff * ((double) ::random() / RAND_MAX);
+    Duration delay = maxBackoff * ((double) os::random() / RAND_MAX);
 
     VLOG(1) << "Will retry registration in " << delay << " if necessary";
 
@@ -1020,13 +1044,13 @@ protected:
   void lostSlave(const UPID& from, const SlaveID& slaveId)
   {
     if (!running.load()) {
-      VLOG(1) << "Ignoring lost slave message because the driver is not"
+      VLOG(1) << "Ignoring lost agent message because the driver is not"
               << " running!";
       return;
     }
 
     if (!connected) {
-      VLOG(1) << "Ignoring lost slave message because the driver is "
+      VLOG(1) << "Ignoring lost agent message because the driver is "
               << "disconnected!";
       return;
     }
@@ -1034,13 +1058,13 @@ protected:
     CHECK_SOME(master);
 
     if (from != master.get().pid()) {
-      VLOG(1) << "Ignoring lost slave message because it was sent "
+      VLOG(1) << "Ignoring lost agent message because it was sent "
               << "from '" << from << "' instead of the leading master '"
               << master.get().pid() << "'";
       return;
     }
 
-    VLOG(1) << "Lost slave " << slaveId;
+    VLOG(1) << "Lost agent " << slaveId;
 
     savedSlavePids.erase(slaveId);
 
@@ -1081,7 +1105,7 @@ protected:
     }
 
     VLOG(1)
-      << "Executor " << executorId << " on slave " << slaveId
+      << "Executor " << executorId << " on agent " << slaveId
       << " exited with status " << status;
 
     Stopwatch stopwatch;
@@ -1317,7 +1341,7 @@ protected:
               savedSlavePids[slaveId] = savedOffers[offerId][slaveId];
             } else {
               LOG(WARNING) << "Attempting to launch task " << task.task_id()
-                           << " with the wrong slave id " << slaveId;
+                           << " with the wrong agent id " << slaveId;
             }
           }
         }
@@ -1342,6 +1366,14 @@ protected:
       VLOG(1) << "Ignoring decline offer message as master is disconnected";
       return;
     }
+
+    if (!savedOffers.contains(offerId)) {
+      LOG(WARNING) << "Attempting to decline an unknown offer " << offerId;
+    }
+
+    // Remove the offer. We do not need to save any PIDs
+    // when declining an offer.
+    savedOffers.erase(offerId);
 
     Call call;
 
@@ -1420,7 +1452,7 @@ protected:
 
       VLOG(2) << "Sending ACK for status update " << status.uuid()
               << " of task " << status.task_id()
-              << " on slave " << status.slave_id()
+              << " on agent " << status.slave_id()
               << " to " << master.get().pid();
 
       Call call;
@@ -1440,7 +1472,7 @@ protected:
               << (status.has_uuid() ? " " + status.uuid() : "")
               << " of task " << status.task_id()
               << (status.has_slave_id()
-                  ? " on slave " + stringify(status.slave_id()) : "");
+                  ? " on agent " + stringify(status.slave_id()) : "");
     }
   }
 
@@ -1453,7 +1485,7 @@ protected:
      return;
     }
 
-    VLOG(2) << "Asked to send framework message to slave "
+    VLOG(2) << "Asked to send framework message to agent "
             << slaveId;
 
     // TODO(benh): After a scheduler has re-registered it won't have
@@ -1475,7 +1507,7 @@ protected:
       message.set_data(data);
       send(slave, message);
     } else {
-      VLOG(1) << "Cannot send directly to slave " << slaveId
+      VLOG(1) << "Cannot send directly to agent " << slaveId
               << "; sending through master";
 
       Call call;
@@ -1590,7 +1622,7 @@ private:
 
   const internal::scheduler::Flags flags;
 
-  hashmap<OfferID, hashmap<SlaveID, UPID> > savedOffers;
+  hashmap<OfferID, hashmap<SlaveID, UPID>> savedOffers;
   hashmap<SlaveID, UPID> savedSlavePids;
 
   // The driver optionally provides implicit acknowledgements
@@ -1605,7 +1637,7 @@ private:
   Authenticatee* authenticatee;
 
   // Indicates if an authentication attempt is in progress.
-  Option<Future<bool> > authenticating;
+  Option<Future<bool>> authenticating;
 
   // Indicates if the authentication is successful.
   bool authenticated;
@@ -1627,7 +1659,7 @@ void MesosSchedulerDriver::initialize() {
   // we'll probably want a way to load master::Flags and slave::Flags
   // as well.
   local::Flags flags;
-  Try<Nothing> load = flags.load("MESOS_");
+  Try<flags::Warnings> load = flags.load("MESOS_");
 
   if (load.isError()) {
     status = DRIVER_ABORTED;
@@ -1653,6 +1685,11 @@ void MesosSchedulerDriver::initialize() {
     logging::initialize(framework.name(), flags);
   } else {
     VLOG(1) << "Disabling initialization of GLOG logging";
+  }
+
+  // Log any flag warnings (after logging is initialized).
+  foreach (const flags::Warning& warning, load->warnings) {
+    LOG(WARNING) << warning.message;
   }
 
   spawn(new VersionProcess(), true);
@@ -1685,7 +1722,7 @@ void MesosSchedulerDriver::initialize() {
     pid = local::launch(flags);
   }
 
-  CHECK(process == NULL);
+  CHECK(process == nullptr);
 
   url = pid.isSome() ? static_cast<string>(pid.get()) : master;
 }
@@ -1709,14 +1746,14 @@ MesosSchedulerDriver::MesosSchedulerDriver(
     Scheduler* _scheduler,
     const FrameworkInfo& _framework,
     const string& _master)
-  : detector(NULL),
+  : detector(nullptr),
     scheduler(_scheduler),
     framework(_framework),
     master(_master),
-    process(NULL),
+    process(nullptr),
     status(DRIVER_NOT_STARTED),
     implicitAcknowlegements(true),
-    credential(NULL),
+    credential(nullptr),
     schedulerId("scheduler-" + UUID::random().toString())
 {
   initialize();
@@ -1728,11 +1765,11 @@ MesosSchedulerDriver::MesosSchedulerDriver(
     const FrameworkInfo& _framework,
     const string& _master,
     const Credential& _credential)
-  : detector(NULL),
+  : detector(nullptr),
     scheduler(_scheduler),
     framework(_framework),
     master(_master),
-    process(NULL),
+    process(nullptr),
     status(DRIVER_NOT_STARTED),
     implicitAcknowlegements(true),
     credential(new Credential(_credential)),
@@ -1747,14 +1784,14 @@ MesosSchedulerDriver::MesosSchedulerDriver(
     const FrameworkInfo& _framework,
     const string& _master,
     bool _implicitAcknowlegements)
-  : detector(NULL),
+  : detector(nullptr),
     scheduler(_scheduler),
     framework(_framework),
     master(_master),
-    process(NULL),
+    process(nullptr),
     status(DRIVER_NOT_STARTED),
     implicitAcknowlegements(_implicitAcknowlegements),
-    credential(NULL),
+    credential(nullptr),
     schedulerId("scheduler-" + UUID::random().toString())
 {
   initialize();
@@ -1767,11 +1804,11 @@ MesosSchedulerDriver::MesosSchedulerDriver(
     const string& _master,
     bool _implicitAcknowlegements,
     const Credential& _credential)
-  : detector(NULL),
+  : detector(nullptr),
     scheduler(_scheduler),
     framework(_framework),
     master(_master),
-    process(NULL),
+    process(nullptr),
     status(DRIVER_NOT_STARTED),
     implicitAcknowlegements(_implicitAcknowlegements),
     credential(new Credential(_credential)),
@@ -1798,16 +1835,17 @@ MesosSchedulerDriver::~MesosSchedulerDriver()
   // to the user somehow. It might make sense to try and add some more
   // debug output for the case where we wait indefinitely due to
   // deadlock.
-  if (process != NULL) {
+  if (process != nullptr) {
     // We call 'terminate()' here to ensure that SchedulerProcess
     // terminates even if the user forgot to call stop/abort on the
     // driver.
     terminate(process);
     wait(process);
-    delete process;
   }
 
+  delete process;
   delete latch;
+  delete credential;
 
   detector.reset();
 
@@ -1825,7 +1863,7 @@ Status MesosSchedulerDriver::start()
       return status;
     }
 
-    if (detector == NULL) {
+    if (detector == nullptr) {
       Try<shared_ptr<MasterDetector>> detector_ = DetectorPool::get(url);
 
       if (detector_.isError()) {
@@ -1842,7 +1880,7 @@ Status MesosSchedulerDriver::start()
 
     // Load scheduler flags.
     internal::scheduler::Flags flags;
-    Try<Nothing> load = flags.load("MESOS_");
+    Try<flags::Warnings> load = flags.load("MESOS_");
 
     if (load.isError()) {
       status = DRIVER_ABORTED;
@@ -1850,8 +1888,31 @@ Status MesosSchedulerDriver::start()
       return status;
     }
 
+    // Log any flag warnings.
+    foreach (const flags::Warning& warning, load->warnings) {
+      LOG(WARNING) << warning.message;
+    }
+
     // Initialize modules. Note that since other subsystems may depend
     // upon modules, we should initialize modules before anything else.
+    if (flags.modules.isSome() && flags.modulesDir.isSome()) {
+      status = DRIVER_ABORTED;
+      scheduler->error(
+          this,
+          "Only one of MESOS_MODULES or MESOS_MODULES_DIR should be specified");
+      return status;
+    }
+
+    if (flags.modulesDir.isSome()) {
+      Try<Nothing> result =
+        modules::ModuleManager::load(flags.modulesDir.get());
+      if (result.isError()) {
+        status = DRIVER_ABORTED;
+        scheduler->error(this, "Error loading modules: " + result.error());
+        return status;
+      }
+    }
+
     if (flags.modules.isSome()) {
       Try<Nothing> result = modules::ModuleManager::load(flags.modules.get());
       if (result.isError()) {
@@ -1861,9 +1922,9 @@ Status MesosSchedulerDriver::start()
       }
     }
 
-    CHECK(process == NULL);
+    CHECK(process == nullptr);
 
-    if (credential == NULL) {
+    if (credential == nullptr) {
       process = new SchedulerProcess(
           this,
           scheduler,
@@ -1908,10 +1969,10 @@ Status MesosSchedulerDriver::stop(bool failover)
       return status;
     }
 
-    // 'process' might be NULL if the driver has failed to instantiate
+    // 'process' might be nullptr if the driver has failed to instantiate
     // it due to bad parameters (e.g. error in creating the detector
     // or loading flags).
-    if (process != NULL) {
+    if (process != nullptr) {
       process->running.store(false);
       dispatch(process, &SchedulerProcess::stop, failover);
     }
@@ -1961,7 +2022,7 @@ Status MesosSchedulerDriver::join()
   // started properly. If it wasn't, we return the current status
   // (which should either be DRIVER_NOT_STARTED or DRIVER_ABORTED).
   synchronized (mutex) {
-    if (process == NULL) {
+    if (process == nullptr) {
       CHECK(status == DRIVER_NOT_STARTED || status == DRIVER_ABORTED);
 
       return status;
@@ -1993,7 +2054,7 @@ Status MesosSchedulerDriver::killTask(const TaskID& taskId)
       return status;
     }
 
-    CHECK(process != NULL);
+    CHECK(process != nullptr);
 
     dispatch(process, &SchedulerProcess::killTask, taskId);
 
@@ -2024,7 +2085,7 @@ Status MesosSchedulerDriver::launchTasks(
       return status;
     }
 
-    CHECK(process != NULL);
+    CHECK(process != nullptr);
 
     dispatch(process, &SchedulerProcess::launchTasks, offerIds, tasks, filters);
 
@@ -2043,7 +2104,7 @@ Status MesosSchedulerDriver::acceptOffers(
       return status;
     }
 
-    CHECK(process != NULL);
+    CHECK(process != nullptr);
 
     dispatch(
         process,
@@ -2066,7 +2127,7 @@ Status MesosSchedulerDriver::declineOffer(
       return status;
     }
 
-    CHECK(process != NULL);
+    CHECK(process != nullptr);
 
     dispatch(
         process,
@@ -2086,7 +2147,7 @@ Status MesosSchedulerDriver::reviveOffers()
       return status;
     }
 
-    CHECK(process != NULL);
+    CHECK(process != nullptr);
 
     dispatch(process, &SchedulerProcess::reviveOffers);
 
@@ -2102,7 +2163,7 @@ Status MesosSchedulerDriver::suppressOffers()
       return status;
     }
 
-    CHECK(process != NULL);
+    CHECK(process != nullptr);
 
     dispatch(process, &SchedulerProcess::suppressOffers);
 
@@ -2125,7 +2186,7 @@ Status MesosSchedulerDriver::acknowledgeStatusUpdate(
             " Implicit acknowledgements are enabled");
     }
 
-    CHECK(process != NULL);
+    CHECK(process != nullptr);
 
     dispatch(process, &SchedulerProcess::acknowledgeStatusUpdate, taskStatus);
 
@@ -2144,7 +2205,7 @@ Status MesosSchedulerDriver::sendFrameworkMessage(
       return status;
     }
 
-    CHECK(process != NULL);
+    CHECK(process != nullptr);
 
     dispatch(process, &SchedulerProcess::sendFrameworkMessage,
             executorId, slaveId, data);
@@ -2162,7 +2223,7 @@ Status MesosSchedulerDriver::reconcileTasks(
       return status;
     }
 
-    CHECK(process != NULL);
+    CHECK(process != nullptr);
 
     dispatch(process, &SchedulerProcess::reconcileTasks, statuses);
 
@@ -2179,7 +2240,7 @@ Status MesosSchedulerDriver::requestResources(
       return status;
     }
 
-    CHECK(process != NULL);
+    CHECK(process != nullptr);
 
     dispatch(process, &SchedulerProcess::requestResources, requests);
 

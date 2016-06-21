@@ -39,6 +39,7 @@ using mesos::master::InverseOfferStatus;
 
 using process::Failure;
 using process::Future;
+using process::Owned;
 using process::Timeout;
 
 namespace mesos {
@@ -134,12 +135,9 @@ void HierarchicalAllocatorProcess::initialize(
 
   // Resources for quota'ed roles are allocated separately and prior to
   // non-quota'ed roles, hence a dedicated sorter for quota'ed roles is
-  // necessary. We create an instance of the same sorter type we use for
-  // all roles.
-  //
-  // TODO(alexr): Consider introducing a sorter type for quota'ed roles.
-  roleSorter = roleSorterFactory();
-  quotaRoleSorter = roleSorterFactory();
+  // necessary.
+  roleSorter.reset(roleSorterFactory());
+  quotaRoleSorter.reset(quotaRoleSorterFactory());
 
   VLOG(1) << "Initialized hierarchical allocator process";
 
@@ -188,7 +186,7 @@ void HierarchicalAllocatorProcess::recover(
   // a new agent is added.
   if (expectedAgentCount.get() == 0) {
     VLOG(1) << "Skipping recovery of hierarchical allocator: "
-            << "no reconnecting slaves to wait for";
+            << "no reconnecting agents to wait for";
 
     return;
   }
@@ -206,7 +204,7 @@ void HierarchicalAllocatorProcess::recover(
   }
 
   LOG(INFO) << "Triggered allocator recovery: waiting for "
-            << expectedAgentCount.get() << " slaves to reconnect or "
+            << expectedAgentCount.get() << " agents to reconnect or "
             << ALLOCATION_HOLD_OFF_RECOVERY_TIMEOUT << " to pass";
 }
 
@@ -225,7 +223,8 @@ void HierarchicalAllocatorProcess::addFramework(
   if (!activeRoles.contains(role)) {
     activeRoles[role] = 1;
     roleSorter->add(role, roleWeight(role));
-    frameworkSorters[role] = frameworkSorterFactory();
+    frameworkSorters[role].reset(frameworkSorterFactory());
+    metrics.addRole(role);
   } else {
     activeRoles[role]++;
   }
@@ -251,12 +250,16 @@ void HierarchicalAllocatorProcess::addFramework(
   frameworks[frameworkId] = Framework();
   frameworks[frameworkId].role = frameworkInfo.role();
 
-  // Check if the framework desires revocable resources.
+  // Set the framework capabilities that this allocator cares about.
   frameworks[frameworkId].revocable = false;
+  frameworks[frameworkId].gpuAware = false;
+
   foreach (const FrameworkInfo::Capability& capability,
            frameworkInfo.capabilities()) {
     if (capability.type() == FrameworkInfo::Capability::REVOCABLE_RESOURCES) {
       frameworks[frameworkId].revocable = true;
+    } else if (capability.type() == FrameworkInfo::Capability::GPU_RESOURCES) {
+      frameworks[frameworkId].gpuAware = true;
     }
   }
 
@@ -313,8 +316,9 @@ void HierarchicalAllocatorProcess::removeFramework(
     roleSorter->remove(role);
 
     CHECK(frameworkSorters.contains(role));
-    delete frameworkSorters[role];
     frameworkSorters.erase(role);
+
+    metrics.removeRole(role);
   }
 
   // Do not delete the filters contained in this
@@ -388,12 +392,16 @@ void HierarchicalAllocatorProcess::updateFramework(
   // progress on allowing these fields to be updated.
   CHECK_EQ(frameworks[frameworkId].role, frameworkInfo.role());
 
+  // Update the framework capabilities that this allocator cares about.
   frameworks[frameworkId].revocable = false;
+  frameworks[frameworkId].gpuAware = false;
 
   foreach (const FrameworkInfo::Capability& capability,
            frameworkInfo.capabilities()) {
     if (capability.type() == FrameworkInfo::Capability::REVOCABLE_RESOURCES) {
       frameworks[frameworkId].revocable = true;
+    } else if (capability.type() == FrameworkInfo::Capability::GPU_RESOURCES) {
+      frameworks[frameworkId].gpuAware = true;
     }
   }
 }
@@ -463,14 +471,14 @@ void HierarchicalAllocatorProcess::addSlave(
   if (paused &&
       expectedAgentCount.isSome() &&
       (static_cast<int>(slaves.size()) >= expectedAgentCount.get())) {
-    VLOG(1) << "Recovery complete: sufficient amount of slaves added; "
-            << slaves.size() << " slaves known to the allocator";
+    VLOG(1) << "Recovery complete: sufficient amount of agents added; "
+            << slaves.size() << " agents known to the allocator";
 
     expectedAgentCount = None();
     resume();
   }
 
-  LOG(INFO) << "Added slave " << slaveId << " (" << slaves[slaveId].hostname
+  LOG(INFO) << "Added agent " << slaveId << " (" << slaves[slaveId].hostname
             << ") with " << slaves[slaveId].total
             << " (allocated: " << slaves[slaveId].allocated << ")";
 
@@ -502,7 +510,7 @@ void HierarchicalAllocatorProcess::removeSlave(
   // HierarchicalAllocatorProcess::expire gets invoked (or the framework
   // that applied the filters gets removed).
 
-  LOG(INFO) << "Removed slave " << slaveId;
+  LOG(INFO) << "Removed agent " << slaveId;
 }
 
 
@@ -528,7 +536,7 @@ void HierarchicalAllocatorProcess::updateSlave(
   // See comment at `quotaRoleSorter` declaration regarding non-revocable.
   quotaRoleSorter->update(slaveId, slaves[slaveId].total.nonRevocable());
 
-  LOG(INFO) << "Slave " << slaveId << " (" << slaves[slaveId].hostname << ")"
+  LOG(INFO) << "Agent " << slaveId << " (" << slaves[slaveId].hostname << ")"
             << " updated with oversubscribed resources " << oversubscribed
             << " (total: " << slaves[slaveId].total
             << ", allocated: " << slaves[slaveId].allocated << ")";
@@ -545,7 +553,7 @@ void HierarchicalAllocatorProcess::activateSlave(
 
   slaves[slaveId].activated = true;
 
-  LOG(INFO)<< "Slave " << slaveId << " reactivated";
+  LOG(INFO)<< "Agent " << slaveId << " reactivated";
 }
 
 
@@ -557,7 +565,7 @@ void HierarchicalAllocatorProcess::deactivateSlave(
 
   slaves[slaveId].activated = false;
 
-  LOG(INFO) << "Slave " << slaveId << " deactivated";
+  LOG(INFO) << "Agent " << slaveId << " deactivated";
 }
 
 
@@ -569,13 +577,13 @@ void HierarchicalAllocatorProcess::updateWhitelist(
   whitelist = _whitelist;
 
   if (whitelist.isSome()) {
-    LOG(INFO) << "Updated slave whitelist: " << stringify(whitelist.get());
+    LOG(INFO) << "Updated agent whitelist: " << stringify(whitelist.get());
 
     if (whitelist.get().empty()) {
       LOG(WARNING) << "Whitelist is empty, no offers will be made!";
     }
   } else {
-    LOG(INFO) << "Advertising offers for all slaves";
+    LOG(INFO) << "Advertising offers for all agents";
   }
 }
 
@@ -606,7 +614,8 @@ void HierarchicalAllocatorProcess::updateAllocation(
   // remain unchanged.
 
   // Update the allocated resources.
-  Sorter* frameworkSorter = frameworkSorters[role];
+  CHECK(frameworkSorters.contains(role));
+  const Owned<Sorter>& frameworkSorter = frameworkSorters[role];
 
   Resources frameworkAllocation =
     frameworkSorter->allocation(frameworkId.value(), slaveId);
@@ -651,7 +660,7 @@ void HierarchicalAllocatorProcess::updateAllocation(
   slaves[slaveId].total = updatedTotal.get();
 
   LOG(INFO) << "Updated allocation of framework " << frameworkId
-            << " on slave " << slaveId
+            << " on agent " << slaveId
             << " from " << frameworkAllocation
             << " to " << updatedFrameworkAllocation.get();
 }
@@ -797,7 +806,7 @@ void HierarchicalAllocatorProcess::updateInverseOffer(
 
   if (seconds.get() != Duration::zero()) {
     VLOG(1) << "Framework " << frameworkId
-            << " filtered inverse offers from slave " << slaveId
+            << " filtered inverse offers from agent " << slaveId
             << " for " << seconds.get();
 
     // Create a new inverse offer filter and delay its expiration.
@@ -890,7 +899,7 @@ void HierarchicalAllocatorProcess::recoverResources(
     VLOG(1) << "Recovered " << resources
             << " (total: " << slaves[slaveId].total
             << ", allocated: " << slaves[slaveId].allocated
-            << ") on slave " << slaveId
+            << ") on agent " << slaveId
             << " from framework " << frameworkId;
   }
 
@@ -925,7 +934,7 @@ void HierarchicalAllocatorProcess::recoverResources(
 
   if (timeout.get() != Duration::zero()) {
     VLOG(1) << "Framework " << frameworkId
-            << " filtered slave " << slaveId
+            << " filtered agent " << slaveId
             << " for " << timeout.get();
 
     // Create a new filter.
@@ -1018,6 +1027,8 @@ void HierarchicalAllocatorProcess::setQuota(
     }
   }
 
+  metrics.setQuota(role, quota);
+
   // TODO(alexr): Print all quota info for the role.
   LOG(INFO) << "Set quota " << quota.info.guarantee() << " for role '" << role
             << "'";
@@ -1044,6 +1055,8 @@ void HierarchicalAllocatorProcess::removeQuota(
   // Remove the role from the quota'ed allocation group.
   quotas.erase(role);
   quotaRoleSorter->remove(role);
+
+  metrics.removeQuota(role);
 
   // Trigger the allocation explicitly in order to promptly react to the
   // operator's request.
@@ -1125,9 +1138,13 @@ void HierarchicalAllocatorProcess::allocate()
   Stopwatch stopwatch;
   stopwatch.start();
 
+  metrics.allocation_run.start();
+
   allocate(slaves.keys());
 
-  VLOG(1) << "Performed allocation for " << slaves.size() << " slaves in "
+  metrics.allocation_run.stop();
+
+  VLOG(1) << "Performed allocation for " << slaves.size() << " agents in "
             << stopwatch.elapsed();
 }
 
@@ -1143,11 +1160,14 @@ void HierarchicalAllocatorProcess::allocate(
 
   Stopwatch stopwatch;
   stopwatch.start();
+  metrics.allocation_run.start();
 
   hashset<SlaveID> slaves({slaveId});
   allocate(slaves);
 
-  VLOG(1) << "Performed allocation for slave " << slaveId << " in "
+  metrics.allocation_run.stop();
+
+  VLOG(1) << "Performed allocation for agent " << slaveId << " in "
           << stopwatch.elapsed();
 }
 
@@ -1156,6 +1176,8 @@ void HierarchicalAllocatorProcess::allocate(
 void HierarchicalAllocatorProcess::allocate(
     const hashset<SlaveID>& slaveIds_)
 {
+  ++metrics.allocation_runs;
+
   // Compute the offerable resources, per framework:
   //   (1) For reserved resources on the slave, allocate these to a
   //       framework having the corresponding role.
@@ -1249,6 +1271,14 @@ void HierarchicalAllocatorProcess::allocate(
           continue;
         }
 
+        // Only offer resources from slaves that have GPUs to
+        // frameworks that are capable of receiving GPUs.
+        // See MESOS-5634.
+        if (!frameworks[frameworkId].gpuAware &&
+            slaves[slaveId].total.gpus().getOrElse(0) > 0) {
+          continue;
+        }
+
         // Calculate the currently available resources on the slave.
         Resources available = slaves[slaveId].total - slaves[slaveId].allocated;
 
@@ -1268,11 +1298,16 @@ void HierarchicalAllocatorProcess::allocate(
         Resources resources =
           (available.unreserved() + available.reserved(role)).nonRevocable();
 
+        // It is safe to break here, because all frameworks under a role would
+        // consider the same resources, so in case we don't have allocatable
+        // resources, we don't have to check for other frameworks under the
+        // same role. We only break out of the innermost loop, so the next step
+        // will use the same slaveId, but a different role.
         // NOTE: The resources may not be allocatable here, but they can be
         // accepted by one of the frameworks during the second allocation
         // stage.
         if (!allocatable(resources)) {
-          continue;
+          break;
         }
 
         // If the framework filters these resources, ignore. The unallocated
@@ -1281,7 +1316,7 @@ void HierarchicalAllocatorProcess::allocate(
           continue;
         }
 
-        VLOG(2) << "Allocating " << resources << " on slave " << slaveId
+        VLOG(2) << "Allocating " << resources << " on agent " << slaveId
                 << " to framework " << frameworkId
                 << " as part of its role quota";
 
@@ -1374,6 +1409,14 @@ void HierarchicalAllocatorProcess::allocate(
           continue;
         }
 
+        // Only offer resources from slaves that have GPUs to
+        // frameworks that are capable of receiving GPUs.
+        // See MESOS-5634.
+        if (!frameworks[frameworkId].gpuAware &&
+            slaves[slaveId].total.gpus().getOrElse(0) > 0) {
+          continue;
+        }
+
         // Calculate the currently available resources on the slave.
         Resources available = slaves[slaveId].total - slaves[slaveId].allocated;
 
@@ -1396,6 +1439,19 @@ void HierarchicalAllocatorProcess::allocate(
           resources += available.unreserved();
         }
 
+        // It is safe to break here, because all frameworks under a role would
+        // consider the same resources, so in case we don't have allocatable
+        // resources, we don't have to check for other frameworks under the
+        // same role. We only break out of the innermost loop, so the next step
+        // will use the same slaveId, but a different role.
+        // The difference to the second `allocatable` check is that here we also
+        // check for revocable resources, which can be disabled on a per frame-
+        // work basis, which requires us to go through all frameworks in case we
+        // have allocatable revocable resources.
+        if (!allocatable(resources)) {
+          break;
+        }
+
         // Remove revocable resources if the framework has not opted
         // for them.
         if (!frameworks[frameworkId].revocable) {
@@ -1403,6 +1459,9 @@ void HierarchicalAllocatorProcess::allocate(
         }
 
         // If the resources are not allocatable, ignore.
+        // We can not break here, because another framework under the same role
+        // could accept revocable resources and breaking would skip all other
+        // frameworks.
         if (!allocatable(resources)) {
           continue;
         }
@@ -1424,7 +1483,7 @@ void HierarchicalAllocatorProcess::allocate(
           continue;
         }
 
-        VLOG(2) << "Allocating " << resources << " on slave " << slaveId
+        VLOG(2) << "Allocating " << resources << " on agent " << slaveId
                 << " to framework " << frameworkId;
 
         // NOTE: We perform "coarse-grained" allocation, meaning that we always
@@ -1450,7 +1509,7 @@ void HierarchicalAllocatorProcess::allocate(
   }
 
   if (offerable.empty()) {
-    VLOG(1) << "No resources available to allocate!";
+    VLOG(1) << "No allocations performed";
   } else {
     // Now offer the resources to each framework.
     foreachkey (const FrameworkID& frameworkId, offerable) {
@@ -1489,7 +1548,7 @@ void HierarchicalAllocatorProcess::deallocate(
   // keep generating new inverse offers even though the framework had not
   // responded yet.
 
-  foreachvalue (Sorter* frameworkSorter, frameworkSorters) {
+  foreachvalue (const Owned<Sorter>& frameworkSorter, frameworkSorters) {
     foreach (const SlaveID& slaveId, slaveIds_) {
       CHECK(slaves.contains(slaveId));
 
@@ -1534,7 +1593,7 @@ void HierarchicalAllocatorProcess::deallocate(
               // host, as we have the information available.
               offerable[frameworkId][slaveId] = unavailableResources;
 
-              // Mark this framework as having an offer oustanding for the
+              // Mark this framework as having an offer outstanding for the
               // specified slave.
               maintenance.offersOutstanding.insert(frameworkId);
             }
@@ -1637,7 +1696,7 @@ bool HierarchicalAllocatorProcess::isFiltered(
       OfferFilter* offerFilter, frameworks[frameworkId].offerFilters[slaveId]) {
       if (offerFilter->filter(resources)) {
         VLOG(1) << "Filtered offer with " << resources
-                << " on slave " << slaveId
+                << " on agent " << slaveId
                 << " for framework " << frameworkId;
 
         return true;
@@ -1661,7 +1720,7 @@ bool HierarchicalAllocatorProcess::isFiltered(
         InverseOfferFilter* inverseOfferFilter,
         frameworks[frameworkId].inverseOfferFilters[slaveId]) {
       if (inverseOfferFilter->filter()) {
-        VLOG(1) << "Filtered unavailability on slave " << slaveId
+        VLOG(1) << "Filtered unavailability on agent " << slaveId
                 << " for framework " << frameworkId;
 
         return true;
@@ -1681,6 +1740,66 @@ bool HierarchicalAllocatorProcess::allocatable(
 
   return (cpus.isSome() && cpus.get() >= MIN_CPUS) ||
          (mem.isSome() && mem.get() >= MIN_MEM);
+}
+
+
+double HierarchicalAllocatorProcess::_resources_offered_or_allocated(
+    const string& resource)
+{
+  double offered_or_allocated = 0;
+
+  foreachvalue (const Slave& slave, slaves) {
+    Option<Value::Scalar> value =
+      slave.allocated.get<Value::Scalar>(resource);
+
+    if (value.isSome()) {
+      offered_or_allocated += value->value();
+    }
+  }
+
+  return offered_or_allocated;
+}
+
+
+double HierarchicalAllocatorProcess::_resources_total(
+    const string& resource)
+{
+  Option<Value::Scalar> total =
+    roleSorter->totalScalarQuantities()
+      .get<Value::Scalar>(resource);
+
+  return total.isSome() ? total->value() : 0;
+}
+
+
+double HierarchicalAllocatorProcess::_quota_allocated(
+    const string& role,
+    const string& resource)
+{
+  Option<Value::Scalar> used =
+    quotaRoleSorter->allocationScalarQuantities(role)
+      .get<Value::Scalar>(resource);
+
+  return used.isSome() ? used->value() : 0;
+}
+
+
+double HierarchicalAllocatorProcess::_offer_filters_active(
+    const string& role)
+{
+  double result = 0;
+
+  foreachvalue (const Framework& framework, frameworks) {
+    if (framework.role != role) {
+      continue;
+    }
+
+    foreachkey (const SlaveID& slaveId, framework.offerFilters) {
+      result += framework.offerFilters.get(slaveId)->size();
+    }
+  }
+
+  return result;
 }
 
 } // namespace internal {

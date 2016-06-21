@@ -39,13 +39,25 @@ bool DRFComparator::operator()(const Client& client1, const Client& client2)
 }
 
 
+DRFSorter::DRFSorter(
+    const process::UPID& allocator,
+    const std::string& metricsPrefix)
+  : metrics(Metrics(allocator, *this, metricsPrefix)) {}
+
+
 void DRFSorter::add(const string& name, double weight)
 {
+  CHECK(!contains(name));
+
   Client client(name, 0, 0);
   clients.insert(client);
 
   allocations[name] = Allocation();
   weights[name] = weight;
+
+  if (metrics.isSome()) {
+    metrics->add(name);
+  }
 }
 
 
@@ -66,6 +78,10 @@ void DRFSorter::remove(const string& name)
 
   allocations.erase(name);
   weights.erase(name);
+
+  if (metrics.isSome()) {
+    metrics->remove(name);
+  }
 }
 
 
@@ -73,8 +89,11 @@ void DRFSorter::activate(const string& name)
 {
   CHECK(allocations.contains(name));
 
-  Client client(name, calculateShare(name), 0);
-  clients.insert(client);
+  set<Client, DRFComparator>::iterator it = find(name);
+  if (it == clients.end()) {
+    Client client(name, calculateShare(name), 0);
+    clients.insert(client);
+  }
 }
 
 
@@ -83,7 +102,7 @@ void DRFSorter::deactivate(const string& name)
   set<Client, DRFComparator>::iterator it = find(name);
 
   if (it != clients.end()) {
-    // TODO(benh): Removing the client is an unfortuante strategy
+    // TODO(benh): Removing the client is an unfortunate strategy
     // because we lose information such as the number of allocations
     // for this client which means the fairness can be gamed by a
     // framework disconnecting and reconnecting.

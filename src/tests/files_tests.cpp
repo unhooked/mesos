@@ -18,6 +18,8 @@
 
 #include <gmock/gmock.h>
 
+#include <mesos/authentication/http/basic_authenticator_factory.hpp>
+
 #include <process/future.hpp>
 #include <process/gtest.hpp>
 #include <process/http.hpp>
@@ -33,21 +35,65 @@
 
 #include "files/files.hpp"
 
+#include "tests/mesos.hpp"
+
+namespace authentication = process::http::authentication;
+
 using process::Future;
+using process::Owned;
 
 using process::http::BadRequest;
+using process::http::Forbidden;
 using process::http::NotFound;
 using process::http::OK;
 using process::http::Response;
+using process::http::Unauthorized;
 
 using std::string;
+
+using mesos::http::authentication::BasicAuthenticatorFactory;
 
 namespace mesos {
 namespace internal {
 namespace tests {
 
+class FilesTest : public TemporaryDirectoryTest
+{
+protected:
+  void setBasicHttpAuthenticator(
+      const string& realm,
+      const Credentials& credentials)
+  {
+    Try<authentication::Authenticator*> authenticator =
+      BasicAuthenticatorFactory::create(realm, credentials);
 
-class FilesTest : public TemporaryDirectoryTest {};
+    ASSERT_SOME(authenticator);
+
+    // Add this realm to the set of realms which will be unset during teardown.
+    realms.insert(realm);
+
+    // Pass ownership of the authenticator to libprocess.
+    AWAIT_READY(authentication::setAuthenticator(
+        realm,
+        Owned<authentication::Authenticator>(authenticator.get())));
+  }
+
+  virtual void TearDown()
+  {
+    foreach (const string& realm, realms) {
+      // We need to wait in order to ensure that the operation completes before
+      // we leave `TearDown`. Otherwise, we may leak a mock object.
+      AWAIT_READY(authentication::unsetAuthenticator(realm));
+    }
+
+    realms.clear();
+
+    TemporaryDirectoryTest::TearDown();
+  }
+
+private:
+  hashset<string> realms;
+};
 
 
 TEST_F(FilesTest, AttachTest)
@@ -60,6 +106,11 @@ TEST_F(FilesTest, AttachTest)
   AWAIT_EXPECT_READY(files.attach("dir", "mydir"));         // Valid dir.
   AWAIT_EXPECT_READY(files.attach("file", "myname"));       // Re-attach.
   AWAIT_EXPECT_FAILED(files.attach("missing", "somename")); // Missing file.
+
+  auto authorization = [](const Option<string>&) { return true; };
+
+  // Attach with required authorization.
+  AWAIT_EXPECT_READY(files.attach("file", "myname", authorization));
 
   ASSERT_SOME(os::write("file2", "body"));
 
@@ -123,6 +174,56 @@ TEST_F(FilesTest, ReadTest)
   AWAIT_EXPECT_RESPONSE_BODY_EQ(stringify(expected), response);
 
   response = process::http::get(upid, "read", "path=myname&offset=0");
+
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
+  AWAIT_EXPECT_RESPONSE_BODY_EQ(stringify(expected), response);
+
+  // Test reads with authorization enabled.
+  bool authorized = true;
+  auto authorization = [&authorized](const Option<std::string>&) {
+    return authorized;
+  };
+
+  AWAIT_EXPECT_READY(files.attach("file", "authorized", authorization));
+
+  response = process::http::get(upid, "read", "path=authorized&offset=0");
+
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
+  AWAIT_EXPECT_RESPONSE_BODY_EQ(stringify(expected), response);
+
+  authorized = false;
+
+  response = process::http::get(upid, "read", "path=authorized&offset=0");
+
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(Forbidden().status, response);
+
+  // TODO(tomxing): The pailer in the webui will send length=-1 at first to
+  // determine the length of the file, so we need to accept a length of -1.
+  // Setting `length=-1` has the same effect as not providing a length: we
+  // read to the end of the file, up to the maximum read length.
+  // Will change or remove this test case in MESOS-5334.
+  // Read a valid file with length set as -1.
+  response = process::http::get(
+    upid,
+    "read",
+    "path=/myname&length=-1&offset=0");
+
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
+  AWAIT_EXPECT_RESPONSE_BODY_EQ(stringify(expected), response);
+
+  // Read a valid file with negative length(not -1).
+  response = process::http::get(upid, "read", "path=/myname&length=-2");
+
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(BadRequest().status, response);
+  AWAIT_EXPECT_RESPONSE_BODY_EQ(
+    "Negative length provided: -2.\n",
+    response);
+
+  // Read a valid file with positive length.
+  expected.values["offset"] = 0;
+  expected.values["data"] = "bo";
+
+  response = process::http::get(upid, "read", "path=/myname&offset=0&length=2");
 
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
   AWAIT_EXPECT_RESPONSE_BODY_EQ(stringify(expected), response);
@@ -260,6 +361,27 @@ TEST_F(FilesTest, BrowseTest)
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(
       NotFound().status,
       process::http::get(upid, "browse", "path=missing"));
+
+  // Test browse with authorization enabled.
+  files.detach("one");
+
+  bool authorized = true;
+  auto authorization = [&authorized](const Option<std::string>&) {
+    return authorized;
+  };
+
+  AWAIT_EXPECT_READY(files.attach("1", "one", authorization));
+
+  response = process::http::get(upid, "browse", "path=one");
+
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
+  AWAIT_EXPECT_RESPONSE_BODY_EQ(stringify(expected), response);
+
+  authorized = false;
+
+  response = process::http::get(upid, "browse", "path=one");
+
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(Forbidden().status, response);
 }
 
 
@@ -295,6 +417,97 @@ TEST_F(FilesTest, DownloadTest)
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
   AWAIT_EXPECT_RESPONSE_HEADER_EQ("image/gif", "Content-Type", response);
   AWAIT_EXPECT_RESPONSE_BODY_EQ(data, response);
+
+  // Test downloads with authorization enabled.
+  bool authorized = true;
+  auto authorization = [&authorized](const Option<std::string>&) {
+    return authorized;
+  };
+
+  AWAIT_EXPECT_READY(
+      files.attach("black.gif", "authorized.gif", authorization));
+
+  response = process::http::get(upid, "download", "path=authorized.gif");
+
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
+  AWAIT_EXPECT_RESPONSE_HEADER_EQ("image/gif", "Content-Type", response);
+  AWAIT_EXPECT_RESPONSE_BODY_EQ(data, response);
+
+  authorized = false;
+
+  response = process::http::get(upid, "download", "path=authorized.gif");
+
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(Forbidden().status, response);
+}
+
+
+// Tests that the '/files/debug' endpoint works as expected.
+TEST_F(FilesTest, DebugTest)
+{
+  Files files;
+  process::UPID upid("files", process::address());
+
+  ASSERT_SOME(os::mkdir("real-path-1"));
+  ASSERT_SOME(os::mkdir("real-path-2"));
+
+  AWAIT_EXPECT_READY(files.attach("real-path-1", "virtual-path-1"));
+  AWAIT_EXPECT_READY(files.attach("real-path-2", "virtual-path-2"));
+
+  // Construct the expected JSON output.
+  const string cwd = os::getcwd();
+  JSON::Object expected;
+  expected.values["virtual-path-1"] = path::join(cwd, "real-path-1");
+  expected.values["virtual-path-2"] = path::join(cwd, "real-path-2");
+
+  Future<Response> response = process::http::get(upid, "debug");
+
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
+  AWAIT_EXPECT_RESPONSE_BODY_EQ(stringify(expected), response);
+}
+
+
+// Tests that requests to the '/files/*' endpoints receive an `Unauthorized`
+// response when HTTP authentication is enabled and an invalid credential is
+// provided.
+TEST_F(FilesTest, AuthenticationTest)
+{
+  const string AUTHENTICATION_REALM = "realm";
+
+  Credentials credentials;
+  credentials.add_credentials()->CopyFrom(DEFAULT_CREDENTIAL);
+
+  // Create a basic HTTP authenticator with the specified credentials and set it
+  // as the authenticator for `AUTHENTICATION_REALM`.
+  setBasicHttpAuthenticator(AUTHENTICATION_REALM, credentials);
+
+  // The realm is passed to `Files` to enable
+  // HTTP authentication on its endpoints.
+  Files files(AUTHENTICATION_REALM);
+
+  process::UPID upid("files", process::address());
+
+  const string expectedAuthorizationHeader =
+    "Basic realm=\"" + AUTHENTICATION_REALM + "\"";
+
+  Future<Response> response = process::http::get(upid, "browse");
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(Unauthorized({}).status, response);
+  EXPECT_EQ(response.get().headers.at("WWW-Authenticate"),
+            expectedAuthorizationHeader);
+
+  response = process::http::get(upid, "read");
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(Unauthorized({}).status, response);
+  EXPECT_EQ(response.get().headers.at("WWW-Authenticate"),
+            expectedAuthorizationHeader);
+
+  response = process::http::get(upid, "download");
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(Unauthorized({}).status, response);
+  EXPECT_EQ(response.get().headers.at("WWW-Authenticate"),
+            expectedAuthorizationHeader);
+
+  response = process::http::get(upid, "debug");
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(Unauthorized({}).status, response);
+  EXPECT_EQ(response.get().headers.at("WWW-Authenticate"),
+            expectedAuthorizationHeader);
 }
 
 } // namespace tests {

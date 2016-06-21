@@ -34,6 +34,10 @@
 namespace docker {
 namespace spec {
 
+// The prefix of whiteout files in a docker image.
+constexpr char WHITEOUT_PREFIX[] = ".wh.";
+
+
 /**
  * Parse the docker image reference. Docker expects the image
  * reference to be in the following format:
@@ -52,6 +56,37 @@ Try<ImageReference> parseImageReference(const std::string& s);
 
 
 std::ostream& operator<<(std::ostream& stream, const ImageReference& reference);
+
+
+/**
+ * Returns the port of a docker registry.
+ */
+Result<int> getRegistryPort(const std::string& registry);
+
+
+/**
+ * Returns the scheme of a docker registry.
+ */
+Try<std::string> getRegistryScheme(const std::string& registry);
+
+
+/**
+ * Returns the host of a docker registry.
+ */
+std::string getRegistryHost(const std::string& registry);
+
+
+/**
+ * Returns the hashmap<registry_URL, spec::DockerConfigAuth> by
+ * parsing the docker config file.
+ */
+Try<hashmap<std::string, Config::Auth>> parseAuthConfig(
+    const JSON::Object& _config);
+
+/**
+ * Find the host from a docker config auth url.
+ */
+std::string parseAuthUrl(const std::string& _url);
 
 
 namespace v1 {

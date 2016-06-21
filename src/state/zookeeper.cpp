@@ -23,6 +23,13 @@
 #include <string>
 #include <vector>
 
+#include <mesos/zookeeper/authentication.hpp>
+#include <mesos/zookeeper/watcher.hpp>
+#include <mesos/zookeeper/zookeeper.hpp>
+
+#include <mesos/state/storage.hpp>
+#include <mesos/state/zookeeper.hpp>
+
 #include <process/dispatch.hpp>
 #include <process/future.hpp>
 #include <process/process.hpp>
@@ -39,15 +46,6 @@
 
 #include "logging/logging.hpp"
 
-#include "messages/state.hpp"
-
-#include "state/storage.hpp"
-#include "state/zookeeper.hpp"
-
-#include "zookeeper/authentication.hpp"
-#include "zookeeper/watcher.hpp"
-#include "zookeeper/zookeeper.hpp"
-
 using namespace process;
 
 // Note that we don't add 'using std::set' here because we need
@@ -56,10 +54,11 @@ using std::queue;
 using std::string;
 using std::vector;
 
+using mesos::internal::state::Entry;
+
 using zookeeper::Authentication;
 
 namespace mesos {
-namespace internal {
 namespace state {
 
 
@@ -76,10 +75,10 @@ public:
   virtual void initialize();
 
   // Storage implementation.
-  Future<Option<Entry> > get(const string& name);
+  Future<Option<Entry>> get(const string& name);
   Future<bool> set(const Entry& entry, const UUID& uuid);
   virtual Future<bool> expunge(const Entry& entry);
-  Future<std::set<string> > names();
+  Future<std::set<string>> names();
 
   // ZooKeeper events.
   // Note that events from previous sessions are dropped.
@@ -92,8 +91,8 @@ public:
 
 private:
   // Helpers for getting the names, fetching, and swapping.
-  Result<std::set<string> > doNames();
-  Result<Option<Entry> > doGet(const string& name);
+  Result<std::set<string>> doNames();
+  Result<Option<Entry>> doGet(const string& name);
   Result<bool> doSet(const Entry& entry, const UUID& uuid);
   Result<bool> doExpunge(const Entry& entry);
 
@@ -121,7 +120,7 @@ private:
 
   struct Names
   {
-    Promise<std::set<string> > promise;
+    Promise<std::set<string>> promise;
   };
 
   struct Get
@@ -129,7 +128,7 @@ private:
     explicit Get(const string& _name) : name(_name) {}
 
     string name;
-    Promise<Option<Entry> > promise;
+    Promise<Option<Entry>> promise;
   };
 
   struct Set
@@ -187,8 +186,8 @@ ZooKeeperStorageProcess::ZooKeeperStorageProcess(
     acl(_auth.isSome()
         ? zookeeper::EVERYONE_READ_CREATOR_ALL
         : ZOO_OPEN_ACL_UNSAFE),
-    watcher(NULL),
-    zk(NULL),
+    watcher(nullptr),
+    zk(nullptr),
     state(DISCONNECTED)
 {}
 
@@ -213,7 +212,7 @@ void ZooKeeperStorageProcess::initialize()
 }
 
 
-Future<std::set<string> > ZooKeeperStorageProcess::names()
+Future<std::set<string>> ZooKeeperStorageProcess::names()
 {
   if (error.isSome()) {
     return Failure(error.get());
@@ -223,7 +222,7 @@ Future<std::set<string> > ZooKeeperStorageProcess::names()
     return names->promise.future();
   }
 
-  Result<std::set<string> > result = doNames();
+  Result<std::set<string>> result = doNames();
 
   if (result.isNone()) { // Try again later.
     Names* names = new Names();
@@ -237,7 +236,7 @@ Future<std::set<string> > ZooKeeperStorageProcess::names()
 }
 
 
-Future<Option<Entry> > ZooKeeperStorageProcess::get(const string& name)
+Future<Option<Entry>> ZooKeeperStorageProcess::get(const string& name)
 {
   if (error.isSome()) {
     return Failure(error.get());
@@ -247,7 +246,7 @@ Future<Option<Entry> > ZooKeeperStorageProcess::get(const string& name)
     return get->promise.future();
   }
 
-  Result<Option<Entry> > result = doGet(name);
+  Result<Option<Entry>> result = doGet(name);
 
   if (result.isNone()) { // Try again later.
     Get* get = new Get(name);
@@ -334,7 +333,7 @@ void ZooKeeperStorageProcess::connected(int64_t sessionId, bool reconnect)
 
   while (!pending.names.empty()) {
     Names* names = pending.names.front();
-    Result<std::set<string> > result = doNames();
+    Result<std::set<string>> result = doNames();
     if (result.isNone()) {
       return; // Try again later.
     } else if (result.isError()) {
@@ -348,7 +347,7 @@ void ZooKeeperStorageProcess::connected(int64_t sessionId, bool reconnect)
 
   while (!pending.gets.empty()) {
     Get* get = pending.gets.front();
-    Result<Option<Entry> > result = doGet(get->name);
+    Result<Option<Entry>> result = doGet(get->name);
     if (result.isNone()) {
       return; // Try again later.
     } else if (result.isError()) {
@@ -419,7 +418,7 @@ void ZooKeeperStorageProcess::deleted(int64_t sessionId, const string& path)
 }
 
 
-Result<std::set<string> > ZooKeeperStorageProcess::doNames()
+Result<std::set<string>> ZooKeeperStorageProcess::doNames()
 {
   // Get all children to determine current memberships.
   vector<string> results;
@@ -442,7 +441,7 @@ Result<std::set<string> > ZooKeeperStorageProcess::doNames()
 }
 
 
-Result<Option<Entry> > ZooKeeperStorageProcess::doGet(const string& name)
+Result<Option<Entry>> ZooKeeperStorageProcess::doGet(const string& name)
 {
   CHECK_NONE(error) << ": " << error.get();
   CHECK(state == CONNECTED);
@@ -509,7 +508,7 @@ Result<bool> ZooKeeperStorageProcess::doSet(const Entry& entry,
       string prefix = znode.substr(0, index);
 
       // Create the znode (even if it already exists).
-      code = zk->create(prefix, "", acl, 0, NULL);
+      code = zk->create(prefix, "", acl, 0, nullptr);
 
       if (code == ZINVALIDSTATE || (code != ZOK && zk->retryable(code))) {
         CHECK(zk->getState() != ZOO_AUTH_FAILED_STATE);
@@ -521,7 +520,7 @@ Result<bool> ZooKeeperStorageProcess::doSet(const Entry& entry,
       }
     }
 
-    code = zk->create(znode + "/" + entry.name(), data, acl, 0, NULL);
+    code = zk->create(znode + "/" + entry.name(), data, acl, 0, nullptr);
 
     if (code == ZNODEEXISTS) {
       return false; // Lost a race with someone else.
@@ -552,7 +551,7 @@ Result<bool> ZooKeeperStorageProcess::doSet(const Entry& entry,
     return Error("Failed to deserialize Entry");
   }
 
-  if (UUID::fromBytes(current.uuid()) != uuid) {
+  if (UUID::fromBytes(current.uuid()).get() != uuid) {
     return false;
   }
 
@@ -603,7 +602,8 @@ Result<bool> ZooKeeperStorageProcess::doExpunge(const Entry& entry)
     return Error("Failed to deserialize Entry");
   }
 
-  if (UUID::fromBytes(current.uuid()) != UUID::fromBytes(entry.uuid())) {
+  if (UUID::fromBytes(current.uuid()).get() !=
+      UUID::fromBytes(entry.uuid()).get()) {
     return false;
   }
 
@@ -644,7 +644,7 @@ ZooKeeperStorage::~ZooKeeperStorage()
 }
 
 
-Future<Option<Entry> > ZooKeeperStorage::get(const string& name)
+Future<Option<Entry>> ZooKeeperStorage::get(const string& name)
 {
   return dispatch(process, &ZooKeeperStorageProcess::get, name);
 }
@@ -662,11 +662,10 @@ Future<bool> ZooKeeperStorage::expunge(const Entry& entry)
 }
 
 
-Future<std::set<string> > ZooKeeperStorage::names()
+Future<std::set<string>> ZooKeeperStorage::names()
 {
   return dispatch(process, &ZooKeeperStorageProcess::names);
 }
 
 } // namespace state {
-} // namespace internal {
 } // namespace mesos {

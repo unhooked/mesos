@@ -81,6 +81,34 @@ Future<Nothing> unsetAuthenticator(const std::string& realm);
 
 } // namespace authentication {
 
+// Forward declaration.
+struct Request;
+
+namespace authorization {
+
+// The `AuthorizationCallbacks` type is used for a set of authorization
+// callbacks used by libprocess to authorize HTTP endpoints. The key of the map
+// contains the endpoint's path, while the value contains the callback.
+typedef hashmap<std::string,
+                lambda::function<process::Future<bool>(
+                    const Request,
+                    const Option<std::string> principal)>>
+  AuthorizationCallbacks;
+
+
+// Set authorization callbacks for HTTP endpoints. These can be used to call out
+// to an external, application-level authorizer. The callbacks should accept an
+// HTTP request and an optional principal, and they should return a
+// `Future<bool>` representing whether or not authorization was successful.
+void setCallbacks(const AuthorizationCallbacks&);
+
+
+// Remove any authorization callbacks which were previously installed in
+// libprocess.
+void unsetCallbacks();
+
+} // namespace authorization {
+
 // Status code reason strings, from the HTTP1.1 RFC:
 // http://www.w3.org/Protocols/rfc2616/rfc2616-sec6.html
 extern hashmap<uint16_t, std::string>* statuses;
@@ -342,7 +370,7 @@ public:
     // Returns false if the data could not be written because
     // either end of the pipe was already closed. Note that an
     // empty write has no effect.
-    bool write(const std::string& s);
+    bool write(std::string s);
 
     // Closing the write-end of the pipe will send end-of-file
     // to the reader. Returns false if the write-end of the pipe
@@ -431,12 +459,14 @@ struct Response
 
   explicit Response(
       const std::string& _body,
-      uint16_t _code)
+      uint16_t _code,
+      const std::string& contentType = "text/plain; charset=utf-8")
     : type(BODY),
       body(_body),
       code(_code)
   {
     headers["Content-Length"] = stringify(body.size());
+    headers["Content-Type"] = contentType;
     status = Status::string(code);
   }
 
@@ -490,6 +520,9 @@ struct OK : Response
     : Response(std::string(body), Status::OK) {}
 
   explicit OK(const std::string& body) : Response(body, Status::OK) {}
+
+  explicit OK(const std::string& body, const std::string& contentType)
+    : Response(body, Status::OK, contentType) {}
 
   OK(const JSON::Value& value, const Option<std::string>& jsonp = None());
 
@@ -583,10 +616,21 @@ struct MethodNotAllowed : Response
 
   MethodNotAllowed(
       const std::initializer_list<std::string>& allowedMethods,
-      const std::string& body)
-    : Response(body, Status::METHOD_NOT_ALLOWED)
+      const std::string& requestMethod)
+    : Response(
+        constructBody(allowedMethods, requestMethod),
+        Status::METHOD_NOT_ALLOWED)
   {
     headers["Allow"] = strings::join(", ", allowedMethods);
+  }
+
+private:
+  static std::string constructBody(
+      const std::initializer_list<std::string>& allowedMethods,
+      const std::string& requestMethod)
+  {
+    return "Expecting one of { '" + strings::join("', '", allowedMethods) +
+           "' }, but received '" + requestMethod + "'";
   }
 };
 

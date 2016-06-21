@@ -244,11 +244,11 @@ void TestContainerizer::destroy(
                  << executorId << "' of framework " << frameworkId;
     return;
   }
-  destroy(containers_[key]);
+  _destroy(containers_[key]);
 }
 
 
-void TestContainerizer::destroy(const ContainerID& containerId)
+void TestContainerizer::_destroy(const ContainerID& containerId)
 {
   if (drivers.contains(containerId)) {
     Owned<MesosExecutorDriver> driver = drivers[containerId];
@@ -297,6 +297,9 @@ void TestContainerizer::setup()
   EXPECT_CALL(*this, usage(_))
     .WillRepeatedly(Return(ResourceStatistics()));
 
+  EXPECT_CALL(*this, status(_))
+    .WillRepeatedly(Return(ContainerStatus()));
+
   EXPECT_CALL(*this, update(_, _))
     .WillRepeatedly(Return(Nothing()));
 
@@ -305,6 +308,9 @@ void TestContainerizer::setup()
 
   EXPECT_CALL(*this, wait(_))
     .WillRepeatedly(Invoke(this, &TestContainerizer::_wait));
+
+  EXPECT_CALL(*this, destroy(_))
+    .WillRepeatedly(Invoke(this, &TestContainerizer::_destroy));
 }
 
 } // namespace tests {

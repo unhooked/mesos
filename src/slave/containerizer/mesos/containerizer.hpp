@@ -219,12 +219,14 @@ private:
 
   process::Future<bool> __launch(
       const ContainerID& containerId,
+      const Option<TaskInfo>& taskInfo,
       const ExecutorInfo& executorInfo,
       const std::string& directory,
       const Option<std::string>& user,
       const SlaveID& slaveId,
       const process::PID<Slave>& slavePid,
       bool checkpoint,
+      const Option<ProvisionInfo>& provisionInfo,
       const std::list<Option<mesos::slave::ContainerLaunchInfo>>& launchInfos);
 
   process::Future<bool> isolate(
@@ -285,6 +287,7 @@ private:
 
   enum State
   {
+    PROVISIONING,
     PREPARING,
     ISOLATING,
     FETCHING,
@@ -302,15 +305,20 @@ private:
     // the executor exits.
     process::Future<Option<int>> status;
 
+    // We keep track of the future that is waiting for the provisioner's
+    // `ProvisionInfo`, so that destroy will only start calling
+    // provisioner->destroy after provisioner->provision has finished.
+    std::list<process::Future<ProvisionInfo>> provisionInfos;
+
     // We keep track of the future that is waiting for all the
     // isolators' prepare futures, so that destroy will only start
-    // calling cleanup after all isolators has finished preparing.
+    // calling cleanup after all isolators have finished preparing.
     process::Future<std::list<Option<mesos::slave::ContainerLaunchInfo>>>
       launchInfos;
 
     // We keep track of the future that is waiting for all the
     // isolators' isolate futures, so that destroy will only start
-    // calling cleanup after all isolators has finished isolating.
+    // calling cleanup after all isolators have finished isolating.
     process::Future<std::list<Nothing>> isolation;
 
     // We keep track of any limitations received from each isolator so we can

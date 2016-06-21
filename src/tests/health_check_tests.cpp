@@ -45,6 +45,8 @@ using mesos::internal::slave::MesosContainerizer;
 using mesos::internal::slave::MesosContainerizerProcess;
 using mesos::internal::slave::Slave;
 
+using mesos::master::detector::MasterDetector;
+
 using mesos::slave::ContainerLogger;
 
 using process::Clock;
@@ -274,12 +276,16 @@ TEST_F(HealthCheckTest, HealthyTask)
 
     Result<JSON::Value> find = parse.get().find<JSON::Value>(
         "frameworks[0].tasks[0].statuses[0].healthy");
-    EXPECT_SOME_EQ(true, find);
+    EXPECT_SOME_TRUE(find);
   }
 
   // Verify that task health is exposed in the slave's state endpoint.
   {
-    Future<http::Response> response = http::get(slave.get()->pid, "state");
+    Future<http::Response> response = http::get(
+        slave.get()->pid,
+        "state",
+        None(),
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL));
 
     AWAIT_EXPECT_RESPONSE_STATUS_EQ(process::http::OK().status, response);
 
@@ -288,7 +294,7 @@ TEST_F(HealthCheckTest, HealthyTask)
 
     Result<JSON::Value> find = parse.get().find<JSON::Value>(
         "frameworks[0].executors[0].tasks[0].statuses[0].healthy");
-    EXPECT_SOME_EQ(true, find);
+    EXPECT_SOME_TRUE(find);
   }
 
   driver.stop();
@@ -577,12 +583,16 @@ TEST_F(HealthCheckTest, HealthStatusChange)
 
     Result<JSON::Value> find = parse.get().find<JSON::Value>(
         "frameworks[0].tasks[0].statuses[0].healthy");
-    EXPECT_SOME_EQ(true, find);
+    EXPECT_SOME_TRUE(find);
   }
 
   // Verify that task health is exposed in the slave's state endpoint.
   {
-    Future<http::Response> response = http::get(slave.get()->pid, "state");
+    Future<http::Response> response = http::get(
+        slave.get()->pid,
+        "state",
+        None(),
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL));
 
     AWAIT_EXPECT_RESPONSE_STATUS_EQ(process::http::OK().status, response);
 
@@ -591,7 +601,7 @@ TEST_F(HealthCheckTest, HealthStatusChange)
 
     Result<JSON::Value> find = parse.get().find<JSON::Value>(
         "frameworks[0].executors[0].tasks[0].statuses[0].healthy");
-    EXPECT_SOME_EQ(true, find);
+    EXPECT_SOME_TRUE(find);
   }
 
   AWAIT_READY(statusHealth2);
@@ -614,13 +624,17 @@ TEST_F(HealthCheckTest, HealthStatusChange)
 
     Result<JSON::Value> find = parse.get().find<JSON::Value>(
         "frameworks[0].tasks[0].statuses[0].healthy");
-    EXPECT_SOME_EQ(false, find);
+    EXPECT_SOME_FALSE(find);
   }
 
   // Verify that the task health change is reflected in the slave's
   // state endpoint.
   {
-    Future<http::Response> response = http::get(slave.get()->pid, "state");
+    Future<http::Response> response = http::get(
+        slave.get()->pid,
+        "state",
+        None(),
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL));
 
     AWAIT_EXPECT_RESPONSE_STATUS_EQ(process::http::OK().status, response);
 
@@ -629,7 +643,7 @@ TEST_F(HealthCheckTest, HealthStatusChange)
 
     Result<JSON::Value> find = parse.get().find<JSON::Value>(
         "frameworks[0].executors[0].tasks[0].statuses[0].healthy");
-    EXPECT_SOME_EQ(false, find);
+    EXPECT_SOME_FALSE(find);
   }
 
   AWAIT_READY(statusHealth3);
@@ -652,13 +666,17 @@ TEST_F(HealthCheckTest, HealthStatusChange)
 
     Result<JSON::Value> find = parse.get().find<JSON::Value>(
         "frameworks[0].tasks[0].statuses[0].healthy");
-    EXPECT_SOME_EQ(true, find);
+    EXPECT_SOME_TRUE(find);
   }
 
   // Verify through slave's state endpoint that the task is back to a
   // healthy state.
   {
-    Future<http::Response> response = http::get(slave.get()->pid, "state");
+    Future<http::Response> response = http::get(
+        slave.get()->pid,
+        "state",
+        None(),
+        createBasicAuthHeaders(DEFAULT_CREDENTIAL));
 
     AWAIT_EXPECT_RESPONSE_STATUS_EQ(process::http::OK().status, response);
 
@@ -667,7 +685,7 @@ TEST_F(HealthCheckTest, HealthStatusChange)
 
     Result<JSON::Value> find = parse.get().find<JSON::Value>(
         "frameworks[0].executors[0].tasks[0].statuses[0].healthy");
-    EXPECT_SOME_EQ(true, find);
+    EXPECT_SOME_TRUE(find);
   }
 
   os::rm(tmpPath); // Clean up the temporary file.

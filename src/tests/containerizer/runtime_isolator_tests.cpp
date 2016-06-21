@@ -40,13 +40,14 @@ using process::PID;
 
 using master::Master;
 
+using mesos::master::detector::MasterDetector;
+
 using slave::Slave;
 
 namespace mesos {
 namespace internal {
 namespace tests {
 
-#ifdef __linux__
 class DockerArchiveTest : public TemporaryDirectoryTest {};
 
 
@@ -251,7 +252,6 @@ TEST_F(DockerRuntimeIsolatorTest,
   slave::Flags flags = CreateSlaveFlags();
   flags.isolation = "docker/runtime,filesystem/linux";
   flags.image_providers = "docker";
-  flags.docker_registry = "https://registry-1.docker.io";
   flags.docker_store_dir = path::join(os::getcwd(), "store");
 
   Owned<MasterDetector> detector = master.get()->createDetector();
@@ -315,9 +315,6 @@ TEST_F(DockerRuntimeIsolatorTest,
   driver.stop();
   driver.join();
 }
-
-
-#endif // __linux__
 
 } // namespace tests {
 } // namespace internal {

@@ -23,6 +23,7 @@
 
 #include <process/future.hpp>
 #include <process/id.hpp>
+#include <process/owned.hpp>
 
 #include <stout/duration.hpp>
 #include <stout/hashmap.hpp>
@@ -44,10 +45,13 @@ namespace allocator {
 
 // We forward declare the hierarchical allocator process so that we
 // can typedef an instantiation of it with DRF sorters.
-template <typename RoleSorter, typename FrameworkSorter>
+template <
+    typename RoleSorter,
+    typename FrameworkSorter,
+    typename QuotaRoleSorter>
 class HierarchicalAllocatorProcess;
 
-typedef HierarchicalAllocatorProcess<DRFSorter, DRFSorter>
+typedef HierarchicalAllocatorProcess<DRFSorter, DRFSorter, DRFSorter>
 HierarchicalDRFAllocatorProcess;
 
 typedef MesosAllocator<HierarchicalDRFAllocatorProcess>
@@ -68,15 +72,17 @@ class HierarchicalAllocatorProcess : public MesosAllocatorProcess
 public:
   HierarchicalAllocatorProcess(
       const std::function<Sorter*()>& _roleSorterFactory,
-      const std::function<Sorter*()>& _frameworkSorterFactory)
+      const std::function<Sorter*()>& _frameworkSorterFactory,
+      const std::function<Sorter*()>& _quotaRoleSorterFactory)
     : ProcessBase(process::ID::generate("hierarchical-allocator")),
       initialized(false),
       paused(true),
       metrics(*this),
-      roleSorter(NULL),
-      quotaRoleSorter(NULL),
+      roleSorter(nullptr),
+      quotaRoleSorter(nullptr),
       roleSorterFactory(_roleSorterFactory),
-      frameworkSorterFactory(_frameworkSorterFactory) {}
+      frameworkSorterFactory(_frameworkSorterFactory),
+      quotaRoleSorterFactory(_quotaRoleSorterFactory) {}
 
   virtual ~HierarchicalAllocatorProcess() {}
 
@@ -277,6 +283,10 @@ protected:
     // Whether the framework desires revocable resources.
     bool revocable;
 
+    // Whether the framework is aware of GPU resources. See
+    // the documentation for the GPU_RESOURCES Capability.
+    bool gpuAware;
+
     // Active offer and inverse offer filters for the framework.
     hashmap<SlaveID, hashset<OfferFilter*>> offerFilters;
     hashmap<SlaveID, hashset<InverseOfferFilter*>> inverseOfferFilters;
@@ -286,6 +296,19 @@ protected:
   {
     return static_cast<double>(eventCount<process::DispatchEvent>());
   }
+
+  double _resources_total(
+      const std::string& resource);
+
+  double _resources_offered_or_allocated(
+      const std::string& resource);
+
+  double _quota_allocated(
+      const std::string& role,
+      const std::string& resource);
+
+  double _offer_filters_active(
+      const std::string& role);
 
   hashmap<FrameworkID, Framework> frameworks;
 
@@ -407,7 +430,7 @@ protected:
 
   // A sorter for active roles. This sorter determines the order in which
   // roles are allocated resources during Level 1 of the second stage.
-  Sorter* roleSorter;
+  process::Owned<Sorter> roleSorter;
 
   // A dedicated sorter for roles for which quota is set. This sorter
   // determines the order in which quota'ed roles are allocated resources
@@ -425,19 +448,18 @@ protected:
   // the quota roles as it pertains to their level of quota satisfaction.
   // Since revocable resources do not increase a role's level of satisfaction
   // toward its quota, we choose to exclude them from the quota role sorter.
-  Sorter* quotaRoleSorter;
+  process::Owned<Sorter> quotaRoleSorter;
 
   // A collection of sorters, one per active role. Each sorter determines
   // the order in which frameworks that belong to the same role are allocated
   // resources inside the role's share. These sorters are used during Level 2
   // for both the first and the second stages.
-  hashmap<std::string, Sorter*> frameworkSorters;
+  hashmap<std::string, process::Owned<Sorter>> frameworkSorters;
 
   // Factory functions for sorters.
-  //
-  // NOTE: `quotaRoleSorter` currently reuses `roleSorterFactory`.
   const std::function<Sorter*()> roleSorterFactory;
   const std::function<Sorter*()> frameworkSorterFactory;
+  const std::function<Sorter*()> quotaRoleSorterFactory;
 };
 
 
@@ -447,15 +469,21 @@ protected:
 // We map the templatized version of the `HierarchicalAllocatorProcess` to one
 // that relies on sorter factories in the internal namespace. This allows us
 // to keep the implemention of the allocator in the implementation file.
-template <typename RoleSorter, typename FrameworkSorter>
+template <
+    typename RoleSorter,
+    typename FrameworkSorter,
+    typename QuotaRoleSorter>
 class HierarchicalAllocatorProcess
   : public internal::HierarchicalAllocatorProcess
 {
 public:
   HierarchicalAllocatorProcess()
     : internal::HierarchicalAllocatorProcess(
-          []() -> Sorter* { return new RoleSorter(); },
-          []() -> Sorter* { return new FrameworkSorter(); }) {}
+          [this]() -> Sorter* {
+            return new RoleSorter(this->self(), "allocator/mesos/roles/");
+          },
+          []() -> Sorter* { return new FrameworkSorter(); },
+          []() -> Sorter* { return new QuotaRoleSorter(); }) {}
 };
 
 } // namespace allocator {

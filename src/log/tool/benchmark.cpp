@@ -21,6 +21,8 @@
 #include <fstream>
 #include <sstream>
 
+#include <mesos/log/log.hpp>
+
 #include <process/clock.hpp>
 #include <process/future.hpp>
 #include <process/process.hpp>
@@ -29,11 +31,11 @@
 #include <stout/bytes.hpp>
 #include <stout/error.hpp>
 #include <stout/foreach.hpp>
+#include <stout/os.hpp>
 #include <stout/stopwatch.hpp>
 #include <stout/strings.hpp>
 #include <stout/os/read.hpp>
 
-#include "log/log.hpp"
 #include "log/tool/initialize.hpp"
 #include "log/tool/benchmark.hpp"
 
@@ -47,6 +49,8 @@ using std::ifstream;
 using std::ofstream;
 using std::string;
 using std::vector;
+
+using mesos::log::Log;
 
 namespace mesos {
 namespace internal {
@@ -108,8 +112,8 @@ Try<Nothing> Benchmark::execute(int argc, char** argv)
       "\n");
 
   // Configure the tool by parsing command line arguments.
-  if (argc > 0 && argv != NULL) {
-    Try<Nothing> load = flags.load(None(), argc, argv);
+  if (argc > 0 && argv != nullptr) {
+    Try<flags::Warnings> load = flags.load(None(), argc, argv);
     if (load.isError()) {
       return Error(flags.usage(load.error()));
     }
@@ -120,6 +124,11 @@ Try<Nothing> Benchmark::execute(int argc, char** argv)
 
     process::initialize();
     logging::initialize(argv[0], flags);
+
+    // Log any flag warnings (after logging is initialized).
+    foreach (const flags::Warning& warning, load->warnings) {
+      LOG(WARNING) << warning.message;
+    }
   }
 
   if (flags.quorum.isNone()) {
@@ -208,7 +217,7 @@ Try<Nothing> Benchmark::execute(int argc, char** argv)
     if (flags.type == "one") {
       data.push_back(string(sizes[i].bytes(), static_cast<char>(0xff)));
     } else if (flags.type == "random") {
-      data.push_back(string(sizes[i].bytes(), ::random() % 256));
+      data.push_back(string(sizes[i].bytes(), os::random() % 256));
     } else {
       data.push_back(string(sizes[i].bytes(), 0));
     }

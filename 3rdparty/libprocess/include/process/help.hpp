@@ -40,13 +40,21 @@ namespace process {
 //     ### DESCRIPTION ###
 //     description
 //
+//     ### AUTHENTICATION ###
+//     authentication requirements
+//
+//     ### AUTHORIZATION ###
+//     authorization requirements and granularity
+//
 //     references
 //
-// See the 'USAGE', 'TLDR', 'DESCRIPTION', and 'REFERENCES' helpers
-// below to more easily construct your help pages.
+// See the 'USAGE', 'TLDR', 'DESCRIPTION', 'AUTHENTICATION', and
+// 'REFERENCES' helpers below to more easily construct your help pages.
 std::string HELP(
     const std::string& tldr,
     const Option<std::string>& description = None(),
+    const Option<std::string>& authentication = None(),
+    const Option<std::string>& authorization = None(),
     const Option<std::string>& references = None());
 
 // Helper for single-line usage that puts it in a blockquote as code
@@ -66,6 +74,25 @@ inline std::string TLDR(const std::string& tldr)
 
 template <typename... T>
 inline std::string DESCRIPTION(T&&... args)
+{
+  return strings::join("\n", std::forward<T>(args)..., "\n");
+}
+
+
+// Helper for description of Authentication requirements.
+inline std::string AUTHENTICATION(bool required)
+{
+  if (required) {
+    return "This endpoint requires authentication iff HTTP authentication is\n"
+           "enabled.\n";
+  }
+  return "This endpoint does not require authentication.\n";
+}
+
+
+// Helper for description of Authorization requirements.
+template <typename... T>
+inline std::string AUTHORIZATION(T&&... args)
 {
   return strings::join("\n", std::forward<T>(args)..., "\n");
 }

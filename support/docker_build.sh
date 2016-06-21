@@ -7,6 +7,7 @@ set -xe
 
 # Require the following environment variables to be set.
 : ${OS:?"Environment variable 'OS' must be set (e.g., OS=ubuntu14.04)"}
+: ${BUILDTOOL:?"Environment variable 'BUILDTOOL' must be set (e.g., BUILDTOOL=autotools)"}
 : ${COMPILER:?"Environment variable 'COMPILER' must be set (e.g., COMPILER=gcc)"}
 : ${CONFIGURATION:?"Environment variable 'CONFIGURATION' must be set (e.g., CONFIGURATION='--enable-libevent --enable-ssl')"}
 : ${ENVIRONMENT:?"Environment variable 'ENVIRONMENT' must be set (e.g., ENVIRONMENT='GLOG_v=1 MESOS_VERBOSE=1')"}
@@ -41,13 +42,13 @@ case $OS in
     append_dockerfile "RUN yum install -y which"
     append_dockerfile "RUN yum groupinstall -y 'Development Tools'"
     append_dockerfile "RUN yum install -y epel-release" # Needed for clang.
-    append_dockerfile "RUN yum install -y clang git maven"
+    append_dockerfile "RUN yum install -y clang git maven cmake"
     append_dockerfile "RUN yum install -y java-1.8.0-openjdk-devel python-devel zlib-devel libcurl-devel openssl-devel cyrus-sasl-devel cyrus-sasl-md5 apr-devel subversion-devel apr-utils-devel libevent-devel libev-devel"
 
     # Add an unprivileged user.
     append_dockerfile "RUN adduser mesos"
    ;;
-  ubuntu*)
+  *ubuntu*)
     # NOTE: Currently we only support Ubuntu13.10+ due to the
     # compiler versions needed to compile Mesos.
 
@@ -58,15 +59,14 @@ case $OS in
     append_dockerfile "RUN rm -rf /var/lib/apt/lists/*"
 
     # Install dependencies.
+    # IBM Power only supports Ubuntu 14.04 and gcc compiler.
+    [ "$(uname -m)" = "x86_64" ] && CLANG_PKG=clang || CLANG_PKG=
     append_dockerfile "RUN apt-get update"
-    append_dockerfile "RUN apt-get -y install build-essential clang git maven autoconf libtool"
-    append_dockerfile "RUN apt-get -y install openjdk-7-jdk python-dev python-boto libcurl4-nss-dev libsasl2-dev libapr1-dev libsvn-dev libevent-dev libev-dev"
+    append_dockerfile "RUN apt-get -y install build-essential $CLANG_PKG git maven autoconf libtool cmake"
+    append_dockerfile "RUN apt-get -y install openjdk-7-jdk python-dev libcurl4-nss-dev libsasl2-dev libapr1-dev libsvn-dev libevent-dev libev-dev"
 
     # Add an unpriviliged user.
     append_dockerfile "RUN adduser --disabled-password --gecos '' mesos"
-
-    # Disable any tests failing on Ubuntu.
-    append_dockerfile "ENV GTEST_FILTER -FsTest.FileSystemTableRead"
     ;;
   *)
     echo "Unknown OS $OS"
@@ -114,7 +114,41 @@ append_dockerfile "ENV DISTCHECK_CONFIGURE_FLAGS $CONFIGURATION"
 append_dockerfile "ENV $ENVIRONMENT"
 
 # Build and check Mesos.
-append_dockerfile "CMD ./bootstrap && ./configure $CONFIGURATION && make -j8 distcheck"
+case $BUILDTOOL in
+  autotools)
+    append_dockerfile "CMD ./bootstrap && ./configure $CONFIGURATION && make -j8 distcheck"
+    ;;
+  cmake)
+    # Transform autotools-like parameters to cmake-like.
+    # Remove "'".
+    CONFIGURATION=${CONFIGURATION//\'/""}
+    # Replace "-" with "_".
+    CONFIGURATION=${CONFIGURATION//-/"_"}
+    # Replace "__" with "-D".
+    CONFIGURATION=${CONFIGURATION//__/"-D"}
+    # To Upper Case.
+    CONFIGURATION=${CONFIGURATION^^}
+
+    # Add "=1" suffix to each variable.
+    IFS=' ' read -r  -a array <<< "$CONFIGURATION"
+
+    CONFIGURATION=""
+    for element in "${array[@]}"
+    do
+        CONFIGURATION="$CONFIGURATION $element=1"
+    done
+
+    # MESOS-5433: `distcheck` is not currently supported by our CMake scripts.
+    # MESOS-5624: In source build is not yet supported.
+    # Also, we run `make` in addition to `make check` because the latter only
+    # compiles stout and libprocess sources and tests.
+    append_dockerfile "CMD ./bootstrap && mkdir build && cd build && cmake $CONFIGURATION .. && make -j8 check && make -j8"
+    ;;
+  *)
+    echo "Unknown build tool $BUILDTOOL"
+    exit 1
+    ;;
+esac
 
 # Generate a random image tag.
 TAG=mesos-`date +%s`-$RANDOM

@@ -14,7 +14,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#ifndef __WINDOWS__
 #include <unistd.h> // For pid_t and STDOUT_FILENO.
+#endif // __WINDOWS__
 
 #include <iostream>
 
@@ -64,7 +66,7 @@ int main(int argc, char** argv)
 
   Flags flags;
 
-  Try<Nothing> load = flags.load(None(), argc, argv);
+  Try<flags::Warnings> load = flags.load(None(), argc, argv);
 
   if (load.isError()) {
     cerr << flags.usage(load.error()) << endl;
@@ -74,6 +76,11 @@ int main(int argc, char** argv)
   if (flags.help) {
     cout << flags.usage() << endl;
     return EXIT_SUCCESS;
+  }
+
+  // Log any flag warnings.
+  foreach (const flags::Warning& warning, load->warnings) {
+    LOG(WARNING) << warning.message;
   }
 
   if (flags.pid.isNone()) {

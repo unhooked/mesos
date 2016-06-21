@@ -108,10 +108,19 @@ protected:
   {
     VLOG(1) << "Committing suicide by killing the process group";
 
+#ifndef __WINDOWS__
     // TODO(vinod): Invoke killtree without killing ourselves.
     // Kill the process group (including ourself).
     killpg(0, SIGKILL);
-
+#else
+    LOG(WARNING) << "Shutting down process group. Windows does not support "
+      "`killpg`, so we simply call `exit` on the assumption "
+      "that the process was generated with the "
+      "`MesosContainerizer`, which uses the 'close on exit' "
+      "feature of job objects to make sure all child processes "
+      "are killed when a parent process exits";
+    exit(0);
+#endif // __WINDOWS__
     // The signal might not get delivered immediately, so sleep for a
     // few seconds. Worst case scenario, exit abnormally.
     os::sleep(Seconds(5));
@@ -155,10 +164,10 @@ public:
     // Load any logging flags from the environment.
     logging::Flags flags;
 
-    Try<Nothing> load = flags.load("MESOS_");
+    Try<flags::Warnings> load = flags.load("MESOS_");
 
     if (load.isError()) {
-      EXIT(1) << "Failed to load flags: " << load.error();
+      EXIT(EXIT_FAILURE) << "Failed to load flags: " << load.error();
     }
 
     // Initialize libprocess.
@@ -169,6 +178,11 @@ public:
       logging::initialize("mesos", flags);
     } else {
       VLOG(1) << "Disabling initialization of GLOG logging";
+    }
+
+    // Log any flag warnings (after logging is initialized).
+    foreach (const flags::Warning& warning, load->warnings) {
+      LOG(WARNING) << warning.message;
     }
 
     LOG(INFO) << "Version: " << MESOS_VERSION;
@@ -183,7 +197,8 @@ public:
     // Get agent PID from environment.
     value = os::getenv("MESOS_SLAVE_PID");
     if (value.isNone()) {
-      EXIT(1) << "Expecting 'MESOS_SLAVE_PID' to be set in the environment";
+      EXIT(EXIT_FAILURE)
+        << "Expecting 'MESOS_SLAVE_PID' to be set in the environment";
     }
 
     UPID upid(value.get());
@@ -212,8 +227,8 @@ public:
 
         recoveryTimeout = _recoveryTimeout.get();
       } else {
-        EXIT(1) << "Expecting 'MESOS_RECOVERY_TIMEOUT' to be set in the "
-                << "environment";
+        EXIT(EXIT_FAILURE)
+          << "Expecting 'MESOS_RECOVERY_TIMEOUT' to be set in the environment";
       }
 
       // Get maximum backoff factor from environment.
@@ -227,12 +242,13 @@ public:
 
         maxBackoff = _maxBackoff.get();
       } else {
-        EXIT(1) << "Expecting 'MESOS_SUBSCRIPTION_BACKOFF_MAX' to be set "
-                << "in the environment";
+        EXIT(EXIT_FAILURE)
+          << "Expecting 'MESOS_SUBSCRIPTION_BACKOFF_MAX' to be set"
+          << " in the environment";
       }
     }
 
-    // Get shutdown grace period from environment.
+    // Get executor shutdown grace period from the environment.
     value = os::getenv("MESOS_EXECUTOR_SHUTDOWN_GRACE_PERIOD");
     if (value.isSome()) {
       Try<Duration> _shutdownGracePeriod = Duration::parse(value.get());
@@ -243,8 +259,9 @@ public:
 
       shutdownGracePeriod = _shutdownGracePeriod.get();
     } else {
-      EXIT(1) << "Expecting 'MESOS_EXECUTOR_SHUTDOWN_GRACE_PERIOD' to be set "
-              << "in the environment";
+      EXIT(EXIT_FAILURE)
+        << "Expecting 'MESOS_EXECUTOR_SHUTDOWN_GRACE_PERIOD' to be set"
+        << " in the environment";
     }
   }
 
@@ -477,7 +494,7 @@ protected:
 
     // Linearly backoff by picking a random duration between 0 and
     // `maxBackoff`.
-    Duration backoff = maxBackoff.get() * ((double) ::random() / RAND_MAX);
+    Duration backoff = maxBackoff.get() * ((double) os::random() / RAND_MAX);
 
     VLOG(1) << "Will retry connecting with the agent again in " << backoff;
 

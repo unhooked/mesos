@@ -47,6 +47,12 @@
 
 #include "master/allocator/mesos/allocator.hpp"
 
+#include "master/contender/standalone.hpp"
+#include "master/contender/zookeeper.hpp"
+
+#include "master/detector/standalone.hpp"
+#include "master/detector/zookeeper.hpp"
+
 #include "sched/constants.hpp"
 
 #include "slave/constants.hpp"
@@ -60,6 +66,9 @@ using namespace mesos::internal::protobuf;
 using mesos::internal::master::Master;
 
 using mesos::internal::slave::Slave;
+
+using mesos::master::detector::MasterDetector;
+using mesos::master::detector::StandaloneMasterDetector;
 
 using process::Clock;
 using process::Future;
@@ -250,7 +259,11 @@ TEST_F(FaultToleranceTest, ReregisterCompletedFrameworks)
       1u,
       masterJSON.values["frameworks"].as<JSON::Array>().values.size());
 
-  Future<Response> slaveState = process::http::get(slave.get()->pid, "state");
+  Future<Response> slaveState = process::http::get(
+      slave.get()->pid,
+      "state",
+      None(),
+      createBasicAuthHeaders(DEFAULT_CREDENTIAL));
 
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, slaveState);
 
@@ -301,7 +314,11 @@ TEST_F(FaultToleranceTest, ReregisterCompletedFrameworks)
       1u,
       masterJSON.values["frameworks"].as<JSON::Array>().values.size());
 
-  slaveState = process::http::get(slave.get()->pid, "state");
+  slaveState = process::http::get(
+      slave.get()->pid,
+      "state",
+      None(),
+      createBasicAuthHeaders(DEFAULT_CREDENTIAL));
 
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, slaveState);
 
@@ -332,7 +349,11 @@ TEST_F(FaultToleranceTest, ReregisterCompletedFrameworks)
   AWAIT_READY(executorLost);
 
   // Verify slave sees completed framework.
-  slaveState = process::http::get(slave.get()->pid, "state");
+  slaveState = process::http::get(
+      slave.get()->pid,
+      "state",
+      None(),
+      createBasicAuthHeaders(DEFAULT_CREDENTIAL));
 
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, slaveState);
 
@@ -508,6 +529,10 @@ TEST_F(FaultToleranceTest, SchedulerReregisterAfterFailoverTimeout)
   Future<Nothing> frameworkFailoverTimeout =
     FUTURE_DISPATCH(_, &Master::frameworkFailoverTimeout);
 
+  Future<Nothing> sched1Error;
+  EXPECT_CALL(sched1, error(&driver1, _))
+    .WillOnce(FutureSatisfy(&sched1Error));
+
   // Simulate framework disconnection.
   ASSERT_TRUE(process::inject::exited(
       frameworkRegisteredMessage.get().to, master.get()->pid));
@@ -527,6 +552,8 @@ TEST_F(FaultToleranceTest, SchedulerReregisterAfterFailoverTimeout)
 
   // Wait until master actually marks the framework as completed.
   AWAIT_READY(frameworkFailoverTimeout);
+
+  AWAIT_READY(sched1Error);
 
   // Now launch the second (i.e., failover) scheduler using the
   // framework id recorded from the first scheduler.

@@ -32,6 +32,7 @@
 #include <process/pid.hpp>
 
 #include <stout/gtest.hpp>
+#include <stout/none.hpp>
 #include <stout/strings.hpp>
 #include <stout/uuid.hpp>
 
@@ -50,6 +51,8 @@ using google::protobuf::RepeatedPtrField;
 using mesos::internal::master::Master;
 
 using mesos::internal::slave::Slave;
+
+using mesos::master::detector::MasterDetector;
 
 using process::Clock;
 using process::Future;
@@ -266,20 +269,6 @@ TEST_F(ReserveOperationValidationTest, NonMatchingPrincipal)
 }
 
 
-// This test verifies that validation fails if the framework's
-// 'principal' is not set.
-TEST_F(ReserveOperationValidationTest, FrameworkMissingPrincipal)
-{
-  Resource resource = Resources::parse("cpus", "8", "role").get();
-  resource.mutable_reservation()->CopyFrom(createReservationInfo("principal"));
-
-  Offer::Operation::Reserve reserve;
-  reserve.add_resources()->CopyFrom(resource);
-
-  EXPECT_SOME(operation::validate(reserve, None()));
-}
-
-
 // This test verifies that validation fails if the `principal`
 // in `ReservationInfo` is not set.
 TEST_F(ReserveOperationValidationTest, ReservationInfoMissingPrincipal)
@@ -430,13 +419,13 @@ TEST_F(CreateOperationValidationTest, PersistentVolumes)
   Offer::Operation::Create create;
   create.add_volumes()->CopyFrom(volume);
 
-  EXPECT_NONE(operation::validate(create, Resources()));
+  EXPECT_NONE(operation::validate(create, Resources(), None()));
 
   Resource cpus = Resources::parse("cpus", "2", "*").get();
 
   create.add_volumes()->CopyFrom(cpus);
 
-  EXPECT_SOME(operation::validate(create, Resources()));
+  EXPECT_SOME(operation::validate(create, Resources(), None()));
 }
 
 
@@ -448,16 +437,46 @@ TEST_F(CreateOperationValidationTest, DuplicatedPersistenceID)
   Offer::Operation::Create create;
   create.add_volumes()->CopyFrom(volume1);
 
-  EXPECT_NONE(operation::validate(create, Resources()));
+  EXPECT_NONE(operation::validate(create, Resources(), None()));
 
   Resource volume2 = Resources::parse("disk", "64", "role1").get();
   volume2.mutable_disk()->CopyFrom(createDiskInfo("id1", "path1"));
 
-  EXPECT_SOME(operation::validate(create, volume1));
+  EXPECT_SOME(operation::validate(create, volume1, None()));
 
   create.add_volumes()->CopyFrom(volume2);
 
-  EXPECT_SOME(operation::validate(create, Resources()));
+  EXPECT_SOME(operation::validate(create, Resources(), None()));
+}
+
+
+// This test confirms that Create operations will be invalidated if they contain
+// a principal in `DiskInfo` that does not match the principal of the framework
+// or operator performing the operation.
+TEST_F(CreateOperationValidationTest, NonMatchingPrincipal)
+{
+  // An operation with an incorrect principal in `DiskInfo.Persistence`.
+  {
+    Resource volume = Resources::parse("disk", "128", "role1").get();
+    volume.mutable_disk()->CopyFrom(
+        createDiskInfo("id1", "path1", None(), None(), None(), "principal"));
+
+    Offer::Operation::Create create;
+    create.add_volumes()->CopyFrom(volume);
+
+    EXPECT_SOME(operation::validate(create, Resources(), "other-principal"));
+  }
+
+  // An operation without a principal in `DiskInfo.Persistence`.
+  {
+    Resource volume = Resources::parse("disk", "128", "role1").get();
+    volume.mutable_disk()->CopyFrom(createDiskInfo("id1", "path1"));
+
+    Offer::Operation::Create create;
+    create.add_volumes()->CopyFrom(volume);
+
+    EXPECT_SOME(operation::validate(create, Resources(), "principal"));
+  }
 }
 
 
@@ -1164,6 +1183,121 @@ TEST_F(TaskValidationTest, TaskAndExecutorUseRevocableResources)
   EXPECT_SOME(task::internal::validateResources(task));
 }
 
+
+// Ensures that negative executor shutdown grace period in `ExecutorInfo`
+// is rejected during `TaskInfo` validation.
+TEST_F(TaskValidationTest, ExecutorShutdownGracePeriodIsNonNegative)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get());
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .Times(1);
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  EXPECT_NE(0u, offers->size());
+  Offer offer = offers.get()[0];
+
+  ExecutorInfo executorInfo(DEFAULT_EXECUTOR_INFO);
+  executorInfo.mutable_shutdown_grace_period()->set_nanoseconds(
+      Seconds(-1).ns());
+
+  TaskInfo task;
+  task.set_name("");
+  task.mutable_task_id()->set_value("1");
+  task.mutable_slave_id()->MergeFrom(offer.slave_id());
+  task.mutable_resources()->MergeFrom(offer.resources());
+  task.mutable_executor()->MergeFrom(executorInfo);
+
+  Future<TaskStatus> status;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&status));
+
+  driver.launchTasks(offer.id(), {task});
+
+  AWAIT_READY(status);
+  EXPECT_EQ(task.task_id(), status->task_id());
+  EXPECT_EQ(TASK_ERROR, status->state());
+  EXPECT_EQ(TaskStatus::REASON_TASK_INVALID, status->reason());
+  EXPECT_TRUE(status->has_message());
+  EXPECT_EQ("ExecutorInfo's 'shutdown_grace_period' must be non-negative",
+            status->message());
+
+  driver.stop();
+  driver.join();
+}
+
+
+// Ensures that negative grace period in `KillPolicy`
+// is rejected during `TaskInfo` validation.
+TEST_F(TaskValidationTest, KillPolicyGracePeriodIsNonNegative)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get());
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .Times(1);
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  EXPECT_NE(0u, offers->size());
+  Offer offer = offers.get()[0];
+
+  TaskInfo task;
+  task.set_name("");
+  task.mutable_task_id()->set_value("1");
+  task.mutable_slave_id()->MergeFrom(offer.slave_id());
+  task.mutable_resources()->MergeFrom(offer.resources());
+  task.mutable_executor()->MergeFrom(DEFAULT_EXECUTOR_INFO);
+  task.mutable_kill_policy()->mutable_grace_period()->set_nanoseconds(
+      Seconds(-1).ns());
+
+  Future<TaskStatus> status;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&status));
+
+  driver.launchTasks(offer.id(), {task});
+
+  AWAIT_READY(status);
+  EXPECT_EQ(task.task_id(), status->task_id());
+  EXPECT_EQ(TASK_ERROR, status->state());
+  EXPECT_EQ(TaskStatus::REASON_TASK_INVALID, status->reason());
+  EXPECT_TRUE(status->has_message());
+  EXPECT_EQ("Task's 'kill_policy.grace_period' must be non-negative",
+            status->message());
+
+  driver.stop();
+  driver.join();
+}
 
 // TODO(jieyu): Add tests for checking duplicated persistence ID
 // against offered resources.

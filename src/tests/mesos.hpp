@@ -39,6 +39,8 @@
 
 #include <mesos/fetcher/fetcher.hpp>
 
+#include <mesos/master/detector.hpp>
+
 #include <mesos/slave/container_logger.hpp>
 #include <mesos/slave/qos_controller.hpp>
 #include <mesos/slave/resource_estimator.hpp>
@@ -56,11 +58,9 @@
 #include <stout/bytes.hpp>
 #include <stout/foreach.hpp>
 #include <stout/gtest.hpp>
-#include <stout/json.hpp>
 #include <stout/lambda.hpp>
 #include <stout/none.hpp>
 #include <stout/option.hpp>
-#include <stout/os.hpp>
 #include <stout/stringify.hpp>
 #include <stout/try.hpp>
 #include <stout/uuid.hpp>
@@ -69,9 +69,9 @@
 
 #include "messages/messages.hpp" // For google::protobuf::Message.
 
-#include "master/detector.hpp"
 #include "master/master.hpp"
 
+#include "slave/constants.hpp"
 #include "slave/slave.hpp"
 
 #include "slave/containerizer/containerizer.hpp"
@@ -98,6 +98,8 @@ namespace mesos {
 namespace internal {
 namespace tests {
 
+constexpr char DEFAULT_HTTP_AUTHENTICATION_REALM[] = "test-realm";
+
 // Forward declarations.
 class MockExecutor;
 
@@ -106,6 +108,10 @@ class MockExecutor;
 // Mesos.  In this case, the class is an alias of `TemporaryDirectoryTest`.
 class MesosTest : public SSLTemporaryDirectoryTest
 {
+public:
+  static void SetUpTestCase();
+  static void TearDownTestCase();
+
 protected:
   MesosTest(const Option<zookeeper::URL>& url = None());
 
@@ -157,60 +163,66 @@ protected:
 
   // Starts a slave with the specified detector and flags.
   virtual Try<process::Owned<cluster::Slave>> StartSlave(
-      MasterDetector* detector,
+      mesos::master::detector::MasterDetector* detector,
       const Option<slave::Flags>& flags = None());
 
   // Starts a slave with the specified detector, containerizer, and flags.
   virtual Try<process::Owned<cluster::Slave>> StartSlave(
-      MasterDetector* detector,
+      mesos::master::detector::MasterDetector* detector,
       slave::Containerizer* containerizer,
       const Option<slave::Flags>& flags = None());
 
   // Starts a slave with the specified detector, containerizer, id, and flags.
   virtual Try<process::Owned<cluster::Slave>> StartSlave(
-      MasterDetector* detector,
+      mesos::master::detector::MasterDetector* detector,
       slave::Containerizer* containerizer,
       const std::string& id,
       const Option<slave::Flags>& flags = None());
 
   // Starts a slave with the specified detector, GC, and flags.
   virtual Try<process::Owned<cluster::Slave>> StartSlave(
-      MasterDetector* detector,
+      mesos::master::detector::MasterDetector* detector,
       slave::GarbageCollector* gc,
       const Option<slave::Flags>& flags = None());
 
   // Starts a slave with the specified detector, resource estimator, and flags.
   virtual Try<process::Owned<cluster::Slave>> StartSlave(
-      MasterDetector* detector,
+      mesos::master::detector::MasterDetector* detector,
       mesos::slave::ResourceEstimator* resourceEstimator,
       const Option<slave::Flags>& flags = None());
 
   // Starts a slave with the specified detector, containerizer,
   // resource estimator, and flags.
   virtual Try<process::Owned<cluster::Slave>> StartSlave(
-      MasterDetector* detector,
+      mesos::master::detector::MasterDetector* detector,
       slave::Containerizer* containerizer,
       mesos::slave::ResourceEstimator* resourceEstimator,
       const Option<slave::Flags>& flags = None());
 
   // Starts a slave with the specified detector, QoS Controller, and flags.
   virtual Try<process::Owned<cluster::Slave>> StartSlave(
-      MasterDetector* detector,
+      mesos::master::detector::MasterDetector* detector,
       mesos::slave::QoSController* qosController,
       const Option<slave::Flags>& flags = None());
 
   // Starts a slave with the specified detector, containerizer,
   // QoS Controller, and flags.
   virtual Try<process::Owned<cluster::Slave>> StartSlave(
-      MasterDetector* detector,
+      mesos::master::detector::MasterDetector* detector,
       slave::Containerizer* containerizer,
       mesos::slave::QoSController* qosController,
+      const Option<slave::Flags>& flags = None());
+
+  // Starts a slave with the specified detector, authorizer, and flags.
+  virtual Try<process::Owned<cluster::Slave>> StartSlave(
+      mesos::master::detector::MasterDetector* detector,
+      mesos::Authorizer* authorizer,
       const Option<slave::Flags>& flags = None());
 
   Option<zookeeper::URL> zookeeperUrl;
 
   const std::string defaultAgentResourcesString{
-    "cpus:2;mem:1024;disk:1024;ports:[31000-32000]"};
+    "cpus:2;gpus:0;mem:1024;disk:1024;ports:[31000-32000]"};
 };
 
 
@@ -280,7 +292,7 @@ public:
   static void TearDownTestCase()
   {
     delete server;
-    server = NULL;
+    server = nullptr;
   }
 
   virtual void SetUp()
@@ -510,12 +522,17 @@ inline Resource::DiskInfo createDiskInfo(
     const Option<std::string>& containerPath,
     const Option<Volume::Mode>& mode = None(),
     const Option<std::string>& hostPath = None(),
-    const Option<Resource::DiskInfo::Source>& source = None())
+    const Option<Resource::DiskInfo::Source>& source = None(),
+    const Option<std::string>& principal = None())
 {
   Resource::DiskInfo info;
 
   if (persistenceId.isSome()) {
     info.mutable_persistence()->set_id(persistenceId.get());
+  }
+
+  if (principal.isSome()) {
+    info.mutable_persistence()->set_principal(principal.get());
   }
 
   if (containerPath.isSome()) {
@@ -589,7 +606,8 @@ inline Resource createPersistentVolume(
     const std::string& persistenceId,
     const std::string& containerPath,
     const Option<std::string>& reservationPrincipal = None(),
-    const Option<Resource::DiskInfo::Source>& source = None())
+    const Option<Resource::DiskInfo::Source>& source = None(),
+    const Option<std::string>& creatorPrincipal = None())
 {
   Resource volume = Resources::parse(
       "disk",
@@ -597,7 +615,13 @@ inline Resource createPersistentVolume(
       role).get();
 
   volume.mutable_disk()->CopyFrom(
-      createDiskInfo(persistenceId, containerPath, None(), None(), source));
+      createDiskInfo(
+          persistenceId,
+          containerPath,
+          None(),
+          None(),
+          source,
+          creatorPrincipal));
 
   if (reservationPrincipal.isSome()) {
     volume.mutable_reservation()->set_principal(reservationPrincipal.get());
@@ -613,7 +637,8 @@ inline Resource createPersistentVolume(
     Resource volume,
     const std::string& persistenceId,
     const std::string& containerPath,
-    const Option<std::string>& reservationPrincipal = None())
+    const Option<std::string>& reservationPrincipal = None(),
+    const Option<std::string>& creatorPrincipal = None())
 {
   Option<Resource::DiskInfo::Source> source = None();
   if (volume.has_disk() && volume.disk().has_source()) {
@@ -621,7 +646,13 @@ inline Resource createPersistentVolume(
   }
 
   volume.mutable_disk()->CopyFrom(
-      createDiskInfo(persistenceId, containerPath, None(), None(), source));
+      createDiskInfo(
+          persistenceId,
+          containerPath,
+          None(),
+          None(),
+          source,
+          creatorPrincipal));
 
   if (reservationPrincipal.isSome()) {
     volume.mutable_reservation()->set_principal(reservationPrincipal.get());
@@ -639,6 +670,40 @@ inline process::http::Headers createBasicAuthHeaders(
       "Basic " +
         base64::encode(credential.principal() + ":" + credential.secret())
   }};
+}
+
+
+// Create WeightInfos from the specified weights flag.
+inline google::protobuf::RepeatedPtrField<WeightInfo> createWeightInfos(
+    const std::string& weightsFlag)
+{
+  google::protobuf::RepeatedPtrField<WeightInfo> infos;
+  std::vector<std::string> tokens = strings::tokenize(weightsFlag, ",");
+  foreach (const std::string& token, tokens) {
+    std::vector<std::string> pair = strings::tokenize(token, "=");
+    EXPECT_EQ(2u, pair.size());
+    double weight = atof(pair[1].c_str());
+    WeightInfo weightInfo;
+    weightInfo.set_role(pair[0]);
+    weightInfo.set_weight(weight);
+    infos.Add()->CopyFrom(weightInfo);
+  }
+
+  return infos;
+}
+
+
+// Convert WeightInfos protobuf to weights hashmap.
+inline hashmap<std::string, double> convertToHashmap(
+    const google::protobuf::RepeatedPtrField<WeightInfo> weightInfos)
+{
+  hashmap<std::string, double> weights;
+
+  foreach (const WeightInfo& weightInfo, weightInfos) {
+    weights[weightInfo.role()] = weightInfo.weight();
+  }
+
+  return weights;
 }
 
 
@@ -691,6 +756,17 @@ inline Offer::Operation LAUNCH(const std::vector<TaskInfo>& tasks)
   }
 
   return operation;
+}
+
+
+inline Parameters parameterize(const ACLs& acls)
+{
+  Parameters parameters;
+  Parameter* parameter = parameters.add_parameter();
+  parameter->set_key("acls");
+  parameter->set_value(std::string(jsonify(JSON::Protobuf(acls))));
+
+  return parameters;
 }
 
 
@@ -836,7 +912,7 @@ class TestingMesosSchedulerDriver : public MesosSchedulerDriver
 public:
   TestingMesosSchedulerDriver(
       Scheduler* scheduler,
-      MasterDetector* _detector)
+      mesos::master::detector::MasterDetector* _detector)
     : MesosSchedulerDriver(
           scheduler,
           DEFAULT_FRAMEWORK_INFO,
@@ -846,12 +922,13 @@ public:
   {
     // No-op destructor as _detector lives on the stack.
     detector =
-      std::shared_ptr<MasterDetector>(_detector, [](MasterDetector*) {});
+      std::shared_ptr<mesos::master::detector::MasterDetector>(
+          _detector, [](mesos::master::detector::MasterDetector*) {});
   }
 
   TestingMesosSchedulerDriver(
       Scheduler* scheduler,
-      MasterDetector* _detector,
+      mesos::master::detector::MasterDetector* _detector,
       const FrameworkInfo& framework,
       bool implicitAcknowledgements = true)
     : MesosSchedulerDriver(
@@ -863,12 +940,13 @@ public:
   {
     // No-op destructor as _detector lives on the stack.
     detector =
-      std::shared_ptr<MasterDetector>(_detector, [](MasterDetector*) {});
+      std::shared_ptr<mesos::master::detector::MasterDetector>(
+          _detector, [](mesos::master::detector::MasterDetector*) {});
   }
 
   TestingMesosSchedulerDriver(
       Scheduler* scheduler,
-      MasterDetector* _detector,
+      mesos::master::detector::MasterDetector* _detector,
       const FrameworkInfo& framework,
       bool implicitAcknowledgements,
       const Credential& credential)
@@ -881,7 +959,8 @@ public:
   {
     // No-op destructor as _detector lives on the stack.
     detector =
-      std::shared_ptr<MasterDetector>(_detector, [](MasterDetector*) {});
+      std::shared_ptr<mesos::master::detector::MasterDetector>(
+          _detector, [](mesos::master::detector::MasterDetector*) {});
   }
 };
 
@@ -897,7 +976,13 @@ public:
   MOCK_METHOD1_T(heartbeat, void(Mesos*));
   MOCK_METHOD2_T(subscribed, void(Mesos*, const typename Event::Subscribed&));
   MOCK_METHOD2_T(offers, void(Mesos*, const typename Event::Offers&));
+  MOCK_METHOD2_T(
+      inverseOffers,
+      void(Mesos*, const typename Event::InverseOffers&));
   MOCK_METHOD2_T(rescind, void(Mesos*, const typename Event::Rescind&));
+  MOCK_METHOD2_T(
+      rescindInverseOffers,
+      void(Mesos*, const typename Event::RescindInverseOffer&));
   MOCK_METHOD2_T(update, void(Mesos*, const typename Event::Update&));
   MOCK_METHOD2_T(message, void(Mesos*, const typename Event::Message&));
   MOCK_METHOD2_T(failure, void(Mesos*, const typename Event::Failure&));
@@ -912,8 +997,14 @@ public:
       case Event::OFFERS:
         offers(mesos, event.offers());
         break;
+      case Event::INVERSE_OFFERS:
+        inverseOffers(mesos, event.inverse_offers());
+        break;
       case Event::RESCIND:
         rescind(mesos, event.rescind());
+        break;
+      case Event::RESCIND_INVERSE_OFFER:
+        rescindInverseOffers(mesos, event.rescind_inverse_offer());
         break;
       case Event::UPDATE:
         update(mesos, event.update());
@@ -930,6 +1021,9 @@ public:
       case Event::HEARTBEAT:
         heartbeat(mesos);
         break;
+      case Event::UNKNOWN:
+        LOG(FATAL) << "Received unexpected UNKNOWN event";
+        break;
     }
   }
 };
@@ -945,7 +1039,8 @@ public:
       const std::string& master,
       ContentType contentType,
       const std::shared_ptr<MockHTTPScheduler<Mesos, Event>>& _scheduler,
-      const Option<std::shared_ptr<MasterDetector>>& detector = None())
+      const Option<std::shared_ptr<mesos::master::detector::MasterDetector>>&
+          detector = None())
     : Mesos(
           master,
           contentType,
@@ -960,6 +1055,7 @@ public:
           lambda::bind(&TestMesos<Mesos, Event>::events,
                        this,
                        lambda::_1),
+          DEFAULT_V1_CREDENTIAL,
           detector),
       scheduler(_scheduler) {}
 
@@ -1052,6 +1148,9 @@ public:
         break;
       case Event::ERROR:
         error(mesos, event.error());
+        break;
+      case Event::UNKNOWN:
+        LOG(FATAL) << "Received unexpected UNKNOWN event";
         break;
     }
   }
@@ -1221,9 +1320,10 @@ class MockSlave : public slave::Slave
 public:
   MockSlave(
       const slave::Flags& flags,
-      MasterDetector* detector,
+      mesos::master::detector::MasterDetector* detector,
       slave::Containerizer* containerizer,
-      const Option<mesos::slave::QoSController*>& qosController = None());
+      const Option<mesos::slave::QoSController*>& qosController = None(),
+      const Option<mesos::Authorizer*>& authorizer = None());
 
   virtual ~MockSlave();
 
@@ -1251,15 +1351,13 @@ public:
       const FrameworkInfo& frameworkInfo,
       const TaskInfo& task);
 
-  MOCK_METHOD3(killTask, void(
+  MOCK_METHOD2(killTask, void(
       const process::UPID& from,
-      const FrameworkID& frameworkId,
-      const TaskID& taskId));
+      const KillTaskMessage& killTaskMessage));
 
   void unmocked_killTask(
       const process::UPID& from,
-      const FrameworkID& frameworkId,
-      const TaskID& taskId);
+      const KillTaskMessage& killTaskMessage);
 
   MOCK_METHOD1(removeFramework, void(
       slave::Framework* framework));
@@ -1280,6 +1378,10 @@ public:
   MOCK_METHOD1(_qosCorrections, void(
       const process::Future<std::list<
           mesos::slave::QoSCorrection>>& correction));
+
+  MOCK_METHOD0(usage, process::Future<ResourceUsage>());
+
+  process::Future<ResourceUsage> unmocked_usage();
 
 private:
   Files files;
@@ -1361,12 +1463,13 @@ class MockDocker : public Docker
 public:
   MockDocker(
       const std::string& path,
-      const std::string& socket);
+      const std::string& socket,
+      const Option<JSON::Object>& config = None());
   virtual ~MockDocker();
 
   MOCK_CONST_METHOD9(
       run,
-      process::Future<Nothing>(
+      process::Future<Option<int>>(
           const mesos::ContainerInfo&,
           const mesos::CommandInfo&,
           const std::string&,
@@ -1402,7 +1505,7 @@ public:
           const std::string&,
           const Option<Duration>&));
 
-  process::Future<Nothing> _run(
+  process::Future<Option<int>> _run(
       const mesos::ContainerInfo& containerInfo,
       const mesos::CommandInfo& commandInfo,
       const std::string& name,
@@ -1614,6 +1717,11 @@ public:
 
   MOCK_METHOD1(
       authorized, process::Future<bool>(const authorization::Request& request));
+
+  MOCK_METHOD2(
+      getObjectApprover, process::Future<process::Owned<ObjectApprover>>(
+          const Option<authorization::Subject>& subject,
+          const authorization::Action& action));
 };
 
 

@@ -104,9 +104,39 @@ inline Try<hashmap<std::string, std::string>> parse(const std::string& value)
   foreachpair (const std::string& key,
                const JSON::Value& value,
                json.get().values) {
-    map[key] = stringify(value);
+    if (!value.is<JSON::String>()) {
+      return Error(
+          "The value of key '" + key + "' in '" + stringify(json.get()) + "'"
+          " is not a string");
+    }
+
+    map[key] = value.as<JSON::String>().value;
   }
   return map;
+}
+
+
+// TODO(klueska): Generalize this parser to take any comma separated
+// list and convert it to its appropriate type (i.e., not just for
+// unsigned ints). Issues could arise when the generic type is a
+// string that contains commas though, so generalizing this is not as
+// straightforward as it looks at first glance.
+template <>
+inline Try<std::vector<unsigned int>> parse(const std::string& value)
+{
+  std::vector<unsigned int> result;
+
+  foreach (const std::string& token, strings::tokenize(value, ",")) {
+    Try<unsigned int> number = numify<unsigned int>(token);
+
+    if (number.isError()) {
+      return Error("Failed to numify '" + token + "': " + number.error());
+    }
+
+    result.push_back(number.get());
+  }
+
+  return result;
 }
 
 } // namespace flags {

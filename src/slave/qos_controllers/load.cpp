@@ -25,11 +25,11 @@
 #include <process/owned.hpp>
 #include <process/process.hpp>
 
+#include <stout/foreach.hpp>
 #include <stout/lambda.hpp>
 #include <stout/numify.hpp>
 #include <stout/option.hpp>
-#include <stout/os/os.hpp>
-#include <stout/posix/os.hpp>
+#include <stout/os.hpp>
 #include <stout/result.hpp>
 
 #include "slave/qos_controllers/load.hpp"
@@ -96,7 +96,7 @@ public:
     if (overloaded) {
       list<QoSCorrection> corrections;
 
-      for (const ResourceUsage::Executor& executor : usage.executors()) {
+      foreach (const ResourceUsage::Executor& executor, usage.executors()) {
         // Set kill correction for all revocable executors.
         if (!Resources(executor.allocated()).revocable().empty()) {
           QoSCorrection correction;
@@ -127,7 +127,7 @@ private:
 
 LoadQoSController::~LoadQoSController()
 {
-  if (process.get() != NULL) {
+  if (process.get() != nullptr) {
     terminate(process.get());
     wait(process.get());
   }
@@ -137,7 +137,7 @@ LoadQoSController::~LoadQoSController()
 Try<Nothing> LoadQoSController::initialize(
   const lambda::function<Future<ResourceUsage>()>& usage)
 {
-  if (process.get() != NULL) {
+  if (process.get() != nullptr) {
     return Error("Load QoS Controller has already been initialized");
   }
 
@@ -156,7 +156,7 @@ Try<Nothing> LoadQoSController::initialize(
 
 process::Future<list<QoSCorrection>> LoadQoSController::corrections()
 {
-  if (process.get() == NULL) {
+  if (process.get() == nullptr) {
     return Failure("Load QoS Controller is not initialized");
   }
 
@@ -176,14 +176,14 @@ static QoSController* create(const Parameters& parameters)
   Option<double> loadThreshold5Min = None();
   Option<double> loadThreshold15Min = None();
 
-  for (const Parameter& parameter : parameters.parameter()) {
+  foreach (const Parameter& parameter, parameters.parameter()) {
     if (parameter.key() == "load_threshold_5min") {
       // Try to parse the load 5min value.
       Try<double> thresholdParam = numify<double>(parameter.value());
       if (thresholdParam.isError()) {
         LOG(ERROR) << "Failed to parse 5 min load threshold: "
                    << thresholdParam.error();
-        return NULL;
+        return nullptr;
       }
 
       loadThreshold5Min = thresholdParam.get();
@@ -193,7 +193,7 @@ static QoSController* create(const Parameters& parameters)
       if (thresholdParam.isError()) {
         LOG(ERROR) << "Failed to parse 15 min load threshold: "
                    << thresholdParam.error();
-        return NULL;
+        return nullptr;
       }
 
       loadThreshold15Min = thresholdParam.get();
@@ -202,7 +202,7 @@ static QoSController* create(const Parameters& parameters)
 
   if (loadThreshold5Min.isNone() && loadThreshold15Min.isNone()) {
     LOG(ERROR) << "No load thresholds are configured for LoadQoSController";
-    return NULL;
+    return nullptr;
   }
 
   return new mesos::internal::slave::LoadQoSController(
@@ -216,5 +216,5 @@ Module<QoSController> org_apache_mesos_LoadQoSController(
     "Apache Mesos",
     "modules@mesos.apache.org",
     "System Load QoS Controller Module.",
-    NULL,
+    nullptr,
     create);

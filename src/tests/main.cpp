@@ -29,8 +29,11 @@
 
 #include "messages/messages.hpp" // For GOOGLE_PROTOBUF_VERIFY_VERSION.
 
+#include "module/manager.hpp"
+
 #include "tests/environment.hpp"
 #include "tests/flags.hpp"
+#include "tests/mesos.hpp"
 #include "tests/module.hpp"
 
 using namespace mesos::internal;
@@ -50,7 +53,7 @@ int main(int argc, char** argv)
 
   // Load flags from environment and command line but allow unknown
   // flags (since we might have gtest/gmock flags as well).
-  Try<Nothing> load = flags.load("MESOS_", argc, argv, true);
+  Try<flags::Warnings> load = flags.load("MESOS_", argc, argv, true);
 
   if (load.isError()) {
     cerr << flags.usage(load.error()) << endl;
@@ -64,6 +67,19 @@ int main(int argc, char** argv)
   }
 
   // Initialize Modules.
+  if (flags.modules.isSome() && flags.modulesDir.isSome()) {
+    EXIT(EXIT_FAILURE) <<
+      flags.usage("Only one of --modules or --modules_dir should be specified");
+  }
+
+  if (flags.modulesDir.isSome()) {
+    Try<Nothing> result =
+      mesos::modules::ModuleManager::load(flags.modulesDir.get());
+    if (result.isError()) {
+      EXIT(EXIT_FAILURE) << "Error loading modules: " << result.error();
+    }
+  }
+
   Try<Nothing> result = tests::initModules(flags.modules);
   if (result.isError()) {
     cerr << "Error initializing modules: " << result.error() << endl;
@@ -74,8 +90,13 @@ int main(int argc, char** argv)
   // overwrite whatever the user set.
   os::setenv("LIBPROCESS_METRICS_SNAPSHOT_ENDPOINT_RATE_LIMIT", "", false);
 
-  // Initialize libprocess.
-  process::initialize();
+  // If `process::initialize()` returns `false`, then it was called before this
+  // invocation, meaning the authentication realm for libprocess-level HTTP
+  // endpoints was set incorrectly. This should be the first invocation.
+  if (!process::initialize(None(), DEFAULT_HTTP_AUTHENTICATION_REALM)) {
+    EXIT(EXIT_FAILURE) << "The call to `process::initialize()` in the tests' "
+                       << "`main()` was not the function's first invocation";
+  }
 
   // Be quiet by default!
   if (!flags.verbose) {
@@ -84,6 +105,11 @@ int main(int argc, char** argv)
 
   // Initialize logging.
   logging::initialize(argv[0], flags, true);
+
+  // Log any flag warnings (after logging is initialized).
+  foreach (const flags::Warning& warning, load->warnings) {
+    LOG(WARNING) << warning.message;
+  }
 
   // Initialize gmock/gtest.
   testing::InitGoogleTest(&argc, argv);

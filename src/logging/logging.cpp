@@ -31,7 +31,9 @@
 #include <stout/stringify.hpp>
 #include <stout/try.hpp>
 
+#ifndef __WINDOWS__
 #include <stout/os/signals.hpp>
+#endif // __WINDOWS__
 
 #include "logging/logging.hpp"
 
@@ -78,6 +80,7 @@ string argv0;
 // allocate any memory or grab locks. And according to
 // https://code.google.com/p/google-glog/issues/detail?id=161
 // it should work in 'most' cases in signal handlers.
+#ifndef __WINDOWS__
 inline void handler(int signal, siginfo_t *siginfo, void *context)
 {
   if (signal == SIGTERM) {
@@ -98,6 +101,7 @@ inline void handler(int signal, siginfo_t *siginfo, void *context)
     RAW_LOG(FATAL, "Unexpected signal in signal handler: %d", signal);
   }
 }
+#endif // __WINDOWS__
 
 
 google::LogSeverity getLogSeverity(const string& logging_level)
@@ -131,9 +135,10 @@ void initialize(
   if (flags.logging_level != "INFO" &&
       flags.logging_level != "WARNING" &&
       flags.logging_level != "ERROR") {
-    EXIT(1) << "'" << flags.logging_level << "' is not a valid logging level."
-               " Possible values for 'logging_level' flag are: "
-               " 'INFO', 'WARNING', 'ERROR'.";
+    EXIT(EXIT_FAILURE)
+      << "'" << flags.logging_level
+      << "' is not a valid logging level. Possible values for"
+      << " 'logging_level' flag are: 'INFO', 'WARNING', 'ERROR'.";
   }
 
   FLAGS_minloglevel = getLogSeverity(flags.logging_level);
@@ -141,8 +146,9 @@ void initialize(
   if (flags.log_dir.isSome()) {
     Try<Nothing> mkdir = os::mkdir(flags.log_dir.get());
     if (mkdir.isError()) {
-      EXIT(1) << "Could not initialize logging: Failed to create directory "
-              << flags.log_dir.get() << ": " << mkdir.error();
+      EXIT(EXIT_FAILURE)
+        << "Could not initialize logging: Failed to create directory "
+        << flags.log_dir.get() << ": " << mkdir.error();
     }
     FLAGS_log_dir = flags.log_dir.get();
     // Do not log to stderr instead of log files.
@@ -194,11 +200,26 @@ void initialize(
     (flags.log_dir.isSome() ? flags.log_dir.get() : "STDERR");
 
   if (installFailureSignalHandler) {
+  // glog on Windows does not support `InstallFailureSignalHandler`.
+#ifndef __WINDOWS__
     // Handles SIGSEGV, SIGILL, SIGFPE, SIGABRT, SIGBUS, SIGTERM
     // by default.
     google::InstallFailureSignalHandler();
 
+    // The code below sets the SIGTERM signal handler to the `handle` function
+    // declared above. While this is useful on POSIX systems, SIGTERM is
+    // generated and handled differently on Windows[1], so this code would
+    // not work.
+    // [1] https://msdn.microsoft.com/en-us/library/xdkz3x12.aspx
+
     // Set up our custom signal handlers.
+    //
+    // NOTE: The code below sets the SIGTERM signal handler to the `handle`
+    // function declared above. While this is useful on POSIX systems, SIGTERM
+    // is generated and handled differently on Windows[1], so this code would
+    // not work.
+    //
+    // [1] https://msdn.microsoft.com/en-us/library/xdkz3x12.aspx
     struct sigaction action;
     action.sa_sigaction = handler;
 
@@ -212,9 +233,10 @@ void initialize(
     // We also do not want SIGTERM to dump a stacktrace, as this
     // can imply that we crashed, when we were in fact terminated
     // by user request.
-    if (sigaction(SIGTERM, &action, NULL) < 0) {
+    if (sigaction(SIGTERM, &action, nullptr) < 0) {
       PLOG(FATAL) << "Failed to set sigaction";
     }
+#endif // __WINDOWS__
   }
 
   initialized->done();

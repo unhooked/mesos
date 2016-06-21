@@ -14,7 +14,6 @@
 #define __PROCESS_FUTURE_HPP__
 
 #include <assert.h>
-#include <stdlib.h> // For abort.
 
 #include <atomic>
 #include <list>
@@ -111,7 +110,7 @@ public:
   // reference to 'that' being incremented.
   Future<T>& operator=(const Future<T>& that);
 
-  // Comparision operators useful for using futures in collections.
+  // Comparison operators useful for using futures in collections.
   bool operator==(const Future<T>& that) const;
   bool operator!=(const Future<T>& that) const;
   bool operator<(const Future<T>& that) const;
@@ -462,6 +461,10 @@ private:
   // Sets the value for this future, unless the future is already set,
   // failed, or discarded, in which case it returns false.
   bool set(const T& _t);
+  bool set(T&& _t);
+
+  template <typename U>
+  bool _set(U&& _u);
 
   // Sets this future as failed, unless the future is already set,
   // failed, or discarded, in which case it returns false.
@@ -553,6 +556,7 @@ public:
 
   bool discard();
   bool set(const T& _t);
+  bool set(T&& _t);
   bool set(const Future<T>& future); // Alias for associate.
   bool associate(const Future<T>& future);
   bool fail(const std::string& message);
@@ -563,6 +567,9 @@ public:
 private:
   template <typename U>
   friend void internal::discarded(Future<U> future);
+
+  template <typename U>
+  bool _set(U&& u);
 
   // Not copyable, not assignable.
   Promise(const Promise<T>&);
@@ -647,10 +654,25 @@ bool Promise<T>::discard()
 
 
 template <typename T>
+bool Promise<T>::set(T&& t)
+{
+  return _set(std::move(t));
+}
+
+
+template <typename T>
 bool Promise<T>::set(const T& t)
 {
+  return _set(t);
+}
+
+
+template <typename T>
+template <typename U>
+bool Promise<T>::_set(U&& u)
+{
   if (!f.data->associated) {
-    return f.set(t);
+    return f.set(std::forward<U>(u));
   }
   return false;
 }
@@ -700,8 +722,11 @@ bool Promise<T>::associate(const Future<T>& future)
     // associated.
     f.onDiscard(lambda::bind(&internal::discard<T>, WeakFuture<T>(future)));
 
+    // Need to disambiguate for the compiler.
+    bool (Future<T>::*set)(const T&) = &Future<T>::set;
+
     future
-      .onReady(lambda::bind(&Future<T>::set, f, lambda::_1))
+      .onReady(lambda::bind(set, f, lambda::_1))
       .onFailed(lambda::bind(&Future<T>::fail, f, lambda::_1))
       .onDiscarded(lambda::bind(&internal::discarded<T>, f));
   }
@@ -1399,13 +1424,28 @@ Future<T> Future<T>::after(
 
 
 template <typename T>
-bool Future<T>::set(const T& _t)
+bool Future<T>::set(T&& t)
+{
+  return _set(std::move(t));
+}
+
+
+template <typename T>
+bool Future<T>::set(const T& t)
+{
+  return _set(t);
+}
+
+
+template <typename T>
+template <typename U>
+bool Future<T>::_set(U&& u)
 {
   bool result = false;
 
   synchronized (data->lock) {
     if (data->state == PENDING) {
-      data->result = _t;
+      data->result = std::forward<U>(u);
       data->state = READY;
       result = true;
     }
@@ -1413,7 +1453,7 @@ bool Future<T>::set(const T& _t)
 
   // Invoke all callbacks associated with this future being READY. We
   // don't need a lock because the state is now in READY so there
-  // should not be any concurrent modications.
+  // should not be any concurrent modifications.
   if (result) {
     internal::run(data->onReadyCallbacks, data->result.get());
     internal::run(data->onAnyCallbacks, *this);
@@ -1440,7 +1480,7 @@ bool Future<T>::fail(const std::string& _message)
 
   // Invoke all callbacks associated with this future being FAILED. We
   // don't need a lock because the state is now in FAILED so there
-  // should not be any concurrent modications.
+  // should not be any concurrent modifications.
   if (result) {
     internal::run(data->onFailedCallbacks, data->result.error());
     internal::run(data->onAnyCallbacks, *this);
@@ -1449,6 +1489,57 @@ bool Future<T>::fail(const std::string& _message)
   }
 
   return result;
+}
+
+
+// Helper for setting a set of Promises.
+template <typename T>
+void setPromises(std::set<Promise<T>*>* promises, const T& t)
+{
+  foreach (Promise<T>* promise, *promises) {
+    promise->set(t);
+    delete promise;
+  }
+  promises->clear();
+}
+
+
+// Helper for failing a set of Promises.
+template <typename T>
+void failPromises(std::set<Promise<T>*>* promises, const std::string& failure)
+{
+  foreach (Promise<T>* promise, *promises) {
+    promise->fail(failure);
+    delete promise;
+  }
+  promises->clear();
+}
+
+
+// Helper for discarding a set of Promises.
+template <typename T>
+void discardPromises(std::set<Promise<T>*>* promises)
+{
+  foreach (Promise<T>* promise, *promises) {
+    promise->discard();
+    delete promise;
+  }
+  promises->clear();
+}
+
+
+// Helper for discarding an individual promise in the set.
+template <typename T>
+void discardPromises(std::set<Promise<T>*>* promises, const Future<T>& future)
+{
+  foreach (Promise<T>* promise, *promises) {
+    if (promise->future() == future) {
+      promise->discard();
+      promises->erase(promise);
+      delete promise;
+      return;
+    }
+  }
 }
 
 }  // namespace process {

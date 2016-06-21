@@ -7,16 +7,16 @@ layout: documentation
 # Mesos Observability Metrics
 
 This document describes the observability metrics provided by Mesos master and
-slave nodes. This document also provides some initial guidance on which metrics
+agent nodes. This document also provides some initial guidance on which metrics
 you should monitor to detect abnormal situations in your cluster.
 
 
 ## Overview
 
-Mesos master and slave nodes report a set of statistics and metrics that enable
+Mesos master and agent nodes report a set of statistics and metrics that enable
 you to  monitor resource usage and detect abnormal situations early. The
 information reported by Mesos includes details about available resources, used
-resources, registered frameworks, active slaves, and task state. You can use
+resources, registered frameworks, active agents, and task state. You can use
 this information to create automated alerts and to plot different metrics over
 time inside a monitoring dashboard.
 
@@ -27,11 +27,11 @@ Mesos provides two different kinds of metrics: counters and gauges.
 
 **Counters** keep track of discrete events and are monotonically increasing. The
 value of a metric of this type is always a natural number. Examples include the
-number of failed tasks and the number of slave registrations. For some metrics
+number of failed tasks and the number of agent registrations. For some metrics
 of this type, the rate of change is often more useful than the value itself.
 
 **Gauges** represent an instantaneous sample of some magnitude. Examples include
-the amount of used memory in the cluster and the number of connected slaves. For
+the amount of used memory in the cluster and the number of connected agents. For
 some metrics of this type, it is often useful to determine whether the value is
 above or below a threshold for a sustained period of time.
 
@@ -40,12 +40,9 @@ The tables in this document indicate the type of each available metric.
 
 ## Master Nodes
 
-Metrics from the master node are available at the following URL:
-
-    http://<mesos-master-ip>:5050/metrics/snapshot
-
-The response is a JSON object that contains metrics names and values as
-key-value pairs.
+Metrics from each master node are available via the
+[/metrics/snapshot](endpoints/metrics/snapshot.md) master endpoint.  The response
+is a JSON object that contains metrics names and values as key-value pairs.
 
 ### Observability metrics
 
@@ -145,6 +142,48 @@ framework is misbehaving.
   <code>master/disk_revocable_used</code>
   </td>
   <td>Allocated revocable disk space in MB</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>master/gpus_percent</code>
+  </td>
+  <td>Percentage of allocated GPUs</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>master/gpus_used</code>
+  </td>
+  <td>Number of allocated GPUs</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>master/gpus_total</code>
+  </td>
+  <td>Number of GPUs</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>master/gpus_revocable_percent</code>
+  </td>
+  <td>Percentage of allocated revocable GPUs</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>master/gpus_revocable_total</code>
+  </td>
+  <td>Number of revocable GPUs</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>master/gpus_revocable_used</code>
+  </td>
+  <td>Number of allocated revocable GPUs</td>
   <td>Gauge</td>
 </tr>
 <tr>
@@ -274,10 +313,10 @@ sustained periods of time may degrade the performance of the cluster.
 </tr>
 </table>
 
-#### Slaves
+#### Agents
 
-The following metrics provide information about slave events, slave counts, and
-slave states. A low number of active slaves may indicate that slaves are
+The following metrics provide information about agent events, agent counts, and
+agent states. A low number of active agents may indicate that agents are
 unhealthy or that they are not able to connect to the elected master.
 
 <table class="table table-striped">
@@ -288,7 +327,7 @@ unhealthy or that they are not able to connect to the elected master.
   <td>
   <code>master/slave_registrations</code>
   </td>
-  <td>Number of slaves that were able to cleanly re-join the cluster and
+  <td>Number of agents that were able to cleanly re-join the cluster and
       connect back to the master after the master is disconnected.</td>
   <td>Counter</td>
 </tr>
@@ -296,22 +335,22 @@ unhealthy or that they are not able to connect to the elected master.
   <td>
   <code>master/slave_removals</code>
   </td>
-  <td>Number of slave removed for various reasons, including maintenance</td>
+  <td>Number of agent removed for various reasons, including maintenance</td>
   <td>Counter</td>
 </tr>
 <tr>
   <td>
   <code>master/slave_reregistrations</code>
   </td>
-  <td>Number of slave re-registrations</td>
+  <td>Number of agent re-registrations</td>
   <td>Counter</td>
 </tr>
 <tr>
   <td>
   <code>master/slave_shutdowns_scheduled</code>
   </td>
-  <td>Number of slaves which have failed their health check and are scheduled
-      to be removed. They will not be immediately removed due to the Slave
+  <td>Number of agents which have failed their health check and are scheduled
+      to be removed. They will not be immediately removed due to the Agent
       Removal Rate-Limit, but <code>master/slave_shutdowns_completed</code>
       will start increasing as they do get removed.</td>
   <td>Counter</td>
@@ -320,8 +359,8 @@ unhealthy or that they are not able to connect to the elected master.
   <td>
   <code>master/slave_shutdowns_canceled</code>
   </td>
-  <td>Number of cancelled slave shutdowns. This happens when the slave removal
-      rate limit allows for a slave to reconnect and send a <code>PONG</code>
+  <td>Number of cancelled agent shutdowns. This happens when the agent removal
+      rate limit allows for a agent to reconnect and send a <code>PONG</code>
       to the master before being removed.</td>
   <td>Counter</td>
 </tr>
@@ -329,37 +368,37 @@ unhealthy or that they are not able to connect to the elected master.
   <td>
   <code>master/slave_shutdowns_completed</code>
   </td>
-  <td>Number of slaves that failed their health check. These are slaves which
-      were not heard from despite the slave-removal rate limit, and have been
-      removed from the master's slave registry.</td>
+  <td>Number of agents that failed their health check. These are agents which
+      were not heard from despite the agent-removal rate limit, and have been
+      removed from the master's agent registry.</td>
   <td>Counter</td>
 </tr>
 <tr>
   <td>
   <code>master/slaves_active</code>
   </td>
-  <td>Number of active slaves</td>
+  <td>Number of active agents</td>
   <td>Gauge</td>
 </tr>
 <tr>
   <td>
   <code>master/slaves_connected</code>
   </td>
-  <td>Number of connected slaves</td>
+  <td>Number of connected agents</td>
   <td>Gauge</td>
 </tr>
 <tr>
   <td>
   <code>master/slaves_disconnected</code>
   </td>
-  <td>Number of disconnected slaves</td>
+  <td>Number of disconnected agents</td>
   <td>Gauge</td>
 </tr>
 <tr>
   <td>
   <code>master/slaves_inactive</code>
   </td>
-  <td>Number of inactive slaves</td>
+  <td>Number of inactive agents</td>
   <td>Gauge</td>
 </tr>
 </table>
@@ -482,7 +521,7 @@ The task states listed here match those of the task state machine.
 #### Messages
 
 The following metrics provide information about messages between the master and
-the slaves and between the framework and the executors. A high rate of dropped
+the agents and between the framework and the executors. A high rate of dropped
 messages may indicate that there is a problem with the network.
 
 <table class="table table-striped">
@@ -598,7 +637,7 @@ messages may indicate that there is a problem with the network.
   <td>
   <code>master/messages_register_slave</code>
   </td>
-  <td>Number of slave registration messages</td>
+  <td>Number of agent registration messages</td>
   <td>Counter</td>
 </tr>
 <tr>
@@ -612,7 +651,7 @@ messages may indicate that there is a problem with the network.
   <td>
   <code>master/messages_reregister_slave</code>
   </td>
-  <td>Number of slave re-registration messages</td>
+  <td>Number of agent re-registration messages</td>
   <td>Counter</td>
 </tr>
 <tr>
@@ -654,42 +693,42 @@ messages may indicate that there is a problem with the network.
   <td>
   <code>master/messages_unregister_slave</code>
   </td>
-  <td>Number of slave unregistration messages</td>
+  <td>Number of agent unregistration messages</td>
   <td>Counter</td>
 </tr>
 <tr>
   <td>
   <code>master/messages_update_slave</code>
   </td>
-  <td>Number of update slave messages</td>
+  <td>Number of update agent messages</td>
   <td>Counter</td>
 </tr>
 <tr>
   <td>
   <code>master/recovery_slave_removals</code>
   </td>
-  <td>Number of slaves not re-registered during master failover</td>
+  <td>Number of agents not re-registered during master failover</td>
   <td>Counter</td>
 </tr>
 <tr>
   <td>
   <code>master/slave_removals/reason_registered</code>
   </td>
-  <td>Number of slaves removed when new slaves registered at the same address</td>
+  <td>Number of agents removed when new agents registered at the same address</td>
   <td>Counter</td>
 </tr>
 <tr>
   <td>
   <code>master/slave_removals/reason_unhealthy</code>
   </td>
-  <td>Number of slaves failed due to failed health checks</td>
+  <td>Number of agents failed due to failed health checks</td>
   <td>Counter</td>
 </tr>
 <tr>
   <td>
   <code>master/slave_removals/reason_unregistered</code>
   </td>
-  <td>Number of slaves unregistered</td>
+  <td>Number of agents unregistered</td>
   <td>Counter</td>
 </tr>
 <tr>
@@ -717,28 +756,28 @@ messages may indicate that there is a problem with the network.
   <td>
   <code>master/task_lost/source_master/reason_invalid_offers</code>
   </td>
-  <td>Number of tasks lost due to invalid offers</code>
+  <td>Number of tasks lost due to invalid offers</td>
   <td>Counter</td>
 </tr>
 <tr>
   <td>
   <code>master/task_lost/source_master/reason_slave_removed</code>
   </td>
-  <td>Number of tasks lost due to slave removal</code>
+  <td>Number of tasks lost due to agent removal</td>
   <td>Counter</td>
 </tr>
 <tr>
   <td>
   <code>master/task_lost/source_slave/reason_executor_terminated</code>
   </td>
-  <td>Number of tasks lost due to executor termination</code>
+  <td>Number of tasks lost due to executor termination</td>
   <td>Counter</td>
 </tr>
 <tr>
   <td>
   <code>master/valid_executor_to_framework_messages</code>
   </td>
-  <td>Number of valid executor to framework messages</code>
+  <td>Number of valid executor to framework messages</td>
   <td>Counter</td>
 </tr>
 </table>
@@ -778,7 +817,7 @@ event queue.
 #### Registrar
 
 The following metrics provide information about read and write latency to the
-slave registrar.
+agent registrar.
 
 <table class="table table-striped">
 <thead>
@@ -856,6 +895,193 @@ slave registrar.
 </tr>
 </table>
 
+#### Replicated log
+
+The following metrics provide information about the replicated log underneath
+the registrar, which is the persistent store for masters.
+
+<table class="table table-striped">
+<thead>
+<tr><th>Metric</th><th>Description</th><th>Type</th>
+</thead>
+<tr>
+  <td>
+  <code>registrar/log/recovered</code>
+  </td>
+  <td>
+    Whether the replicated log for the registrar has caught up with the other
+    masters in the cluster. A cluster is operational as long as a quorum of
+    "recovered" masters is available in the cluster.
+  </td>
+  <td>Gauge</td>
+</tr>
+</table>
+
+#### Allocator
+
+The following metrics provide information about performance
+and resource allocations in the allocator.
+
+<table class="table table-stripped">
+<thead>
+<tr><th>Metric</th><th>Description</th><th>Type</th>
+</thead>
+<tr>
+  <td>
+  <code>allocator/mesos/allocation_run_ms</code>
+  </td>
+  <td>Allocation algorithm latency in ms</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>allocator/mesos/allocation_run_ms/count</code>
+  </td>
+  <td>Number of allocation algorithm latency measurements in the window</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>allocator/mesos/allocation_run_ms/max</code>
+  </td>
+  <td>Maximum allocation algorithm latency in ms</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>allocator/mesos/allocation_run_ms/min</code>
+  </td>
+  <td>Minimum allocation algorithm latency in ms</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>allocator/mesos/allocation_run_ms/p50</code>
+  </td>
+  <td>Median allocation algorithm latency in ms</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>allocator/mesos/allocation_run_ms/p90</code>
+  </td>
+  <td>90th percentile allocation algorithm latency in ms</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>allocator/mesos/allocation_run_ms/p95</code>
+  </td>
+  <td>95th percentile allocation algorithm latency in ms</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>allocator/mesos/allocation_run_ms/p99</code>
+  </td>
+  <td>99th percentile allocation algorithm latency in ms</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>allocator/mesos/allocation_run_ms/p999</code>
+  </td>
+  <td>99.9th percentile allocation algorithm latency in ms</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>allocator/mesos/allocation_run_ms/p9999</code>
+  </td>
+  <td>99.99th percentile allocation algorithm latency in ms</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>allocator/mesos/allocation_runs</code>
+  </td>
+  <td>Number of times the allocation algorithm has run</td>
+  <td>Counter</td>
+</tr>
+<tr>
+  <td>
+  <code>allocator/mesos/roles/&lt;role&gt;/shares/dominant</code>
+  </td>
+  <td>Dominant resource share for the role, exposed as a percentage (0.0-1.0)</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>allocator/mesos/event_queue_dispatches</code>
+  </td>
+  <td>Number of dispatch events in the event queue</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>allocator/mesos/offer_filters/roles/&lt;role&gt;/active</code>
+  </td>
+  <td>Number of active offer filters for all frameworks within the role</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>allocator/mesos/quota/roles/&lt;role&gt;/resources/&lt;resource&gt;/offered_or_allocated</code>
+  </td>
+  <td>Amount of resources considered offered or allocated towards
+      a role's quota guarantee</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>allocator/mesos/quota/roles/&lt;role&gt;/resources/&lt;resource&gt;/guarantee</code>
+  </td>
+  <td>Amount of resources guaranteed for a role via quota</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>allocator/mesos/resources/cpus/offered_or_allocated</code>
+  </td>
+  <td>Number of CPUs offered or allocated</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>allocator/mesos/resources/cpus/total</code>
+  </td>
+  <td>Number of CPUs</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>allocator/mesos/resources/disk/offered_or_allocated</code>
+  </td>
+  <td>Allocated or offered disk space in MB</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>allocator/mesos/resources/disk/total</code>
+  </td>
+  <td>Total disk space in MB</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>allocator/mesos/resources/mem/offered_or_allocated</code>
+  </td>
+  <td>Allocated or offered memory in MB</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>allocator/mesos/resources/mem/total</code>
+  </td>
+  <td>Total memory in MB</td>
+  <td>Gauge</td>
+</tr>
+</table>
 
 ### Basic Alerts
 
@@ -877,7 +1103,7 @@ failures, bugs in one of the frameworks, or bugs in Mesos.
 
 #### master/slaves_active is low
 
-Slaves are having trouble connecting to the master.
+Agents are having trouble connecting to the master.
 
 #### master/cpus_percent > 0.9 for sustained periods of time
 
@@ -894,25 +1120,21 @@ No master is currently elected.
 
 
 
-## Slave Nodes
+## Agent Nodes
 
-Metrics from each slave node are available at the following URL:
-
-    http://<mesos-slave>:5051/metrics/snapshot
-
-The response is a JSON object that contains metrics names and values as key-
-value pairs.
-
+Metrics from each agent node are available via the
+[/metrics/snapshot](endpoints/metrics/snapshot.md) agent endpoint.  The response
+is a JSON object that contains metrics names and values as key-value pairs.
 
 ### Observability Metrics
 
-This section lists all available metrics from Mesos slave nodes grouped by
+This section lists all available metrics from Mesos agent nodes grouped by
 category.
 
 #### Resources
 
 The following metrics provide information about the total resources available in
-the slave and their current usage.
+the agent and their current usage.
 
 <table class="table table-striped">
 <thead>
@@ -983,6 +1205,48 @@ the slave and their current usage.
 </tr>
 <tr>
   <td>
+  <code>slave/gpus_percent</code>
+  </td>
+  <td>Percentage of allocated GPUs</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>slave/gpus_used</code>
+  </td>
+  <td>Number of allocated GPUs</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>slave/gpus_total</code>
+  </td>
+  <td>Number of GPUs</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>slave/gpus_revocable_percent</code>
+  </td>
+  <td>Percentage of allocated revocable GPUs</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>slave/gpus_revocable_total</code>
+  </td>
+  <td>Number of revocable GPUs</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
+  <code>slave/gpus_revocable_used</code>
+  </td>
+  <td>Number of allocated revocable GPUs</td>
+  <td>Gauge</td>
+</tr>
+<tr>
+  <td>
   <code>slave/mem_percent</code>
   </td>
   <td>Percentage of allocated memory</td>
@@ -1046,9 +1310,9 @@ the slave and their current usage.
 </tr>
 </table>
 
-#### Slave
+#### Agent
 
-The following metrics provide information about whether a slave is currently
+The following metrics provide information about whether a agent is currently
 registered with a master and for how long it has been running.
 
 <table class="table table-striped">
@@ -1059,7 +1323,7 @@ registered with a master and for how long it has been running.
   <td>
   <code>slave/registered</code>
   </td>
-  <td>Whether this slave is registered with a master</td>
+  <td>Whether this agent is registered with a master</td>
   <td>Gauge</td>
 </tr>
 <tr>
@@ -1073,7 +1337,7 @@ registered with a master and for how long it has been running.
 
 #### System
 
-The following metrics provide information about the slave system.
+The following metrics provide information about the agent system.
 
 <table class="table table-striped">
 <thead>
@@ -1126,7 +1390,7 @@ The following metrics provide information about the slave system.
 #### Executors
 
 The following metrics provide information about the executor instances running
-on the slave.
+on the agent.
 
 <table class="table table-striped">
 <thead>
@@ -1199,7 +1463,7 @@ on the slave.
   <td>
   <code>slave/recovery_errors</code>
   </td>
-  <td>Number of errors encountered during slave recovery</td>
+  <td>Number of errors encountered during agent recovery</td>
   <td>Gauge</td>
 </tr>
 </table>
@@ -1265,7 +1529,7 @@ The following metrics provide information about active and terminated tasks.
 
 #### Messages
 
-The following metrics provide information about messages between the slaves and
+The following metrics provide information about messages between the agents and
 the master it is registered with.
 
 <table class="table table-striped">

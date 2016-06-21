@@ -222,43 +222,44 @@ Future<hashset<ContainerID>> LinuxLauncher::recover(
 }
 
 
-static int childSetup(
-    int pipes[2],
-    const Option<lambda::function<int()>>& setup)
+// A hook that is executed in the parent process. It attempts to move a process
+// into the freezer cgroup.
+//
+// NOTE: The child process is blocked by the hook infrastructure while
+// these hooks are executed.
+// NOTE: Returning an Error implies the child process will be killed.
+Try<Nothing> assignFreezerHierarchy(
+    pid_t child,
+    const string& hierarchy,
+    const string& cgroup)
 {
-  // In child.
-  ::close(pipes[1]);
-
-  // Do a blocking read on the pipe until the parent signals us to
-  // continue.
-  char dummy;
-  ssize_t length;
-  while ((length = ::read(pipes[0], &dummy, sizeof(dummy))) == -1 &&
-         errno == EINTR);
-
-  if (length != sizeof(dummy)) {
-    ABORT("Failed to synchronize with parent");
+  // Create a freezer cgroup for this container if necessary.
+  Try<bool> exists = cgroups::exists(hierarchy, cgroup);
+  if (exists.isError()) {
+    return Error("Failed to assign process to its freezer cgroup: "
+                 "Failed to check existence of freezer cgroup: " +
+                 exists.error());
   }
 
-  ::close(pipes[0]);
+  if (!exists.get()) {
+    Try<Nothing> created = cgroups::create(hierarchy, cgroup);
 
-  // Move to a different session (and new process group) so we're
-  // independent from the slave's session (otherwise children will
-  // receive SIGHUP if the slave exits).
-  // TODO(idownes): perror is not listed as async-signal-safe and
-  // should be reimplemented safely.
-  // TODO(jieyu): Move this logic to the subprocess (i.e.,
-  // mesos-containerizer launch).
-  if (::setsid() == -1) {
-    perror("Failed to put child in a new session");
-    return 1;
+    if (created.isError()) {
+      return Error("Failed to assign process to its freezer cgroup: "
+                   "Failed to create freezer cgroup: " + created.error());
+    }
   }
 
-  if (setup.isSome()) {
-    return setup.get()();
+  // Move the child into the freezer cgroup. Any grandchildren will
+  // also be contained in the cgroup.
+  Try<Nothing> assign = cgroups::assign(hierarchy, cgroup, child);
+
+  if (assign.isError()) {
+    return Error("Failed to assign process to its freezer cgroup: " +
+                 assign.error());
   }
 
-  return 0;
+  return Nothing();
 }
 
 
@@ -271,45 +272,30 @@ Try<pid_t> LinuxLauncher::fork(
     const process::Subprocess::IO& err,
     const Option<flags::FlagsBase>& flags,
     const Option<map<string, string>>& environment,
-    const Option<lambda::function<int()>>& setup,
-    const Option<int>& namespaces)
+    const Option<int>& namespaces,
+    vector<Subprocess::Hook> parentHooks)
 {
-  // Create a freezer cgroup for this container if necessary.
-  Try<bool> exists = cgroups::exists(freezerHierarchy, cgroup(containerId));
-  if (exists.isError()) {
-    return Error("Failed to check existence of freezer cgroup: " +
-                 exists.error());
-  }
-
-  if (!exists.get()) {
-    Try<Nothing> created =
-      cgroups::create(freezerHierarchy, cgroup(containerId));
-
-    if (created.isError()) {
-      return Error("Failed to create freezer cgroup: " + created.error());
-    }
-  }
-
-  // Use a pipe to block the child until it's been moved into the
-  // freezer cgroup.
-  int pipes[2];
-
-  // We assume this should not fail under reasonable conditions so we
-  // use CHECK.
-  CHECK_EQ(0, ::pipe(pipes));
-
   int cloneFlags = namespaces.isSome() ? namespaces.get() : 0;
   cloneFlags |= SIGCHLD; // Specify SIGCHLD as child termination signal.
 
   LOG(INFO) << "Cloning child process with flags = "
             << ns::stringify(cloneFlags);
 
+  // NOTE: Currently we don't care about the order of the hooks, as
+  // both hooks are independent.
+
   // If we are on systemd, then extend the life of the child. As with the
   // freezer, any grandchildren will also be contained in the slice.
-  std::vector<Subprocess::Hook> parentHooks;
   if (systemdHierarchy.isSome()) {
     parentHooks.emplace_back(Subprocess::Hook(&systemd::mesos::extendLifetime));
   }
+
+  // Create parent Hook for moving child into freezer cgroup.
+  parentHooks.emplace_back(Subprocess::Hook(lambda::bind(
+      &assignFreezerHierarchy,
+      lambda::_1,
+      freezerHierarchy,
+      cgroup(containerId))));
 
   Try<Subprocess> child = subprocess(
       path,
@@ -317,50 +303,14 @@ Try<pid_t> LinuxLauncher::fork(
       in,
       out,
       err,
+      SETSID,
       flags,
       environment,
-      lambda::bind(&childSetup, pipes, setup),
       lambda::bind(&os::clone, lambda::_1, cloneFlags),
       parentHooks);
 
   if (child.isError()) {
     return Error("Failed to clone child process: " + child.error());
-  }
-
-  // Parent.
-  os::close(pipes[0]);
-
-  // Move the child into the freezer cgroup. Any grandchildren will
-  // also be contained in the cgroup.
-  // TODO(jieyu): Move this logic to the subprocess (i.e.,
-  // mesos-containerizer launch).
-  Try<Nothing> assign = cgroups::assign(
-      freezerHierarchy,
-      cgroup(containerId),
-      child.get().pid());
-
-  if (assign.isError()) {
-    LOG(ERROR) << "Failed to assign process " << child.get().pid()
-                << " of container '" << containerId << "'"
-                << " to its freezer cgroup: " << assign.error();
-
-    ::kill(child.get().pid(), SIGKILL);
-    return Error("Failed to contain process");
-  }
-
-  // Now that we've contained the child we can signal it to continue
-  // by writing to the pipe.
-  char dummy;
-  ssize_t length;
-  while ((length = ::write(pipes[1], &dummy, sizeof(dummy))) == -1 &&
-         errno == EINTR);
-
-  os::close(pipes[1]);
-
-  if (length != sizeof(dummy)) {
-    // Ensure the child is killed.
-    ::kill(child.get().pid(), SIGKILL);
-    return Error("Failed to synchronize child process");
   }
 
   if (!pids.contains(containerId)) {

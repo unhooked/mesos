@@ -55,6 +55,7 @@ public:
 
   std::string docker_registry;
   std::string docker_store_dir;
+  std::string docker_volume_checkpoint_dir;
 
   std::string default_role;
   Option<std::string> attributes;
@@ -89,7 +90,8 @@ public:
   bool cgroups_cpu_enable_pids_and_tids_count;
   Option<std::string> cgroups_net_cls_primary_handle;
   Option<std::string> cgroups_net_cls_secondary_handles;
-  Option<std::string> slave_subsystems;
+  Option<std::string> agent_subsystems;
+  Option<std::vector<unsigned int>> nvidia_gpu_devices;
   Option<std::string> perf_events;
   Duration perf_interval;
   Duration perf_duration;
@@ -99,6 +101,7 @@ public:
 #endif
   Option<Firewall> firewall_rules;
   Option<Path> credential;
+  Option<ACLs> acls;
   Option<std::string> containerizer_path;
   std::string containerizers;
   Option<std::string> default_container_image;
@@ -107,9 +110,14 @@ public:
   Duration docker_remove_delay;
   std::string sandbox_directory;
   Option<ContainerInfo> default_container_info;
+
+  // TODO(alexr): Remove this after the deprecation cycle (started in 1.0).
   Duration docker_stop_timeout;
+
   bool docker_kill_orphans;
   std::string docker_socket;
+  Option<JSON::Object> docker_config;
+
 #ifdef WITH_NETWORK_ISOLATOR
   uint16_t ephemeral_ports_per_container;
   Option<std::string> eth0_name;
@@ -121,15 +129,27 @@ public:
   bool network_enable_socket_statistics_details;
   bool network_enable_snmp_statistics;
 #endif
+  Option<std::string> network_cni_plugins_dir;
+  Option<std::string> network_cni_config_dir;
   Duration container_disk_watch_interval;
   bool enforce_container_disk_quota;
   Option<Modules> modules;
+  Option<std::string> modulesDir;
   std::string authenticatee;
+  std::string authorizer;
+  std::string http_authenticators;
+  bool authenticate_http;
+  Option<Path> http_credentials;
   Option<std::string> hooks;
   Option<std::string> resource_estimator;
   Option<std::string> qos_controller;
   Duration qos_correction_interval_min;
   Duration oversubscribed_resources_interval;
+  Option<std::string> master_detector;
+#if ENABLE_XFS_DISK_ISOLATOR
+  std::string xfs_project_range;
+#endif
+  bool http_command_executor;
 };
 
 } // namespace slave {

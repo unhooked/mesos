@@ -58,7 +58,7 @@ Flags::Flags()
 }
 
 
-static Flags* systemd_flags = NULL;
+static Flags* systemd_flags = nullptr;
 
 
 const Flags& flags()
@@ -69,14 +69,17 @@ const Flags& flags()
 
 namespace mesos {
 
+// NOTE: Returning an Error implies the child process will be killed.
 Try<Nothing> extendLifetime(pid_t child)
 {
   if (!systemd::exists()) {
-    return Error("systemd does not exist on this system");
+    return Error("Failed to contain process on systemd: "
+                 "systemd does not exist on this system");
   }
 
   if (!systemd::enabled()) {
-    return Error("systemd is not enabled on this system");
+    return Error("Failed to contain process on systemd: "
+                 "systemd is not configured as enabled on this system");
   }
 
   Try<Nothing> assign = cgroups::assign(
@@ -85,11 +88,9 @@ Try<Nothing> extendLifetime(pid_t child)
       child);
 
   if (assign.isError()) {
-    LOG(ERROR) << "Failed to assign process " << child
-                << " to its systemd executor slice: " << assign.error();
-
-    ::kill(child, SIGKILL);
-    return Error("Failed to contain process on systemd");
+    return Error("Failed to contain process on systemd: "
+                 "Failed to assign process to its systemd executor slice: " +
+                  assign.error());
   }
 
   LOG(INFO) << "Assigned child process '" << child << "' to '"
@@ -258,7 +259,7 @@ bool exists()
 
 bool enabled()
 {
-  return systemd_flags != NULL && flags().enabled && exists();
+  return systemd_flags != nullptr && flags().enabled && exists();
 }
 
 

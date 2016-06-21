@@ -16,6 +16,7 @@
 
 #include <unistd.h>
 
+#include <functional>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -34,6 +35,7 @@
 #include <process/reap.hpp>
 
 #include <stout/abort.hpp>
+#include <stout/duration.hpp>
 #include <stout/gtest.hpp>
 #include <stout/hashset.hpp>
 #include <stout/os.hpp>
@@ -44,7 +46,6 @@
 #endif // __linux__
 
 #include "master/master.hpp"
-#include "master/detector.hpp"
 
 #include "slave/flags.hpp"
 #include "slave/gc.hpp"
@@ -97,6 +98,8 @@ using mesos::internal::slave::PosixCpuIsolatorProcess;
 using mesos::internal::slave::PosixMemIsolatorProcess;
 using mesos::internal::slave::Slave;
 
+using mesos::master::detector::MasterDetector;
+
 using mesos::slave::ContainerConfig;
 using mesos::slave::ContainerLaunchInfo;
 using mesos::slave::Isolator;
@@ -113,24 +116,78 @@ namespace mesos {
 namespace internal {
 namespace tests {
 
-static int childSetup(int pipes[2])
+// Flag describing whether a the isolatePid parentHook should check the cgroups
+// before and after isolation.
+enum CheckCgroups
 {
-  // In child process.
-  ::close(pipes[1]);
+  CHECK_CGROUPS,
+  NO_CHECK_CGROUPS,
+};
 
-  // Wait until the parent signals us to continue.
-  char dummy;
-  ssize_t length;
-  while ((length = ::read(pipes[0], &dummy, sizeof(dummy))) == -1 &&
-         errno == EINTR);
+// A hook that is executed in the parent process. It attempts to isolate
+// a process and can optionally check the cgroups before and after isolation.
+//
+// NOTE: The child process is blocked by the hook infrastructure while
+// these hooks are executed.
+// NOTE: Returning an Error implies the child process will be killed.
+Try<Nothing> isolatePid(
+    pid_t child,
+    const Owned<Isolator>& isolator,
+    const ContainerID& containerId,
+    const CheckCgroups checkCgroups = NO_CHECK_CGROUPS)
+{
+  if (checkCgroups == CHECK_CGROUPS) {
+    // Before isolation, the cgroup is empty.
+    Future<ResourceStatistics> usage = isolator->usage(containerId);
 
-  if (length != sizeof(dummy)) {
-    ABORT("Failed to synchronize with parent");
+    // Note this is following the implementation of AWAIT_READY.
+    if (!process::internal::await(usage, Seconds(15))) {
+      return Error("Could check cgroup usage");
+    }
+    if (usage.isDiscarded() || usage.isFailed()) {
+      return Error("Could check cgroup usage");
+    }
+
+    if (0U != usage.get().processes()) {
+      return Error("Cgroups processes not empty before isolation");
+    }
+    if (0U != usage.get().threads()) {
+      return Error("Cgroups threads not empty before isolation");
+    }
   }
 
-  ::close(pipes[0]);
+  // Isolate process.
+  process::Future<Nothing> isolate = isolator->isolate(containerId, child);
 
-  return 0;
+  // Note this is following the implementation of AWAIT_READY.
+  if (!process::internal::await(isolate, Seconds(15))) {
+    return Error("Could not isolate pid");
+  }
+  if (isolate.isDiscarded() || isolate.isFailed()) {
+    return Error("Could not isolate pid");
+  }
+
+  if (checkCgroups == CHECK_CGROUPS) {
+    // After isolation, there should be one process in the cgroup.
+    Future<ResourceStatistics> usage = isolator->usage(containerId);
+
+    // Note this is following the implementation of AWAIT_READY.
+    if (!process::internal::await(usage, Seconds(15))) {
+      return Error("Could check cgroup usage");
+    }
+    if (usage.isDiscarded() || usage.isFailed()) {
+      return Error("Could check cgroup usage");
+    }
+
+    if (1U != usage.get().processes()) {
+      return Error("Cgroups processes empty after isolation");
+    }
+    if (1U != usage.get().threads()) {
+      return Error("Cgroups threads empty after isolation");
+    }
+  }
+
+  return Nothing();
 }
 
 
@@ -184,18 +241,30 @@ TYPED_TEST(CpuIsolatorTest, UserCpuUsage)
 
   const string& file = path::join(dir.get(), "mesos_isolator_test_ready");
 
-  // Max out a single core in userspace. This will run for at most one second.
+  // Max out a single core in userspace. This will run for at most onesecond.
   string command = "while true ; do true ; done &"
     "touch " + file + "; " // Signals the command is running.
     "sleep 60";
-
-  int pipes[2];
-  ASSERT_NE(-1, ::pipe(pipes));
 
   vector<string> argv(3);
   argv[0] = "sh";
   argv[1] = "-c";
   argv[2] = command;
+
+  vector<Subprocess::Hook> parentHooks;
+
+  // Create parent Hook to isolate child.
+  //
+  // NOTE: We can safely use references here as the hook will be executed
+  // during the call to `fork`.
+  const lambda::function<Try<Nothing>(pid_t)> isolatePidHook = lambda::bind(
+      isolatePid,
+      lambda::_1,
+      std::cref(isolator),
+      std::cref(containerId),
+      NO_CHECK_CGROUPS);
+
+  parentHooks.emplace_back(Subprocess::Hook(isolatePidHook));
 
   Try<pid_t> pid = launcher->fork(
       containerId,
@@ -206,25 +275,13 @@ TYPED_TEST(CpuIsolatorTest, UserCpuUsage)
       Subprocess::FD(STDERR_FILENO),
       None(),
       None(),
-      lambda::bind(&childSetup, pipes),
-      None());
+      None(),
+      parentHooks);
 
   ASSERT_SOME(pid);
 
   // Reap the forked child.
   Future<Option<int> > status = process::reap(pid.get());
-
-  // Continue in the parent.
-  ASSERT_SOME(os::close(pipes[0]));
-
-  // Isolate the forked child.
-  AWAIT_READY(isolator->isolate(containerId, pid.get()));
-
-  // Now signal the child to continue.
-  char dummy;
-  ASSERT_LT(0, ::write(pipes[1], &dummy, sizeof(dummy)));
-
-  ASSERT_SOME(os::close(pipes[1]));
 
   // Wait for the command to start.
   while (!os::exists(file));
@@ -302,13 +359,25 @@ TYPED_TEST(CpuIsolatorTest, SystemCpuUsage)
     "touch " + file + "; " // Signals the command is running.
     "sleep 60";
 
-  int pipes[2];
-  ASSERT_NE(-1, ::pipe(pipes));
-
   vector<string> argv(3);
   argv[0] = "sh";
   argv[1] = "-c";
   argv[2] = command;
+
+  vector<Subprocess::Hook> parentHooks;
+
+  // Create parent Hook to isolate child.
+  //
+  // NOTE: We can safely use references here as the hook will be executed
+  // during the call to `fork`.
+  const lambda::function<Try<Nothing>(pid_t)> isolatePidHook = lambda::bind(
+      isolatePid,
+      lambda::_1,
+      std::cref(isolator),
+      std::cref(containerId),
+      NO_CHECK_CGROUPS);
+
+  parentHooks.emplace_back(Subprocess::Hook(isolatePidHook));
 
   Try<pid_t> pid = launcher->fork(
       containerId,
@@ -319,25 +388,13 @@ TYPED_TEST(CpuIsolatorTest, SystemCpuUsage)
       Subprocess::FD(STDERR_FILENO),
       None(),
       None(),
-      lambda::bind(&childSetup, pipes),
-      None());
+      None(),
+      parentHooks);
 
   ASSERT_SOME(pid);
 
   // Reap the forked child.
   Future<Option<int> > status = process::reap(pid.get());
-
-  // Continue in the parent.
-  ASSERT_SOME(os::close(pipes[0]));
-
-  // Isolate the forked child.
-  AWAIT_READY(isolator->isolate(containerId, pid.get()));
-
-  // Now signal the child to continue.
-  char dummy;
-  ASSERT_LT(0, ::write(pipes[1], &dummy, sizeof(dummy)));
-
-  ASSERT_SOME(os::close(pipes[1]));
 
   // Wait for the command to start.
   while (!os::exists(file));
@@ -504,7 +561,6 @@ TEST_F(RevocableCpuIsolatorTest, ROOT_CGROUPS_RevocableCpu)
       Subprocess::PATH("/dev/null"),
       None(),
       None(),
-      None(),
       None());
 
   ASSERT_SOME(pid);
@@ -586,13 +642,25 @@ TEST_F(LimitedCpuIsolatorTest, ROOT_CGROUPS_CFS_Enable_Cfs)
     "sleep 0.5 && "
     "kill $MESOS_TEST_PID";
 
-  int pipes[2];
-  ASSERT_NE(-1, ::pipe(pipes));
-
   vector<string> argv(3);
   argv[0] = "sh";
   argv[1] = "-c";
   argv[2] = command;
+
+  vector<Subprocess::Hook> parentHooks;
+
+  // Create parent Hook to isolate child.
+  //
+  // NOTE: We can safely use references here as the hook will be executed
+  // during the call to `fork`.
+  const lambda::function<Try<Nothing>(pid_t)> isolatePidHook = lambda::bind(
+      isolatePid,
+      lambda::_1,
+      std::cref(isolator),
+      std::cref(containerId),
+      NO_CHECK_CGROUPS);
+
+  parentHooks.emplace_back(Subprocess::Hook(isolatePidHook));
 
   Try<pid_t> pid = launcher->fork(
       containerId,
@@ -603,25 +671,13 @@ TEST_F(LimitedCpuIsolatorTest, ROOT_CGROUPS_CFS_Enable_Cfs)
       Subprocess::FD(STDERR_FILENO),
       None(),
       None(),
-      lambda::bind(&childSetup, pipes),
-      prepare.get().isSome() ? prepare.get().get().namespaces() : 0);
+      prepare.get().isSome() ? prepare.get().get().namespaces() : 0,
+      parentHooks);
 
   ASSERT_SOME(pid);
 
   // Reap the forked child.
   Future<Option<int> > status = process::reap(pid.get());
-
-  // Continue in the parent.
-  ASSERT_SOME(os::close(pipes[0]));
-
-  // Isolate the forked child.
-  AWAIT_READY(isolator->isolate(containerId, pid.get()));
-
-  // Now signal the child to continue.
-  char dummy;
-  ASSERT_LT(0, ::write(pipes[1], &dummy, sizeof(dummy)));
-
-  ASSERT_SOME(os::close(pipes[1]));
 
   // Wait for the command to complete.
   AWAIT_READY(status);
@@ -692,13 +748,24 @@ TEST_F(LimitedCpuIsolatorTest, ROOT_CGROUPS_CFS_Big_Quota)
 
   AWAIT_READY(prepare);
 
-  int pipes[2];
-  ASSERT_NE(-1, ::pipe(pipes));
-
   vector<string> argv(3);
   argv[0] = "sh";
   argv[1] = "-c";
   argv[2] = "exit 0";
+
+  vector<Subprocess::Hook> parentHooks;
+
+  // Create parent Hook to isolate child.
+  // Note: We can safely use references here as we are sure that the life time
+  // of the parent will exceed the child.
+  const lambda::function<Try<Nothing>(pid_t)> isolatePidHook = lambda::bind(
+      isolatePid,
+      lambda::_1,
+      std::cref(isolator),
+      std::cref(containerId),
+      NO_CHECK_CGROUPS);
+
+  parentHooks.emplace_back(Subprocess::Hook(isolatePidHook));
 
   Try<pid_t> pid = launcher->fork(
       containerId,
@@ -709,25 +776,13 @@ TEST_F(LimitedCpuIsolatorTest, ROOT_CGROUPS_CFS_Big_Quota)
       Subprocess::FD(STDERR_FILENO),
       None(),
       None(),
-      lambda::bind(&childSetup, pipes),
-      prepare.get().isSome() ? prepare.get().get().namespaces() : 0);
+      prepare.get().isSome() ? prepare.get().get().namespaces() : 0,
+      parentHooks);
 
   ASSERT_SOME(pid);
 
   // Reap the forked child.
   Future<Option<int> > status = process::reap(pid.get());
-
-  // Continue in the parent.
-  ASSERT_SOME(os::close(pipes[0]));
-
-  // Isolate the forked child.
-  AWAIT_READY(isolator->isolate(containerId, pid.get()));
-
-  // Now signal the child to continue.
-  char dummy;
-  ASSERT_LT(0, ::write(pipes[1], &dummy, sizeof(dummy)));
-
-  ASSERT_SOME(os::close(pipes[1]));
 
   // Wait for the command to complete successfully.
   AWAIT_READY(status);
@@ -786,9 +841,6 @@ TEST_F(LimitedCpuIsolatorTest, ROOT_CGROUPS_Pids_and_Tids)
   EXPECT_EQ(0U, usage.get().processes());
   EXPECT_EQ(0U, usage.get().threads());
 
-  int pipes[2];
-  ASSERT_NE(-1, ::pipe(pipes));
-
   // Use these to communicate with the test process after it has
   // exec'd to make sure it is running.
   int inputPipes[2];
@@ -800,6 +852,20 @@ TEST_F(LimitedCpuIsolatorTest, ROOT_CGROUPS_Pids_and_Tids)
   vector<string> argv(1);
   argv[0] = "cat";
 
+  vector<Subprocess::Hook> parentHooks;
+
+  // Create parent Hook to isolate child.
+  // Note: We can safely use references here as we are sure that the life time
+  // of the parent will exceed the child.
+  const lambda::function<Try<Nothing>(pid_t)> isolatePidHook = lambda::bind(
+      isolatePid,
+      lambda::_1,
+      std::cref(isolator),
+      std::cref(containerId),
+      CHECK_CGROUPS);
+
+  parentHooks.emplace_back(Subprocess::Hook(isolatePidHook));
+
   Try<pid_t> pid = launcher->fork(
       containerId,
       "cat",
@@ -809,38 +875,13 @@ TEST_F(LimitedCpuIsolatorTest, ROOT_CGROUPS_Pids_and_Tids)
       Subprocess::FD(STDERR_FILENO),
       None(),
       None(),
-      lambda::bind(&childSetup, pipes),
-      prepare.get().isSome() ? prepare.get().get().namespaces() : 0);
+      prepare.get().isSome() ? prepare.get().get().namespaces() : 0,
+      parentHooks);
 
   ASSERT_SOME(pid);
 
   // Reap the forked child.
   Future<Option<int>> status = process::reap(pid.get());
-
-  // Continue in the parent.
-  ASSERT_SOME(os::close(pipes[0]));
-
-  // Before isolation, the cgroup is empty.
-  usage = isolator->usage(containerId);
-  AWAIT_READY(usage);
-  EXPECT_EQ(0U, usage.get().processes());
-  EXPECT_EQ(0U, usage.get().threads());
-
-  // Isolate the forked child.
-  AWAIT_READY(isolator->isolate(containerId, pid.get()));
-
-  // After the isolation, the cgroup is not empty, even though the
-  // process hasn't exec'd yet.
-  usage = isolator->usage(containerId);
-  AWAIT_READY(usage);
-  EXPECT_EQ(1U, usage.get().processes());
-  EXPECT_EQ(1U, usage.get().threads());
-
-  // Now signal the child to continue.
-  char dummy;
-  ASSERT_LT(0, ::write(pipes[1], &dummy, sizeof(dummy)));
-
-  ASSERT_SOME(os::close(pipes[1]));
 
   // Write to the test process and wait for an echoed result.
   // This observation ensures that the "cat" process has
@@ -1083,8 +1124,8 @@ TEST_F(NetClsIsolatorTest, ROOT_CGROUPS_NetClsIsolate)
 }
 
 
-// This test verifies that are able to retrieve the `net_cls` handle
-// from `state.json`.
+// This test verifies that we are able to retrieve the `net_cls` handle
+// from `/state`.
 TEST_F(NetClsIsolatorTest, ROOT_CGROUPS_ContainerStatus)
 {
   Try<Owned<cluster::Master>> master = StartMaster();
@@ -1142,8 +1183,12 @@ TEST_F(NetClsIsolatorTest, ROOT_CGROUPS_ContainerStatus)
   AWAIT_READY(status);
   ASSERT_EQ(TASK_RUNNING, status.get().state());
 
-  // Task is ready. Verify `ContainerStatus` is present in slave state.json.
-  Future<Response> response = http::get(slave.get()->pid, "state.json");
+  // Task is ready. Verify `ContainerStatus` is present in slave state.
+  Future<Response> response = http::get(
+      slave.get()->pid,
+      "state",
+      None(),
+      createBasicAuthHeaders(DEFAULT_CREDENTIAL));
 
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
   AWAIT_EXPECT_RESPONSE_HEADER_EQ(APPLICATION_JSON, "Content-Type", response);
@@ -1327,7 +1372,6 @@ TEST_F(SharedFilesystemIsolatorTest, DISABLED_ROOT_RelativeVolume)
       Subprocess::FD(STDERR_FILENO),
       None(),
       None(),
-      None(),
       prepare.get().get().namespaces());
   ASSERT_SOME(pid);
 
@@ -1432,7 +1476,6 @@ TEST_F(SharedFilesystemIsolatorTest, DISABLED_ROOT_AbsoluteVolume)
       Subprocess::FD(STDIN_FILENO),
       Subprocess::FD(STDOUT_FILENO),
       Subprocess::FD(STDERR_FILENO),
-      None(),
       None(),
       None(),
       prepare.get().get().namespaces());

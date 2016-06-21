@@ -25,7 +25,6 @@ package mesos.master;
  * This is a protobuf so as to be able to share the status to inverse offers
  * through endpoints such as the maintenance status endpoint.
  */
-// TODO(jmlvanre): Copy this when V1 Allocator API is introduced.
 message InverseOfferStatus {
   enum Status {
     // We have not received a response yet. This is the default state before

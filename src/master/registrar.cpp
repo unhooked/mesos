@@ -19,6 +19,8 @@
 
 #include <mesos/type_utils.hpp>
 
+#include <mesos/state/protobuf.hpp>
+
 #include <process/defer.hpp>
 #include <process/dispatch.hpp>
 #include <process/future.hpp>
@@ -42,25 +44,24 @@
 #include "master/registrar.hpp"
 #include "master/registry.hpp"
 
-#include "state/protobuf.hpp"
-
-using mesos::internal::state::protobuf::State;
-using mesos::internal::state::protobuf::Variable;
+using mesos::state::protobuf::State;
+using mesos::state::protobuf::Variable;
 
 using process::dispatch;
 using process::spawn;
 using process::terminate;
 using process::wait; // Necessary on some OS's to disambiguate.
 
+using process::AUTHENTICATION;
 using process::DESCRIPTION;
 using process::Failure;
 using process::Future;
 using process::HELP;
 using process::Owned;
+using process::PID;
 using process::Process;
 using process::Promise;
 using process::TLDR;
-using process::USAGE;
 
 using process::http::OK;
 
@@ -80,12 +81,16 @@ using process::http::Request;
 class RegistrarProcess : public Process<RegistrarProcess>
 {
 public:
-  RegistrarProcess(const Flags& _flags, State* _state)
+  RegistrarProcess(
+      const Flags& _flags,
+      State* _state,
+      const Option<string>& _authenticationRealm)
     : ProcessBase(process::ID::generate("registrar")),
       metrics(*this),
       updating(false),
       flags(_flags),
-      state(_state) {}
+      state(_state),
+      authenticationRealm(_authenticationRealm) {}
 
   virtual ~RegistrarProcess() {}
 
@@ -96,13 +101,26 @@ public:
 protected:
   virtual void initialize()
   {
-    route("/registry", registryHelp(), &RegistrarProcess::registry);
+    if (authenticationRealm.isSome()) {
+      route(
+          "/registry",
+          authenticationRealm.get(),
+          registryHelp(),
+          &RegistrarProcess::registry);
+    } else {
+      route(
+          "/registry",
+          registryHelp(),
+          lambda::bind(&RegistrarProcess::registry, this, lambda::_1, None()));
+    }
   }
 
 private:
   // HTTP handlers.
   // /registrar(N)/registry
-  Future<Response> registry(const Request& request);
+  Future<Response> registry(
+      const Request& request,
+      const Option<string>& /* principal */);
   static string registryHelp();
 
   // The 'Recover' operation adds the latest MasterInfo.
@@ -208,6 +226,10 @@ private:
   // When an error is encountered from abort(), we'll fail all
   // subsequent operations.
   Option<Error> error;
+
+  // The authentication realm, if any, into which this process'
+  // endpoints will be installed.
+  Option<string> authenticationRealm;
 };
 
 
@@ -235,7 +257,9 @@ void fail(deque<Owned<Operation>>* operations, const string& message)
 }
 
 
-Future<Response> RegistrarProcess::registry(const Request& request)
+Future<Response> RegistrarProcess::registry(
+    const Request& request,
+    const Option<string>& /* principal */)
 {
   JSON::Object result;
 
@@ -297,7 +321,8 @@ string RegistrarProcess::registryHelp()
           "    ]",
           "  }",
           "}",
-          "```"));
+          "```"),
+      AUTHENTICATION(true));
 }
 
 
@@ -509,9 +534,12 @@ void RegistrarProcess::abort(const string& message)
 }
 
 
-Registrar::Registrar(const Flags& flags, State* state)
+Registrar::Registrar(
+    const Flags& flags,
+    State* state,
+    const Option<string>& authenticationRealm)
 {
-  process = new RegistrarProcess(flags, state);
+  process = new RegistrarProcess(flags, state, authenticationRealm);
   spawn(process);
 }
 
@@ -533,6 +561,11 @@ Future<Registry> Registrar::recover(const MasterInfo& info)
 Future<bool> Registrar::apply(Owned<Operation> operation)
 {
   return dispatch(process, &RegistrarProcess::apply, operation);
+}
+
+PID<RegistrarProcess> Registrar::pid() const
+{
+  return process->self();
 }
 
 } // namespace master {

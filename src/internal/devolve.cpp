@@ -65,7 +65,7 @@ SlaveInfo devolve(const v1::AgentInfo& agentInfo)
   SlaveInfo info = devolve<SlaveInfo>(agentInfo);
 
   // We set 'checkpoint' to 'true' since the v1::AgentInfo doesn't
-  // have 'checkpoint' but all "slaves" were checkpointing by default
+  // have 'checkpoint' but all "agents" were checkpointing by default
   // when v1::AgentInfo was introduced. See MESOS-2317.
   info.set_checkpoint(true);
 
@@ -109,6 +109,12 @@ Credential devolve(const v1::Credential& credential)
 }
 
 
+TaskStatus devolve(const v1::TaskStatus& status)
+{
+  return devolve<TaskStatus>(status);
+}
+
+
 executor::Call devolve(const v1::executor::Call& call)
 {
   return devolve<executor::Call>(call);
@@ -124,6 +130,18 @@ scheduler::Call devolve(const v1::scheduler::Call& call)
 scheduler::Event devolve(const v1::scheduler::Event& event)
 {
   return devolve<scheduler::Event>(event);
+}
+
+
+mesos::agent::Call devolve(const v1::agent::Call& call)
+{
+  return devolve<mesos::agent::Call>(call);
+}
+
+
+mesos::master::Call devolve(const v1::master::Call& call)
+{
+  return devolve<mesos::master::Call>(call);
 }
 
 } // namespace internal {

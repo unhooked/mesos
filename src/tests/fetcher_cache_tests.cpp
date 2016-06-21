@@ -69,6 +69,8 @@ using mesos::internal::slave::MesosContainerizerProcess;
 using mesos::internal::slave::Fetcher;
 using mesos::internal::slave::FetcherProcess;
 
+using mesos::master::detector::MasterDetector;
+
 using process::Future;
 using process::HttpEvent;
 using process::Latch;
@@ -657,6 +659,91 @@ TEST_F(FetcherCacheTest, LocalCached)
     ASSERT_SOME(fetcherProcess->cacheFiles(slaveId, flags));
     EXPECT_EQ(1u, fetcherProcess->cacheFiles(slaveId, flags).get().size());
   }
+}
+
+
+TEST_F(FetcherCacheTest, CachedCustomFilename)
+{
+  startSlave();
+  driver->start();
+
+  const int index = 0;
+  const string customOutputFile = "my-command";
+  CommandInfo::URI uri;
+  uri.set_value(commandPath);
+  uri.set_executable(true);
+  uri.set_cache(true);
+  uri.set_output_file(customOutputFile);
+
+  CommandInfo commandInfo;
+  commandInfo.set_value("./" + customOutputFile + " " + taskName(index));
+  commandInfo.add_uris()->CopyFrom(uri);
+
+  const Try<Task> task = launchTask(commandInfo, index);
+  ASSERT_SOME(task);
+
+  AWAIT_READY(awaitFinished(task.get()));
+
+  EXPECT_EQ(1u, fetcherProcess->cacheSize());
+  ASSERT_SOME(fetcherProcess->cacheFiles(slaveId, flags));
+  EXPECT_EQ(1u, fetcherProcess->cacheFiles(slaveId, flags).get().size());
+
+  // Verify that the downloaded executable lives at our custom output path.
+  const string executablePath = path::join(
+    task.get().runDirectory.value, customOutputFile);
+
+  EXPECT_TRUE(isExecutable(executablePath));
+
+  // The script specified by COMMAND_SCRIPT just statically touches a file
+  // named $COMMAND_NAME + $1, so if we want to verify that it ran here we have
+  // to check this path in addition to the custom-named executable we saved.
+  const string outputPath = path::join(
+    task.get().runDirectory.value, COMMAND_NAME);
+
+  EXPECT_TRUE(os::exists(outputPath + taskName(index)));
+}
+
+
+TEST_F(FetcherCacheTest, CachedCustomOutputFileWithSubdirectory)
+{
+  startSlave();
+  driver->start();
+
+  const int index = 0;
+  const string customOutputFile = "subdir/my-command";
+  CommandInfo::URI uri;
+  uri.set_value(commandPath);
+  uri.set_executable(true);
+  uri.set_cache(true);
+  uri.set_output_file(customOutputFile);
+
+  CommandInfo commandInfo;
+  commandInfo.set_value("./" + customOutputFile + " " + taskName(index));
+  commandInfo.add_uris()->CopyFrom(uri);
+
+  const Try<Task> task = launchTask(commandInfo, index);
+  ASSERT_SOME(task);
+
+  AWAIT_READY(awaitFinished(task.get()));
+
+  EXPECT_EQ(1u, fetcherProcess->cacheSize());
+  ASSERT_SOME(fetcherProcess->cacheFiles(slaveId, flags));
+  EXPECT_EQ(1u, fetcherProcess->cacheFiles(slaveId, flags).get().size());
+
+  // Verify that the downloaded executable lives at our custom output file
+  // path.
+  const string executablePath = path::join(
+      task.get().runDirectory.value, customOutputFile);
+
+  EXPECT_TRUE(isExecutable(executablePath));
+
+  // The script specified by COMMAND_SCRIPT just statically touches a file
+  // named $COMMAND_NAME + $1, so if we want to verify that it ran here we have
+  // to check this path in addition to the custom-named executable we saved.
+  const string outputPath = path::join(
+      task.get().runDirectory.value, COMMAND_NAME);
+
+  EXPECT_TRUE(os::exists(outputPath + taskName(index)));
 }
 
 

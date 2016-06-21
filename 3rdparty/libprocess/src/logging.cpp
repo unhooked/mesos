@@ -25,7 +25,9 @@
 
 namespace process {
 
-Future<http::Response> Logging::toggle(const http::Request& request)
+Future<http::Response> Logging::toggle(
+    const http::Request& request,
+    const Option<std::string>& /* principal */)
 {
   Option<std::string> level = request.url.query.get("level");
   Option<std::string> duration = request.url.query.get("duration");
@@ -60,16 +62,25 @@ Future<http::Response> Logging::toggle(const http::Request& request)
     return http::BadRequest(d.error() + ".\n");
   }
 
+  return set_level(v.get(), d.get())
+      .then([]() -> http::Response {
+        return http::OK();
+      });
+}
+
+
+Future<Nothing> Logging::set_level(int level, const Duration& duration)
+{
   // Set the logging level.
-  set(v.get());
+  set(level);
 
   // Start a revert timer (if necessary).
-  if (v.get() != original) {
-    timeout = d.get();
+  if (level != original) {
+    timeout = duration;
     delay(timeout.remaining(), this, &This::revert);
   }
 
-  return http::OK();
+  return Nothing();
 }
 
 
@@ -92,6 +103,8 @@ const std::string Logging::TOGGLE_HELP()
         ">        level=VALUE          Verbosity level (e.g., 1, 2, 3)",
         ">        duration=VALUE       Duration to keep verbosity level",
         ">                             toggled (e.g., 10secs, 15mins, etc.)"),
+    AUTHENTICATION(true),
+    None(),
     REFERENCES(
         "[glog]: https://code.google.com/p/google-glog"));
 }

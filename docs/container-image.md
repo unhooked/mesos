@@ -79,7 +79,7 @@ the agent will refuse to start.
 In summary, to enable container image support in Mesos containerizer,
 please specify the following agent flags:
 
-    $ sudo mesos-slave \
+    $ sudo mesos-agent \
       --containerizers=mesos \
       --image_providers=appc,docker \
       --isolation=filesystem/linux,docker/runtime
@@ -151,10 +151,10 @@ First, start the Mesos master:
 
 Then, start the Mesos agent:
 
-    $ sudo GLOG_v=1 sbin/mesos-slave \
+    $ sudo GLOG_v=1 sbin/mesos-agent \
       --master=<MASTER_IP>:5050 \
       --isolation=docker/runtime,filesystem/linux \
-      --work_dir=/tmp/mesos/slave \
+      --work_dir=/tmp/mesos/agent \
       --image_providers=docker \
       --executor_environment_variables="{}"
 
@@ -285,7 +285,7 @@ agent flag `--sandbox_directory` properly).
 
 ### Overlay
 
-The reson overlay backend was introduced is because the copy backend
+The reason overlay backend was introduced is because the copy backend
 will waste IO and space while the bind backend can only deal with one
 layer. The overlay backend allows containizer to utilize the
 filesystem to merge multiple filesystems into one efficiently.
@@ -298,16 +298,21 @@ for more detail.
 For more information of overlayfs, please refer to
 [here](https://www.kernel.org/doc/Documentation/filesystems/overlayfs.txt).
 
-The overlay backend currently has these two limitations:
+### AUFS
 
-1. The overlay backend only supports more than one single layer. One
-single layer images will fail to provision and the container will fail
-to launch! This limitation will be solved soon.
+The reason AUFS is introduced is because overlayfs support hasn't been
+merged until kernel 3.18 and Docker's default storage backend for
+ubuntu 14.04 is AUFS.
 
-2. Similar to the bind backend, the filesystem will be read-only.
-Please refer to the second limitation of the bind backend for more
-details. We will resolve this limitation soon.
+Like overlayfs, AUFS is also a unioned file system, which is very
+stable, has a lot of real-world deployments, and has strong community
+support.
 
+Some Linux distributions do not support AUFS. This is usually because
+AUFS is not included in the mainline (upstream) Linux kernel.
+
+For more information of AUFS, please refer to
+[here](http://aufs.sourceforge.net/aufs2/man.html).
 
 ## Executor Dependencies in a Container Image
 
@@ -323,8 +328,7 @@ Instead, it can specify a `volume` whose source is an `Image`. Mesos
 containerizer will provision the `image` specified in the `volume`,
 and mount it under the sandbox directory. The executor can perform
 `pivot_root` or `chroot` itself to enter the container root
-filesystem. This is how we solve the command executor issue, avoiding
-the requirement that it has to exist in all container images.
+filesystem.
 
 
 ## References

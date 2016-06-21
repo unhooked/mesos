@@ -10,7 +10,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License
 
+
+#ifdef __WINDOWS__
+#include <stout/windows.hpp>
+#else
 #include <netinet/tcp.h>
+#endif // __WINDOWS__
 
 #include <process/io.hpp>
 #include <process/network.hpp>
@@ -18,6 +23,7 @@
 
 #include <stout/os/sendfile.hpp>
 #include <stout/os/strerror.hpp>
+#include <stout/os.hpp>
 
 #include "config.hpp"
 #include "poll_socket.hpp"
@@ -69,8 +75,15 @@ Future<Socket> accept(int fd)
   }
 
   // Turn off Nagle (TCP_NODELAY) so pipelined requests don't wait.
+  // NOTE: We cast to `char*` here because the function prototypes on Windows
+  // use `char*` instead of `void*`.
   int on = 1;
-  if (setsockopt(s, SOL_TCP, TCP_NODELAY, &on, sizeof(on)) < 0) {
+  if (::setsockopt(
+          s,
+          SOL_TCP,
+          TCP_NODELAY,
+          reinterpret_cast<const char*>(&on),
+          sizeof(on)) < 0) {
     const string error = os::strerror(errno);
     VLOG(1) << "Failed to turn off the Nagle algorithm: " << error;
     os::close(s);
@@ -105,7 +118,15 @@ Future<Nothing> connect(const Socket& socket)
   socklen_t optlen = sizeof(opt);
   int s = socket.get();
 
-  if (getsockopt(s, SOL_SOCKET, SO_ERROR, &opt, &optlen) < 0 || opt != 0) {
+  // NOTE: We cast to `char*` here because the function prototypes on Windows
+  // use `char*` instead of `void*`.
+  if (::getsockopt(
+          s,
+          SOL_SOCKET,
+          SO_ERROR,
+          reinterpret_cast<char*>(&opt),
+          &optlen) < 0 ||
+      opt != 0) {
     // Connect failure.
     VLOG(1) << "Socket error while connecting";
     return Failure("Socket error while connecting");
@@ -119,9 +140,9 @@ Future<Nothing> connect(const Socket& socket)
 
 Future<Nothing> PollSocketImpl::connect(const Address& address)
 {
-  Try<int> connect = network::connect(get(), address);
+  Try<Nothing, SocketError> connect = network::connect(get(), address);
   if (connect.isError()) {
-    if (errno == EINPROGRESS) {
+    if (net::is_inprogress_error(connect.error().code)) {
       return io::poll(get(), io::WRITE)
         .then(lambda::bind(&internal::connect, socket()));
     }
@@ -148,10 +169,16 @@ Future<size_t> socket_send_data(int s, const char* data, size_t size)
   while (true) {
     ssize_t length = send(s, data, size, MSG_NOSIGNAL);
 
-    if (length < 0 && (errno == EINTR)) {
+#ifdef __WINDOWS__
+    int error = WSAGetLastError();
+#else
+    int error = errno;
+#endif // __WINDOWS__
+
+    if (length < 0 && net::is_restartable_error(error)) {
       // Interrupted, try again now.
       continue;
-    } else if (length < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+    } else if (length < 0 && net::is_retryable_error(error)) {
       // Might block, try again later.
       return io::poll(s, io::WRITE)
         .then(lambda::bind(&internal::socket_send_data, s, data, size));
@@ -182,33 +209,29 @@ Future<size_t> socket_send_file(int s, int fd, off_t offset, size_t size)
   CHECK(size > 0);
 
   while (true) {
-    ssize_t length = os::sendfile(s, fd, offset, size);
+    Try<ssize_t, SocketError> length = os::sendfile(s, fd, offset, size);
 
-    if (length < 0 && (errno == EINTR)) {
+    if (length.isSome()) {
+      CHECK(length.get() >= 0);
+      if (length.get() == 0) {
+        // Socket closed.
+        VLOG(1) << "Socket closed while sending";
+      }
+      return length.get();
+    }
+
+    if (net::is_restartable_error(length.error().code)) {
       // Interrupted, try again now.
       continue;
-    } else if (length < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+    } else if (net::is_retryable_error(length.error().code)) {
       // Might block, try again later.
       return io::poll(s, io::WRITE)
         .then(lambda::bind(&internal::socket_send_file, s, fd, offset, size));
-    } else if (length <= 0) {
-      // Socket error or closed.
-      if (length < 0) {
-        const string error = os::strerror(errno);
-        VLOG(1) << "Socket error while sending: " << error;
-      } else {
-        VLOG(1) << "Socket closed while sending";
-      }
-      if (length == 0) {
-        return length;
-      } else {
-        return Failure(ErrnoError("Socket sendfile failed"));
-      }
     } else {
-      CHECK(length > 0);
-
-      return length;
-    }
+      // Socket error or closed.
+      VLOG(1) << length.error().message;
+      return Failure(length.error());
+    };
   }
 }
 

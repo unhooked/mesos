@@ -22,7 +22,9 @@
 #include <stout/lambda.hpp>
 #include <stout/nothing.hpp>
 #include <stout/os.hpp>
+#include <stout/os/read.hpp>
 #include <stout/os/strerror.hpp>
+#include <stout/os/write.hpp>
 #include <stout/try.hpp>
 
 using std::string;
@@ -65,15 +67,23 @@ void read(
   } else {
     ssize_t length;
     if (flags == NONE) {
-      length = ::read(fd, data, size);
+      length = os::read(fd, data, size);
     } else { // PEEK.
       // In case 'fd' is not a socket ::recv() will fail with ENOTSOCK and the
       // error will be propagted out.
-      length = ::recv(fd, data, size, MSG_PEEK);
+      // NOTE: We cast to `char*` here because the function prototypes on
+      // Windows use `char*` instead of `void*`.
+      length = ::recv(fd, (char*) data, size, MSG_PEEK);
     }
 
+#ifdef __WINDOWS__
+    int error = WSAGetLastError();
+#else
+    int error = errno;
+#endif // __WINDOWS__
+
     if (length < 0) {
-      if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+      if (net::is_restartable_error(error) || net::is_retryable_error(error)) {
         // Restart the read operation.
         Future<short> future =
           io::poll(fd, process::io::READ).onAny(
@@ -123,10 +133,16 @@ void write(
   } else if (future.isFailed()) {
     promise->fail(future.failure());
   } else {
-    ssize_t length = ::write(fd, data, size);
+    ssize_t length = os::write(fd, data, size);
+
+#ifdef __WINDOWS__
+    int error = WSAGetLastError();
+#else
+    int error = errno;
+#endif // __WINDOWS__
 
     if (length < 0) {
-      if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+      if (net::is_restartable_error(error) || net::is_retryable_error(error)) {
         // Restart the write operation.
         Future<short> future =
           io::poll(fd, process::io::WRITE).onAny(
@@ -272,7 +288,9 @@ Future<size_t> peek(int fd, void* data, size_t size, size_t limit)
   // fixed in a newer version of libev (we use 3.8 at the time of
   // writing this comment).
   internal::read(fd, data, limit, internal::PEEK, promise, io::READ);
-  promise->future().onAny(lambda::bind(&os::close, fd));
+
+  // NOTE: We wrap `os::close` in a lambda to disambiguate on Windows.
+  promise->future().onAny([fd]() { os::close(fd); });
 
   return promise->future();
 }
@@ -319,7 +337,7 @@ void _splice(
     boost::shared_array<char> data,
     std::shared_ptr<Promise<Nothing>> promise)
 {
-  // Stop splicing if a discard occured on our future.
+  // Stop splicing if a discard occurred on our future.
   if (promise->future().hasDiscard()) {
     // TODO(benh): Consider returning the number of bytes already
     // spliced on discarded, or a failure. Same for the 'onDiscarded'
@@ -345,7 +363,7 @@ void _splice(
         promise->set(Nothing());
       } else {
         // Note that we always try and complete the write, even if a
-        // discard has occured on our future, in order to provide
+        // discard has occurred on our future, in order to provide
         // semantics where everything read is written. The promise
         // will eventually be discarded in the next read.
         io::write(to, string(data.get(), size))
@@ -420,9 +438,20 @@ Future<string> read(int fd)
   std::shared_ptr<string> buffer(new string());
   boost::shared_array<char> data(new char[BUFFERED_READ_SIZE]);
 
+  // NOTE: We wrap `os::close` in a lambda to disambiguate on Windows.
   return internal::_read(fd, buffer, data, BUFFERED_READ_SIZE)
-    .onAny(lambda::bind(&os::close, fd));
+    .onAny([fd]() { os::close(fd); });
 }
+
+
+#ifdef __WINDOWS__
+// NOTE: Ordinarily this would go in a Windows-specific header; we put it here
+// to avoid complex forward declarations.
+Future<string> read(HANDLE handle)
+{
+  return read(_open_osfhandle(reinterpret_cast<intptr_t>(handle), O_RDONLY));
+}
+#endif // __WINDOWS__
 
 
 Future<Nothing> write(int fd, const string& data)
@@ -461,8 +490,9 @@ Future<Nothing> write(int fd, const string& data)
         nonblock.error());
   }
 
+  // NOTE: We wrap `os::close` in a lambda to disambiguate on Windows.
   return internal::_write(fd, Owned<string>(new string(data)), 0)
-    .onAny(lambda::bind(&os::close, fd));
+    .onAny([fd]() { os::close(fd); });
 }
 
 
@@ -531,10 +561,24 @@ Future<Nothing> redirect(int from, Option<int> to, size_t chunk)
     return Failure("Failed to make 'to' non-blocking: " + nonblock.error());
   }
 
+  // NOTE: We wrap `os::close` in a lambda to disambiguate on Windows.
   return internal::splice(from, to.get(), chunk)
-    .onAny(lambda::bind(&os::close, from))
-    .onAny(lambda::bind(&os::close, to.get()));
+    .onAny([from]() { os::close(from); })
+    .onAny([to]() { os::close(to.get()); });
 }
+
+
+#ifdef __WINDOWS__
+// NOTE: Ordinarily this would go in a Windows-specific header; we put it here
+// to avoid complex forward declarations.
+Future<Nothing> redirect(HANDLE from, Option<int> to, size_t chunk)
+{
+  return redirect(
+      _open_osfhandle(reinterpret_cast<intptr_t>(from), O_RDWR),
+      to,
+      chunk);
+}
+#endif // __WINDOWS__
 
 
 // TODO(hartem): Most of the boilerplate code here is the same as

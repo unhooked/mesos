@@ -126,8 +126,18 @@ public:
           break;
         }
 
+        case Event::INVERSE_OFFERS: {
+          cout << endl << "Received an INVERSE_OFFERS event" << endl;
+          break;
+        }
+
         case Event::RESCIND: {
           cout << endl << "Received a RESCIND event" << endl;
+          break;
+        }
+
+        case Event::RESCIND_INVERSE_OFFER: {
+          cout << endl << "Received a RESCIND_INVERSE_OFFER event" << endl;
           break;
         }
 
@@ -182,8 +192,9 @@ public:
           break;
         }
 
-        default: {
-          EXIT(1) << "Received an UNKNOWN event";
+        case Event::UNKNOWN: {
+          LOG(WARNING) << "Received an UNKNOWN event and ignored";
+          break;
         }
       }
     }
@@ -199,7 +210,8 @@ virtual void initialize()
       mesos::ContentType::PROTOBUF,
       process::defer(self(), &Self::connected),
       process::defer(self(), &Self::disconnected),
-      process::defer(self(), &Self::received, lambda::_1)));
+      process::defer(self(), &Self::received, lambda::_1),
+      None()));
 }
 
 private:
@@ -279,7 +291,7 @@ private:
 
       Call::Acknowledge* ack = call.mutable_acknowledge();
       ack->mutable_agent_id()->CopyFrom(status.agent_id());
-      ack->mutable_task_id ()->CopyFrom(status.task_id ());
+      ack->mutable_task_id()->CopyFrom(status.task_id());
       ack->set_uuid(status.uuid());
 
       mesos->send(call);
@@ -292,11 +304,12 @@ private:
     if (status.state() == TASK_LOST ||
         status.state() == TASK_KILLED ||
         status.state() == TASK_FAILED) {
-      EXIT(1) << "Exiting because task " << status.task_id()
-              << " is in unexpected state " << status.state()
-              << " with reason " << status.reason()
-              << " from source " << status.source()
-              << " with message '" << status.message() << "'";
+      EXIT(EXIT_FAILURE)
+        << "Exiting because task " << status.task_id()
+        << " is in unexpected state " << status.state()
+        << " with reason " << status.reason()
+        << " from source " << status.source()
+        << " with message '" << status.message() << "'";
     }
 
     if (tasksFinished == totalTasks) {
@@ -367,13 +380,12 @@ int main(int argc, char** argv)
 {
   // Find this executable's directory to locate executor.
   string uri;
-  Option<string> value = os::getenv("MESOS_BUILD_DIR");
+  Option<string> value = os::getenv("MESOS_HELPER_DIR");
   if (value.isSome()) {
-    uri = path::join(value.get(), "src", "test-http-executor");
+    uri = path::join(value.get(), "test-http-executor");
   } else {
     uri = path::join(
         os::realpath(Path(argv[0]).dirname()).get(),
-        "src",
         "test-http-executor");
   }
 
@@ -390,20 +402,25 @@ int main(int argc, char** argv)
             "master",
             "ip:port of master to connect");
 
-  Try<Nothing> load = flags.load(None(), argc, argv);
+  Try<flags::Warnings> load = flags.load(None(), argc, argv);
 
   if (load.isError()) {
     cerr << load.error() << endl;
     usage(argv[0], flags);
-    EXIT(1);
+    EXIT(EXIT_FAILURE);
   } else if (master.isNone()) {
     cerr << "Missing --master" << endl;
     usage(argv[0], flags);
-    EXIT(1);
+    EXIT(EXIT_FAILURE);
   }
 
   process::initialize();
   mesos::internal::logging::initialize(argv[0], flags, true); // Catch signals.
+
+  // Log any flag warnings (after logging is initialized).
+  foreach (const flags::Warning& warning, load->warnings) {
+    LOG(WARNING) << warning.message;
+  }
 
   FrameworkInfo framework;
   framework.set_name("Event Call Scheduler using libprocess (C++)");
@@ -428,7 +445,8 @@ int main(int argc, char** argv)
 
   value = os::getenv("DEFAULT_PRINCIPAL");
   if (value.isNone()) {
-    EXIT(1) << "Expecting authentication principal in the environment";
+    EXIT(EXIT_FAILURE)
+      << "Expecting authentication principal in the environment";
   }
 
   framework.set_principal(value.get());

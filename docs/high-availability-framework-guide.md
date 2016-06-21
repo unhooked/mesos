@@ -185,17 +185,17 @@ initial state and several possible terminal states:
   has learned about the task (and maybe started fetching its dependencies) but has
   not yet started to run it.
 
-* A task transitions to the `TASK_RUNNING` state after it starts running
+* A task transitions to the `TASK_RUNNING` state after it has begun running
   successfully (if the task fails to start, it transitions to one of the
   terminal states listed below).
 
   * If a framework attempts to launch a task but does not receive a status
     update for it within a timeout, the framework should perform
     [reconciliation](reconciliation.md). That is, it should ask the master for
-    the current state of the task. The master will reply with `TASK_LOST` for
-    unknown tasks. The framework can then use this to distinguish between tasks
-    that are slow to launch and tasks that the master has never heard about
-    (e.g., because the task launch message was dropped).
+    the current state of the task. The master will reply with `TASK_LOST` status
+    updates for unknown tasks. The framework can then use this to distinguish
+    between tasks that are slow to launch and tasks that the master has never
+    heard about (e.g., because the task launch message was dropped).
 
     * Note that the correctness of this technique depends on the fact that
       messaging between the scheduler and the master is ordered.
@@ -212,10 +212,17 @@ initial state and several possible terminal states:
   * `TASK_FAILED` indicates that a task aborted with an error.
   * `TASK_KILLED` indicates that a task was killed by the executor.
   * `TASK_LOST` indicates that the task was running on an agent that has lost
-    contact with the current master (typically due to a network partition or the
-    agent host crashing). This case is described further below.
+    contact with the current master (typically due to a network partition or an
+    agent host failure). This case is described further below.
   * `TASK_ERROR` indicates that a task launch attempt failed because of an error
     in the task specification.
+
+Note that the same task status can be used in several different (but usually
+related) situations. For example, `TASK_ERROR` is used when the framework's
+principal is not authorized to launch tasks as a certain user, and also when the
+task description is syntactically malformed (e.g., the task ID contains an
+invalid character). The `reason` field of the `TaskStatus` message can be used
+to disambiguate between such situations.
 
 ## Dealing with Partitioned or Failed Agents
 
@@ -228,7 +235,7 @@ using two different mechanisms:
    "ping" messages to the agent and expects a "pong" response message within a
    configurable timeout. The agent is considered to have failed if it does not
    respond promptly to a certain number of ping messages in a row. This behavior
-   is controlled by the `--slave_ping_timeout` and `--max_slave_ping_timeouts`
+   is controlled by the `--agent_ping_timeout` and `--max_agent_ping_timeouts`
    master flags.
 
 If the persistent TCP connection to the agent breaks or the agent fails health
@@ -239,7 +246,7 @@ it from the cluster. Specifically:
   semantics when a registered agent gets disconnected are as follows for each
   framework running on that agent:
 
-  * If the framework is [checkpointing](slave-recovery.md): no immediate action
+  * If the framework is [checkpointing](agent-recovery.md): no immediate action
     is taken. The agent is given a chance to reconnect until health checks time
     out.
 
@@ -252,29 +259,29 @@ it from the cluster. Specifically:
 
     * The rationale for this behavior is that, using typical TCP settings, an
       error in the persistent TCP connection between the master and the agent is
-      more likely to correspond to an agent error (e.g., the `mesos-slave`
+      more likely to correspond to an agent error (e.g., the `mesos-agent`
       process terminating unexpectedly) than a network partition, because the
       Mesos health-check timeouts are much smaller than the typical values of
       the corresponding TCP-level timeouts. Since non-checkpointing frameworks
-      will not survive a restart of the `mesos-slave` process, the master sends
+      will not survive a restart of the `mesos-agent` process, the master sends
       `TASK_LOST` status updates so that these tasks can be rescheduled
       promptly.  Of course, the heuristic that TCP errors do not correspond to
       network partitions may not be true in some environments.
 
 * If the agent fails health checks, it is scheduled for removal. The removals can
-  be rate limited by the master (see `---slave_removal_rate_limit` master flag)
-  to avoid removing a slew of slaves at once (e.g., during a network partition).
+  be rate limited by the master (see `--agent_removal_rate_limit` master flag)
+  to avoid removing a slew of agents at once (e.g., during a network partition).
 
-* When it is time to remove an agent, the master marks the agent as "removed" in
-  the master's [durable state](replicated-log-internals.md) (this will survive
-  master failover). The master sends a `slaveLost` callback to every registered
-  scheduler driver; it also sends `TASK_LOST` status updates for every task that
-  was running on the removed agent.
+* When it is time to remove an agent, the master removes the agent from the list
+  of registered agents in the master's [durable state](replicated-log-internals.md)
+  (this will survive master failover). The master sends a `slaveLost` callback
+  to every registered scheduler driver; it also sends `TASK_LOST` status updates
+  for every task that was running on the removed agent.
 
-    >NOTE: Neither the callback nor the status updates are delivered reliably by
-    the master. For example, if the master or scheduler fails over or there is a
-    network connectivity issue during the delivery of these messages, they will
-    not be resent.
+    >NOTE: Neither the callback nor the task status updates are delivered
+    reliably by the master. For example, if the master or scheduler fails over
+    or there is a network connectivity issue during the delivery of these
+    messages, they will not be resent.
 
 * Meanwhile, any tasks at the removed agent will continue to run and the agent
   will repeatedly attempt to reconnect to the master. Once a removed agent is
@@ -284,13 +291,13 @@ it from the cluster. Specifically:
   executors.  Persistent volumes and dynamic reservations on the removed agent
   will be preserved.
 
-  * A removed agent can rejoin the cluster by starting a new copy of the
-    `mesos-slave` process. When a removed agent is shutdown by the master, Mesos
-    ensures that the next time `mesos-slave` is started (using the same work
-    directory at the same host), the agent will receive a new agent ID; in
-    effect, the agent will be treated as a newly joined agent. The agent will
-    retain any previously created persistent volumes and dynamic reservations,
-    although the agent ID associated with these resources will have changed.
+  * A removed agent can rejoin the cluster by restarting the `mesos-agent`
+    process. When a removed agent is shutdown by the master, Mesos ensures that
+    the next time `mesos-agent` is started (using the same work directory at the
+    same host), the agent will receive a new agent ID; in effect, the agent will
+    be treated as a newly joined agent. The agent will retain any previously
+    created persistent volumes and dynamic reservations, although the agent ID
+    associated with these resources will have changed.
 
 Typically, frameworks respond to failed or partitioned agents by scheduling new
 copies of the tasks that were running on the lost agent. This should be done
@@ -321,16 +328,16 @@ framework has successfully reregistered with the new leading master, the
 
 ### Agent Reregistration
 During the period after a new master has been elected but before a given agent
-has reregistered or the `slave_reregister_timeout` has fired, attempting to
+has reregistered or the `agent_reregister_timeout` has fired, attempting to
 reconcile the state of a task running on that agent will not return any
 information (because the master cannot accurately determine the state of the
 task).
 
 If an agent does not reregister with the new master within a timeout (controlled
-by the `--slave_reregister_timeout` configuration flag), the master marks the
+by the `--agent_reregister_timeout` configuration flag), the master marks the
 agent as failed and follows the same steps described above. However, there is
 one difference: by default, agents are _allowed to reconnect_ following master
-failover, even after the `slave_reregister_timeout` has fired. This means that
+failover, even after the `agent_reregister_timeout` has fired. This means that
 frameworks might see a `TASK_LOST` update for a task but then later discover
 that the task is running (because the agent where it was running was allowed to
 reconnect). This behavior can be avoided by enabling the `--registry_strict`

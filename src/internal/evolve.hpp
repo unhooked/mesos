@@ -19,19 +19,34 @@
 
 #include <google/protobuf/message.h>
 
+#include <mesos/agent/agent.hpp>
+
 #include <mesos/mesos.hpp>
 
+#include <mesos/master/master.hpp>
+
 #include <mesos/executor/executor.hpp>
+
+#include <mesos/master/master.hpp>
+
+#include <mesos/maintenance/maintenance.hpp>
 
 #include <mesos/scheduler/scheduler.hpp>
 
 #include <mesos/v1/mesos.hpp>
 
+#include <mesos/v1/agent/agent.hpp>
+
 #include <mesos/v1/executor/executor.hpp>
+
+#include <mesos/v1/master/master.hpp>
+
+#include <mesos/v1/maintenance/maintenance.hpp>
 
 #include <mesos/v1/scheduler/scheduler.hpp>
 
 #include <stout/foreach.hpp>
+#include <stout/json.hpp>
 
 #include "messages/messages.hpp"
 
@@ -43,6 +58,7 @@ v1::AgentID evolve(const SlaveID& slaveId);
 v1::AgentInfo evolve(const SlaveInfo& slaveInfo);
 v1::FrameworkID evolve(const FrameworkID& frameworkId);
 v1::FrameworkInfo evolve(const FrameworkInfo& frameworkInfo);
+v1::KillPolicy evolve(const KillPolicy& killPolicy);
 v1::ExecutorID evolve(const ExecutorID& executorId);
 v1::ExecutorInfo evolve(const ExecutorInfo& executorInfo);
 v1::Offer evolve(const Offer& offer);
@@ -51,6 +67,12 @@ v1::OfferID evolve(const OfferID& offerId);
 v1::TaskID evolve(const TaskID& taskId);
 v1::TaskInfo evolve(const TaskInfo& taskInfo);
 v1::TaskStatus evolve(const TaskStatus& status);
+v1::Task evolve(const Task& task);
+v1::MasterInfo evolve(const MasterInfo& masterInfo);
+
+v1::agent::Response evolve(const mesos::agent::Response& response);
+
+v1::master::Response evolve(const mesos::master::Response& response);
 
 v1::scheduler::Call evolve(const scheduler::Call& call);
 
@@ -78,7 +100,9 @@ v1::scheduler::Event evolve(const scheduler::Event& event);
 v1::scheduler::Event evolve(const FrameworkRegisteredMessage& message);
 v1::scheduler::Event evolve(const FrameworkReregisteredMessage& message);
 v1::scheduler::Event evolve(const ResourceOffersMessage& message);
+v1::scheduler::Event evolve(const InverseOffersMessage& message);
 v1::scheduler::Event evolve(const RescindResourceOfferMessage& message);
+v1::scheduler::Event evolve(const RescindInverseOfferMessage& message);
 v1::scheduler::Event evolve(const StatusUpdateMessage& message);
 v1::scheduler::Event evolve(const LostSlaveMessage& message);
 v1::scheduler::Event evolve(const ExitedExecutorMessage& message);
@@ -97,6 +121,34 @@ v1::executor::Event evolve(const KillTaskMessage& message);
 v1::executor::Event evolve(const RunTaskMessage& message);
 v1::executor::Event evolve(const StatusUpdateAcknowledgementMessage& message);
 v1::executor::Event evolve(const ShutdownExecutorMessage& message);
+
+
+v1::master::Event evolve(const mesos::master::Event& event);
+
+
+// Before the v1 API we had REST endpoints that returned JSON. The JSON was not
+// specified in any formal way, i.e., there were no protobufs which captured the
+// structure. As part of the v1 API we introduced the Call/Response protobufs
+// (see v1/master.proto and v1/agent.proto). This evolve variant transforms a
+// JSON object that would have been returned from a particular REST endpoint to
+// a `Response` protobuf suitable for returning from the new v1 API endpoints.
+
+// Declaration of helper functions for evolving JSON objects used in master's
+// REST endpoints pre v1 API.
+template <v1::master::Response::Type T>
+v1::master::Response evolve(const JSON::Object& object);
+
+
+// Helper functions that evolve old style internal messages to a
+// v1::master::Response.
+v1::master::Response evolve(const mesos::maintenance::ClusterStatus& status);
+v1::master::Response evolve(const mesos::maintenance::Schedule& schedule);
+
+
+// Declaration of helper functions for evolving JSON objects used in agent's
+// REST endpoints pre v1 API.
+template <v1::agent::Response::Type T>
+v1::agent::Response evolve(const JSON::Object& object);
 
 } // namespace internal {
 } // namespace mesos {

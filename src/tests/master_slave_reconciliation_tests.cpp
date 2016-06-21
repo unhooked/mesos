@@ -35,6 +35,8 @@
 
 #include "master/master.hpp"
 
+#include "master/detector/standalone.hpp"
+
 #include "slave/slave.hpp"
 
 #include "tests/containerizer.hpp"
@@ -46,6 +48,8 @@ using namespace mesos::internal::protobuf;
 using mesos::internal::master::Master;
 
 using mesos::internal::slave::Slave;
+
+using mesos::master::detector::StandaloneMasterDetector;
 
 using process::Clock;
 using process::Future;
@@ -70,7 +74,7 @@ class MasterSlaveReconciliationTest : public MesosTest {};
 
 // This test verifies that a re-registering slave sends the terminal
 // unacknowledged tasks for a terminal executor. This is required
-// for the master to correctly reconcile it's view with the slave's
+// for the master to correctly reconcile its view with the slave's
 // view of tasks. This test drops a terminal update to the master
 // and then forces the slave to re-register.
 TEST_F(MasterSlaveReconciliationTest, SlaveReregisterTerminatedExecutor)
@@ -291,6 +295,14 @@ TEST_F(MasterSlaveReconciliationTest, ReconcileRace)
 
   driver.start();
 
+  // Since the agent may have retried registration, we want to
+  // ensure that any duplicate registrations are flushed before
+  // we appoint the master again. Otherwise, the agent may
+  // receive a stale registration message.
+  Clock::pause();
+  Clock::settle();
+  Clock::resume();
+
   // Trigger a re-registration of the slave and capture the message
   // so that we can spoof a race with a launch task message.
   DROP_PROTOBUFS(ReregisterSlaveMessage(), slave.get()->pid, master.get()->pid);
@@ -350,7 +362,7 @@ TEST_F(MasterSlaveReconciliationTest, ReconcileRace)
 
   AWAIT_READY(slaveReregisteredMessage);
 
-  // Neither the master nor the slave should not send a TASK_LOST
+  // Neither the master nor the slave should send a TASK_LOST
   // as part of the reconciliation. We check this by calling
   // Clock::settle() to flush all pending events.
   Clock::pause();

@@ -68,6 +68,7 @@ using std::string;
 using process::Latch;
 using process::wait; // Necessary on some OS's to disambiguate.
 
+using mesos::Executor; // Necessary on some OS's to disambiguate.
 
 namespace mesos {
 namespace internal {
@@ -81,15 +82,16 @@ namespace internal {
 // Process here, see: MESOS-4729.
 class ShutdownProcess : public Process<ShutdownProcess>
 {
+public:
+  explicit ShutdownProcess(const Duration& _gracePeriod)
+    : gracePeriod(_gracePeriod) {}
+
 protected:
   virtual void initialize()
   {
-    VLOG(1) << "Scheduling shutdown of the executor in "
-            << slave::DEFAULT_EXECUTOR_SHUTDOWN_GRACE_PERIOD;
+    VLOG(1) << "Scheduling shutdown of the executor in " << gracePeriod;
 
-    // TODO(benh): Pass the shutdown timeout with ExecutorRegistered
-    // since it might have gotten configured on the command line.
-    delay(slave::DEFAULT_EXECUTOR_SHUTDOWN_GRACE_PERIOD, self(), &Self::kill);
+    delay(gracePeriod, self(), &Self::kill);
   }
 
   void kill()
@@ -98,31 +100,46 @@ protected:
 
     // TODO(vinod): Invoke killtree without killing ourselves.
     // Kill the process group (including ourself).
+#ifndef __WINDOWS__
     killpg(0, SIGKILL);
+#else
+    LOG(WARNING) << "Shutting down process group. Windows does not support "
+                    "`killpg`, so we simply call `exit` on the assumption "
+                    "that the process was generated with the "
+                    "`WindowsContainerizer`, which uses the 'close on exit' "
+                    "feature of job objects to make sure all child processes "
+                    "are killed when a parent process exits";
+    exit(0);
+#endif // __WINDOWS__
 
     // The signal might not get delivered immediately, so sleep for a
     // few seconds. Worst case scenario, exit abnormally.
     os::sleep(Seconds(5));
     exit(EXIT_FAILURE);
   }
+
+private:
+  const Duration gracePeriod;
 };
 
 
 class ExecutorProcess : public ProtobufProcess<ExecutorProcess>
 {
 public:
-  ExecutorProcess(const UPID& _slave,
-                  MesosExecutorDriver* _driver,
-                  Executor* _executor,
-                  const SlaveID& _slaveId,
-                  const FrameworkID& _frameworkId,
-                  const ExecutorID& _executorId,
-                  bool _local,
-                  const string& _directory,
-                  bool _checkpoint,
-                  const Duration& _recoveryTimeout,
-                  std::recursive_mutex* _mutex,
-                  Latch* _latch)
+  ExecutorProcess(
+      const UPID& _slave,
+      MesosExecutorDriver* _driver,
+      Executor* _executor,
+      const SlaveID& _slaveId,
+      const FrameworkID& _frameworkId,
+      const ExecutorID& _executorId,
+      bool _local,
+      const string& _directory,
+      bool _checkpoint,
+      const Duration& _recoveryTimeout,
+      const Duration& _shutdownGracePeriod,
+      std::recursive_mutex* _mutex,
+      Latch* _latch)
     : ProcessBase(ID::generate("executor")),
       slave(_slave),
       driver(_driver),
@@ -138,7 +155,8 @@ public:
       latch(_latch),
       directory(_directory),
       checkpoint(_checkpoint),
-      recoveryTimeout(_recoveryTimeout)
+      recoveryTimeout(_recoveryTimeout),
+      shutdownGracePeriod(_shutdownGracePeriod)
   {
     LOG(INFO) << "Version: " << MESOS_VERSION;
 
@@ -202,19 +220,20 @@ protected:
     send(slave, message);
   }
 
-  void registered(const ExecutorInfo& executorInfo,
-                  const FrameworkID& frameworkId,
-                  const FrameworkInfo& frameworkInfo,
-                  const SlaveID& slaveId,
-                  const SlaveInfo& slaveInfo)
+  void registered(
+      const ExecutorInfo& executorInfo,
+      const FrameworkID& frameworkId,
+      const FrameworkInfo& frameworkInfo,
+      const SlaveID& slaveId,
+      const SlaveInfo& slaveInfo)
   {
     if (aborted.load()) {
-      VLOG(1) << "Ignoring registered message from slave " << slaveId
+      VLOG(1) << "Ignoring registered message from agent " << slaveId
               << " because the driver is aborted!";
       return;
     }
 
-    LOG(INFO) << "Executor registered on slave " << slaveId;
+    LOG(INFO) << "Executor registered on agent " << slaveId;
 
     connected = true;
     connection = UUID::random();
@@ -232,12 +251,12 @@ protected:
   void reregistered(const SlaveID& slaveId, const SlaveInfo& slaveInfo)
   {
     if (aborted.load()) {
-      VLOG(1) << "Ignoring re-registered message from slave " << slaveId
+      VLOG(1) << "Ignoring re-registered message from agent " << slaveId
               << " because the driver is aborted!";
       return;
     }
 
-    LOG(INFO) << "Executor re-registered on slave " << slaveId;
+    LOG(INFO) << "Executor re-registered on agent " << slaveId;
 
     connected = true;
     connection = UUID::random();
@@ -255,12 +274,12 @@ protected:
   void reconnect(const UPID& from, const SlaveID& slaveId)
   {
     if (aborted.load()) {
-      VLOG(1) << "Ignoring reconnect message from slave " << slaveId
+      VLOG(1) << "Ignoring reconnect message from agent " << slaveId
               << " because the driver is aborted!";
       return;
     }
 
-    LOG(INFO) << "Received reconnect request from slave " << slaveId;
+    LOG(INFO) << "Received reconnect request from agent " << slaveId;
 
     // Update the slave link.
     slave = from;
@@ -339,29 +358,33 @@ protected:
       const TaskID& taskId,
       const string& uuid)
   {
+    Try<UUID> uuid_ = UUID::fromBytes(uuid);
+    CHECK_SOME(uuid_);
+
     if (aborted.load()) {
       VLOG(1) << "Ignoring status update acknowledgement "
-              << UUID::fromBytes(uuid) << " for task " << taskId
+              << uuid_.get() << " for task " << taskId
               << " of framework " << frameworkId
               << " because the driver is aborted!";
       return;
     }
 
     VLOG(1) << "Executor received status update acknowledgement "
-            << UUID::fromBytes(uuid) << " for task " << taskId
+            << uuid_.get() << " for task " << taskId
             << " of framework " << frameworkId;
 
     // Remove the corresponding update.
-    updates.erase(UUID::fromBytes(uuid));
+    updates.erase(uuid_.get());
 
     // Remove the corresponding task.
     tasks.erase(taskId);
   }
 
-  void frameworkMessage(const SlaveID& slaveId,
-                        const FrameworkID& frameworkId,
-                        const ExecutorID& executorId,
-                        const string& data)
+  void frameworkMessage(
+      const SlaveID& slaveId,
+      const FrameworkID& frameworkId,
+      const ExecutorID& executorId,
+      const string& data)
   {
     if (aborted.load()) {
       VLOG(1) << "Ignoring framework message because the driver is aborted!";
@@ -391,7 +414,7 @@ protected:
 
     if (!local) {
       // Start the Shutdown Process.
-      spawn(new ShutdownProcess(), true);
+      spawn(new ShutdownProcess(shutdownGracePeriod), true);
     }
 
     Stopwatch stopwatch;
@@ -460,8 +483,8 @@ protected:
     if (checkpoint && connected) {
       connected = false;
 
-      LOG(INFO) << "Slave exited, but framework has checkpointing enabled. "
-                << "Waiting " << recoveryTimeout << " to reconnect with slave "
+      LOG(INFO) << "Agent exited, but framework has checkpointing enabled. "
+                << "Waiting " << recoveryTimeout << " to reconnect with agent "
                 << slaveId;
 
       delay(recoveryTimeout, self(), &Self::_recoveryTimeout, connection);
@@ -469,13 +492,13 @@ protected:
       return;
     }
 
-    LOG(INFO) << "Slave exited ... shutting down";
+    LOG(INFO) << "Agent exited ... shutting down";
 
     connected = false;
 
     if (!local) {
       // Start the Shutdown Process.
-      spawn(new ShutdownProcess(), true);
+      spawn(new ShutdownProcess(shutdownGracePeriod), true);
     }
 
     Stopwatch stopwatch;
@@ -559,6 +582,7 @@ private:
   const string directory;
   bool checkpoint;
   Duration recoveryTimeout;
+  Duration shutdownGracePeriod;
 
   LinkedHashMap<UUID, StatusUpdate> updates; // Unacknowledged updates.
 
@@ -576,9 +600,9 @@ private:
 // Implementation of C++ API.
 
 
-MesosExecutorDriver::MesosExecutorDriver(Executor* _executor)
+MesosExecutorDriver::MesosExecutorDriver(mesos::Executor* _executor)
   : executor(_executor),
-    process(NULL),
+    process(nullptr),
     status(DRIVER_NOT_STARTED)
 {
   GOOGLE_PROTOBUF_VERIFY_VERSION;
@@ -586,7 +610,7 @@ MesosExecutorDriver::MesosExecutorDriver(Executor* _executor)
   // Load any logging flags from the environment.
   logging::Flags flags;
 
-  Try<Nothing> load = flags.load("MESOS_");
+  Try<flags::Warnings> load = flags.load("MESOS_");
 
   if (load.isError()) {
     status = DRIVER_ABORTED;
@@ -605,6 +629,11 @@ MesosExecutorDriver::MesosExecutorDriver(Executor* _executor)
     logging::initialize("mesos", flags);
   } else {
     VLOG(1) << "Disabling initialization of GLOG logging";
+  }
+
+  // Log any flag warnings (after logging is initialized).
+  foreach (const flags::Warning& warning, load->warnings) {
+    LOG(WARNING) << warning.message;
   }
 
   spawn(new VersionProcess(), true);
@@ -633,9 +662,18 @@ Status MesosExecutorDriver::start()
 
     // Set stream buffering mode to flush on newlines so that we
     // capture logs from user processes even when output is redirected
-    // to a file.
-    setvbuf(stdout, 0, _IOLBF, 0);
-    setvbuf(stderr, 0, _IOLBF, 0);
+    // to a file. On POSIX, the buffer size is determined by the system
+    // when the `buf` parameter is null. On Windows we have to specify
+    // the size, so we use 1024 bytes, a number that is arbitrary, but
+    // large enough to not affect performance.
+    const size_t bufferSize =
+#ifdef __WINDOWS__
+      1024;
+#else // __WINDOWS__
+      0;
+#endif // __WINDOWS__
+    setvbuf(stdout, nullptr, _IOLBF, bufferSize);
+    setvbuf(stderr, nullptr, _IOLBF, bufferSize);
 
     bool local;
 
@@ -694,6 +732,24 @@ Status MesosExecutorDriver::start()
     }
     workDirectory = value.get();
 
+    // Get executor shutdown grace period from the environment.
+    //
+    // NOTE: We do not require this variable to be set
+    // (in contrast to the others above) for backwards
+    // compatibility: agents < 0.28.0 do not set it.
+    Duration shutdownGracePeriod = DEFAULT_EXECUTOR_SHUTDOWN_GRACE_PERIOD;
+    value = os::getenv("MESOS_EXECUTOR_SHUTDOWN_GRACE_PERIOD");
+    if (value.isSome()) {
+      Try<Duration> parse = Duration::parse(value.get());
+      if (parse.isError()) {
+        EXIT(EXIT_FAILURE)
+          << "Failed to parse value '" << value.get() << "' of "
+          << "'MESOS_EXECUTOR_SHUTDOWN_GRACE_PERIOD': " << parse.error();
+      }
+
+      shutdownGracePeriod = parse.get();
+    }
+
     // Get checkpointing status from environment.
     value = os::getenv("MESOS_CHECKPOINT");
     checkpoint = value.isSome() && value.get() == "1";
@@ -717,7 +773,7 @@ Status MesosExecutorDriver::start()
       }
     }
 
-    CHECK(process == NULL);
+    CHECK(process == nullptr);
 
     process = new ExecutorProcess(
         slave,
@@ -730,6 +786,7 @@ Status MesosExecutorDriver::start()
         workDirectory,
         checkpoint,
         recoveryTimeout,
+        shutdownGracePeriod,
         &mutex,
         latch);
 
@@ -747,7 +804,7 @@ Status MesosExecutorDriver::stop()
       return status;
     }
 
-    CHECK(process != NULL);
+    CHECK(process != nullptr);
 
     dispatch(process, &ExecutorProcess::stop);
 
@@ -767,7 +824,7 @@ Status MesosExecutorDriver::abort()
       return status;
     }
 
-    CHECK(process != NULL);
+    CHECK(process != nullptr);
 
     // We set the atomic aborted to true here to prevent any further
     // messages from being processed in the ExecutorProcess. However,
@@ -822,7 +879,7 @@ Status MesosExecutorDriver::sendStatusUpdate(const TaskStatus& taskStatus)
       return status;
     }
 
-    CHECK(process != NULL);
+    CHECK(process != nullptr);
 
     dispatch(process, &ExecutorProcess::sendStatusUpdate, taskStatus);
 
@@ -838,7 +895,7 @@ Status MesosExecutorDriver::sendFrameworkMessage(const string& data)
       return status;
     }
 
-    CHECK(process != NULL);
+    CHECK(process != nullptr);
 
     dispatch(process, &ExecutorProcess::sendFrameworkMessage, data);
 

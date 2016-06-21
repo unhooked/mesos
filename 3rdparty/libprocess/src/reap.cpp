@@ -13,7 +13,9 @@
 #include <glog/logging.h>
 
 #include <sys/types.h>
+#ifndef __WINDOWS__
 #include <sys/wait.h>
+#endif
 
 #include <process/delay.hpp>
 #include <process/future.hpp>
@@ -93,7 +95,8 @@ protected:
     // zombie; it will be reaped by us on the next loop.
     foreach (pid_t pid, promises.keys()) {
       int status;
-      if (waitpid(pid, &status, WNOHANG) > 0) {
+      Result<pid_t> child_pid = os::waitpid(pid, &status, WNOHANG);
+      if (child_pid.isSome()) {
         // We have reaped a child.
         notify(pid, status);
       } else if (!os::exists(pid)) {
@@ -143,7 +146,7 @@ private:
 
 
 // Global reaper object.
-static ReaperProcess* reaper = NULL;
+static ReaperProcess* reaper = nullptr;
 
 
 Future<Option<int> > reap(pid_t pid)

@@ -46,10 +46,14 @@ class MesosProcess;
 } // namespace scheduler {
 
 namespace internal {
-class MasterDetector;
 class SchedulerProcess;
 } // namespace internal {
 
+namespace master {
+namespace detector {
+class MasterDetector;
+} // namespace detector {
+} // namespace master {
 
 // Callback interface to be implemented by frameworks' schedulers.
 // Note that only one callback will be invoked at a time, so it is not
@@ -143,6 +147,10 @@ public:
   // Invoked when a slave has been determined unreachable (e.g.,
   // machine failure, network partition). Most frameworks will need to
   // reschedule any tasks launched on this slave on a new slave.
+  //
+  // NOTE: This callback is not reliably delivered. If a host or
+  // network failure causes messages between the master and the
+  // scheduler to be dropped, this callback may not be invoked.
   virtual void slaveLost(
       SchedulerDriver* driver,
       const SlaveID& slaveId) = 0;
@@ -150,7 +158,10 @@ public:
   // Invoked when an executor has exited/terminated. Note that any
   // tasks running will have TASK_LOST status updates automagically
   // generated.
-  // NOTE: This callback is not reliably delivered.
+  //
+  // NOTE: This callback is not reliably delivered. If a host or
+  // network failure causes messages between the master and the
+  // scheduler to be dropped, this callback may not be invoked.
   virtual void executorLost(
       SchedulerDriver* driver,
       const ExecutorID& executorId,
@@ -216,14 +227,17 @@ public:
   // framework via Scheduler::resourceOffers callback, asynchronously.
   virtual Status requestResources(const std::vector<Request>& requests) = 0;
 
-  // Launches the given set of tasks. Any resources remaining (i.e.,
-  // not used by the tasks or their executors) will be considered
-  // declined. The specified filters are applied on all unused
-  // resources (see mesos.proto for a description of Filters).
-  // Available resources are aggregated when multiple offers are
-  // provided. Note that all offers must belong to the same slave.
-  // Invoking this function with an empty collection of tasks declines
-  // offers in their entirety (see Scheduler::declineOffer).
+  // Launches the given set of tasks. Any remaining resources (i.e.,
+  // those that are not used by the launched tasks or their executors)
+  // will be considered declined. Note that this includes resources
+  // used by tasks that the framework attempted to launch but failed
+  // (with TASK_ERROR) due to a malformed task description. The
+  // specified filters are applied on all unused resources (see
+  // mesos.proto for a description of Filters). Available resources
+  // are aggregated when multiple offers are provided. Note that all
+  // offers must belong to the same slave. Invoking this function with
+  // an empty collection of tasks declines offers in their entirety
+  // (see Scheduler::declineOffer).
   virtual Status launchTasks(
       const std::vector<OfferID>& offerIds,
       const std::vector<TaskInfo>& tasks,
@@ -244,11 +258,15 @@ public:
 
   // Accepts the given offers and performs a sequence of operations on
   // those accepted offers. See Offer.Operation in mesos.proto for the
-  // set of available operations. Available resources are aggregated
+  // set of available operations. Any remaining resources (i.e., those
+  // that are not used by the launched tasks or their executors) will
+  // be considered declined. Note that this includes resources used by
+  // tasks that the framework attempted to launch but failed (with
+  // TASK_ERROR) due to a malformed task description. The specified
+  // filters are applied on all unused resources (see mesos.proto for
+  // a description of Filters). Available resources are aggregated
   // when multiple offers are provided. Note that all offers must
-  // belong to the same slave. Any unused resources will be considered
-  // declined. The specified filters are applied on all unused
-  // resources (see mesos.proto for a description of Filters).
+  // belong to the same slave.
   virtual Status acceptOffers(
       const std::vector<OfferID>& offerIds,
       const std::vector<Offer::Operation>& operations,
@@ -435,7 +453,7 @@ public:
 
 protected:
   // Used to detect (i.e., choose) the master.
-  std::shared_ptr<internal::MasterDetector> detector;
+  std::shared_ptr<master::detector::MasterDetector> detector;
 
 private:
   void initialize();

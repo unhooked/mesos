@@ -25,9 +25,10 @@ namespace process {
 class Logging : public Process<Logging>
 {
 public:
-  Logging()
+  Logging(Option<std::string> _authenticationRealm)
     : ProcessBase("logging"),
-      original(FLAGS_v)
+      original(FLAGS_v),
+      authenticationRealm(_authenticationRealm)
   {
     // Make sure all reads/writes can be done atomically (i.e., to
     // make sure VLOG(*) statements don't read partial writes).
@@ -38,21 +39,39 @@ public:
 
   virtual ~Logging() {}
 
+  Future<Nothing> set_level(int level, const Duration& duration);
+
 protected:
   virtual void initialize()
   {
-    route("/toggle", TOGGLE_HELP(), &This::toggle);
+    if (authenticationRealm.isSome()) {
+      route("/toggle", authenticationRealm.get(), TOGGLE_HELP(), &This::toggle);
+    } else {
+      route("/toggle",
+            TOGGLE_HELP(),
+            [this](const http::Request& request) {
+              return This::toggle(request, None());
+            });
+    }
   }
 
 private:
-  Future<http::Response> toggle(const http::Request& request);
+  Future<http::Response> toggle(
+      const http::Request& request,
+      const Option<std::string>& /* principal */);
 
   void set(int v)
   {
     if (FLAGS_v != v) {
       VLOG(FLAGS_v) << "Setting verbose logging level to " << v;
       FLAGS_v = v;
-      __sync_synchronize(); // Ensure 'FLAGS_v' visible in other threads.
+
+      // Ensure 'FLAGS_v' visible in other threads.
+#ifdef __WINDOWS__
+      MemoryBarrier();
+#else
+      __sync_synchronize();
+#endif // __WINDOWS__
     }
   }
 
@@ -68,6 +87,10 @@ private:
   Timeout timeout;
 
   const int32_t original; // Original value of FLAGS_v.
+
+  // The authentication realm that the `/logging/toggle` endpoint will be
+  // installed into.
+  const Option<std::string> authenticationRealm;
 };
 
 } // namespace process {

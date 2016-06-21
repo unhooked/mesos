@@ -14,7 +14,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <list>
 #include <string>
 #include <vector>
 
@@ -30,8 +29,6 @@
 #include <process/pid.hpp>
 
 #include <stout/none.hpp>
-#include <stout/os.hpp>
-#include <stout/protobuf.hpp>
 #include <stout/result.hpp>
 #include <stout/try.hpp>
 
@@ -51,12 +48,13 @@ using mesos::internal::master::Master;
 
 using mesos::internal::slave::Slave;
 
+using mesos::master::detector::MasterDetector;
+
 using process::Clock;
 using process::Future;
 using process::Owned;
 using process::PID;
 
-using std::list;
 using std::string;
 using std::vector;
 

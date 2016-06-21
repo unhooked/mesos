@@ -24,9 +24,20 @@
 
 #include <mesos/authorizer/authorizer.hpp>
 
+#include <mesos/log/log.hpp>
+
 #include <mesos/master/allocator.hpp>
+#include <mesos/master/contender.hpp>
+#include <mesos/master/detector.hpp>
 
 #include <mesos/slave/resource_estimator.hpp>
+
+#include <mesos/state/in_memory.hpp>
+#include <mesos/state/log.hpp>
+#include <mesos/state/protobuf.hpp>
+#include <mesos/state/storage.hpp>
+
+#include <mesos/zookeeper/url.hpp>
 
 #include <process/owned.hpp>
 #include <process/pid.hpp>
@@ -39,16 +50,12 @@
 
 #include "files/files.hpp"
 
-#include "log/log.hpp"
-
 #include "master/constants.hpp"
-#include "master/contender.hpp"
-#include "master/detector.hpp"
 #include "master/flags.hpp"
 #include "master/master.hpp"
 #include "master/registrar.hpp"
-#include "master/repairer.hpp"
 
+#include "slave/constants.hpp"
 #include "slave/flags.hpp"
 #include "slave/gc.hpp"
 #include "slave/slave.hpp"
@@ -56,13 +63,6 @@
 
 #include "slave/containerizer/containerizer.hpp"
 #include "slave/containerizer/fetcher.hpp"
-
-#include "state/in_memory.hpp"
-#include "state/log.hpp"
-#include "state/protobuf.hpp"
-#include "state/storage.hpp"
-
-#include "zookeeper/url.hpp"
 
 
 namespace mesos {
@@ -90,7 +90,7 @@ public:
   ~Master();
 
   // Returns a new master detector for this instance of master.
-  process::Owned<MasterDetector> createDetector();
+  process::Owned<mesos::master::detector::MasterDetector> createDetector();
 
   // Returns the `MasterInfo` associated with the underlying master process.
   MasterInfo getMasterInfo();
@@ -98,8 +98,11 @@ public:
   // The underlying master process.
   process::PID<master::Master> pid;
 
+  // Sets authorization callbacks in libprocess.
+  void setAuthorizationCallbacks(Authorizer* authorizer);
+
 private:
-  Master() = default;
+  Master() : files(master::DEFAULT_HTTP_AUTHENTICATION_REALM) {};
 
   // Not copyable, not assignable.
   Master(const Master&) = delete;
@@ -111,15 +114,18 @@ private:
   // Dependencies that are created by the factory method.
   process::Owned<mesos::master::allocator::Allocator> allocator;
   process::Owned<Authorizer> authorizer;
-  process::Owned<MasterContender> contender;
-  process::Owned<MasterDetector> detector;
-  process::Owned<log::Log> log;
+  process::Owned<mesos::master::contender::MasterContender> contender;
+  process::Owned<mesos::master::detector::MasterDetector> detector;
+  process::Owned<mesos::log::Log> log;
+  process::Owned<mesos::state::Storage> storage;
+  process::Owned<mesos::state::protobuf::State> state;
   process::Owned<master::Registrar> registrar;
-  process::Owned<master::Repairer> repairer;
-  process::Owned<state::protobuf::State> state;
-  process::Owned<state::Storage> storage;
 
   Option<std::shared_ptr<process::RateLimiter>> slaveRemovalLimiter;
+
+  // Indicates whether or not authorization callbacks were set when this master
+  // was constructed.
+  bool authorizationCallbacksSet;
 
   // The underlying master object.
   process::Owned<master::Master> master;
@@ -138,7 +144,7 @@ public:
   //   * Terminating the slave process.
   //   * On Linux, we will simulate an OS process exiting.
   static Try<process::Owned<Slave>> start(
-      MasterDetector* detector,
+      mesos::master::detector::MasterDetector* detector,
       const slave::Flags& flags = slave::Flags(),
       const Option<std::string>& id = None(),
       const Option<slave::Containerizer*>& containerizer = None(),
@@ -146,7 +152,8 @@ public:
       const Option<slave::StatusUpdateManager*>& statusUpdateManager = None(),
       const Option<mesos::slave::ResourceEstimator*>& resourceEstimator =
         None(),
-      const Option<mesos::slave::QoSController*>& qosController = None());
+      const Option<mesos::slave::QoSController*>& qosController = None(),
+      const Option<Authorizer*>& authorizer = None());
 
   ~Slave();
 
@@ -164,8 +171,11 @@ public:
   // The underlying slave process.
   process::PID<slave::Slave> pid;
 
+  // Sets authorization callbacks in libprocess.
+  void setAuthorizationCallbacks(Authorizer* authorizer);
+
 private:
-  Slave() = default;
+  Slave() : files(slave::DEFAULT_HTTP_AUTHENTICATION_REALM) {};
 
   // Not copyable, not assignable.
   Slave(const Slave&) = delete;
@@ -184,21 +194,26 @@ private:
   bool cleanUpContainersInDestructor = true;
 
   // Master detector that is not managed by this object.
-  MasterDetector* detector;
+  mesos::master::detector::MasterDetector* detector = nullptr;
 
   // Containerizer that is either owned outside of this `Slave` object
   // or by `ownedContainerizer`.  We keep a copy of this pointer
   // because the cleanup logic acts upon the containerizer (regardless
   // of who created it).
-  slave::Containerizer* containerizer;
+  slave::Containerizer* containerizer = nullptr;
 
   // Dependencies that are created by the factory method.
+  process::Owned<Authorizer> authorizer;
   process::Owned<slave::Containerizer> ownedContainerizer;
   process::Owned<slave::Fetcher> fetcher;
   process::Owned<slave::GarbageCollector> gc;
   process::Owned<mesos::slave::QoSController> qosController;
   process::Owned<mesos::slave::ResourceEstimator> resourceEstimator;
   process::Owned<slave::StatusUpdateManager> statusUpdateManager;
+
+  // Indicates whether or not authorization callbacks were set when this agent
+  // was constructed.
+  bool authorizationCallbacksSet;
 
   // The underlying slave object.
   process::Owned<slave::Slave> slave;

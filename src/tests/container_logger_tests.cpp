@@ -20,6 +20,7 @@
 
 #include <gmock/gmock.h>
 
+#include <process/clock.hpp>
 #include <process/future.hpp>
 #include <process/gtest.hpp>
 #include <process/owned.hpp>
@@ -71,6 +72,8 @@ using mesos::internal::slave::state::ExecutorState;
 using mesos::internal::slave::state::FrameworkState;
 using mesos::internal::slave::state::RunState;
 using mesos::internal::slave::state::SlaveState;
+
+using mesos::master::detector::MasterDetector;
 
 using mesos::slave::ContainerLogger;
 using mesos::slave::Isolator;
@@ -458,7 +461,24 @@ TEST_F(ContainerLoggerTest, LOGROTATE_RotateInSandbox)
   Try<os::ProcessTree> pstrees = os::pstree(0);
   ASSERT_SOME(pstrees);
   foreach (const os::ProcessTree& pstree, pstrees.get().children) {
-    ASSERT_EQ(pstree.process.pid, waitpid(pstree.process.pid, NULL, 0));
+    // Wait for the logger subprocesses to exit, for up to 5 seconds each.
+    Duration waited = Duration::zero();
+    do {
+      if (!os::exists(pstree.process.pid)) {
+        break;
+      }
+
+      // Push the clock ahead to speed up the reaping of subprocesses.
+      Clock::pause();
+      Clock::settle();
+      Clock::advance(Seconds(1));
+      Clock::resume();
+
+      os::sleep(Milliseconds(100));
+      waited += Milliseconds(100);
+    } while (waited < Seconds(5));
+
+    EXPECT_LE(waited, Seconds(5));
   }
 
   // Check for the expected log rotation.

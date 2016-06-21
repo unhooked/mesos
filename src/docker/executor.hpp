@@ -19,7 +19,12 @@
 
 #include <stdio.h>
 
+#include <map>
+#include <string>
+
 #include <process/process.hpp>
+
+#include <stout/option.hpp>
 
 #include "logging/flags.hpp"
 
@@ -52,16 +57,23 @@ struct Flags : public mesos::internal::logging::Flags
         "mapped_directory",
         "The sandbox directory path that is mapped in the docker container.\n");
 
+    // TODO(alexr): Remove this after the deprecation cycle (started in 1.0).
     add(&stop_timeout,
         "stop_timeout",
         "The duration for docker to wait after stopping a running container\n"
-        "before it kills that container.");
+        "before it kills that container. This flag is deprecated; use task's\n"
+        "kill policy instead.");
 
     add(&launcher_dir,
         "launcher_dir",
         "Directory path of Mesos binaries. Mesos would find health-check,\n"
         "fetcher, containerizer and executor binary files under this\n"
         "directory.");
+
+    add(&task_environment,
+        "task_environment",
+        "A JSON map of environment variables and values that should\n"
+        "be passed into the task launched by this executor.");
   }
 
   Option<std::string> container;
@@ -69,8 +81,11 @@ struct Flags : public mesos::internal::logging::Flags
   Option<std::string> docker_socket;
   Option<std::string> sandbox_directory;
   Option<std::string> mapped_directory;
-  Option<Duration> stop_timeout;
   Option<std::string> launcher_dir;
+  Option<std::string> task_environment;
+
+  // TODO(alexr): Remove this after the deprecation cycle (started in 1.0).
+  Option<Duration> stop_timeout;
 };
 
 } // namespace docker {

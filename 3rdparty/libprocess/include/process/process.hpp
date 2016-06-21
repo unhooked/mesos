@@ -39,6 +39,7 @@
 namespace process {
 
 // Forward declaration.
+class Logging;
 class Sequence;
 
 namespace firewall {
@@ -135,7 +136,7 @@ protected:
   void inject(
       const UPID& from,
       const std::string& name,
-      const char* data = NULL,
+      const char* data = nullptr,
       size_t length = 0);
 
   /**
@@ -146,7 +147,7 @@ protected:
   void send(
       const UPID& to,
       const std::string& name,
-      const char* data = NULL,
+      const char* data = nullptr,
       size_t length = 0);
 
   /**
@@ -453,10 +454,17 @@ protected:
  * for it (e.g., a logging directory) via environment variables.
  *
  * @param delegate Process to receive root HTTP requests.
+ * @param authenticationRealm The authentication realm that libprocess-level
+ *     HTTP endpoints will be installed under, if any. If this realm is not
+ *     specified, endpoints will be installed without authentication.
+ * @return `true` if this was the first invocation of `process::initialize()`,
+ *     or `false` if it was not the first invocation.
  *
  * @see [glog](https://google-glog.googlecode.com/svn/trunk/doc/glog.html)
  */
-void initialize(const Option<std::string>& delegate = None());
+bool initialize(
+    const Option<std::string>& delegate = None(),
+    const Option<std::string>& authenticationRealm = None());
 
 
 /**
@@ -475,6 +483,12 @@ std::string absolutePath(const std::string& path);
  * Returns the socket address associated with this instance of the library.
  */
 network::Address address();
+
+
+/**
+ * Return the PID associated with the global logging process.
+ */
+PID<Logging> logging();
 
 
 /**
@@ -553,14 +567,14 @@ bool wait(const ProcessBase* process, const Duration& duration = Seconds(-1));
  */
 void post(const UPID& to,
           const std::string& name,
-          const char* data = NULL,
+          const char* data = nullptr,
           size_t length = 0);
 
 
 void post(const UPID& from,
           const UPID& to,
           const std::string& name,
-          const char* data = NULL,
+          const char* data = nullptr,
           size_t length = 0);
 
 

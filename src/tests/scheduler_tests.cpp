@@ -16,6 +16,7 @@
 
 #include <string>
 #include <queue>
+#include <vector>
 
 #include <gmock/gmock.h>
 
@@ -43,6 +44,8 @@
 
 #include "master/allocator/mesos/allocator.hpp"
 
+#include "master/detector/standalone.hpp"
+
 #include "master/master.hpp"
 
 #include "tests/containerizer.hpp"
@@ -55,6 +58,9 @@ using mesos::internal::master::Master;
 using mesos::internal::slave::Containerizer;
 using mesos::internal::slave::Slave;
 
+using mesos::master::detector::MasterDetector;
+using mesos::master::detector::StandaloneMasterDetector;
+
 using mesos::v1::scheduler::Call;
 using mesos::v1::scheduler::Event;
 using mesos::v1::scheduler::Mesos;
@@ -65,7 +71,10 @@ using process::Owned;
 using process::PID;
 using process::Queue;
 
+using std::cout;
+using std::endl;
 using std::string;
+using std::vector;
 
 using testing::_;
 using testing::AtMost;
@@ -94,18 +103,14 @@ INSTANTIATE_TEST_CASE_P(
 // This test verifies that a scheduler can subscribe with the master.
 TEST_P(SchedulerTest, Subscribe)
 {
-  master::Flags flags = CreateMasterFlags();
-  flags.authenticate_frameworks = false;
-
-  Try<Owned<cluster::Master>> master = StartMaster(flags);
+  Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
 
   auto scheduler = std::make_shared<MockV1HTTPScheduler>();
 
   Future<Nothing> connected;
   EXPECT_CALL(*scheduler, connected(_))
-    .WillOnce(FutureSatisfy(&connected))
-    .WillRepeatedly(Return()); // Ignore future invocations.
+    .WillOnce(FutureSatisfy(&connected));
 
   ContentType contentType = GetParam();
 
@@ -131,8 +136,8 @@ TEST_P(SchedulerTest, Subscribe)
 
   AWAIT_READY(subscribed);
 
-  EXPECT_CALL(*scheduler, disconnected(_))
-    .Times(AtMost(1));
+  ASSERT_EQ(master::DEFAULT_HEARTBEAT_INTERVAL.secs(),
+            subscribed->heartbeat_interval_seconds());
 }
 
 
@@ -140,10 +145,7 @@ TEST_P(SchedulerTest, Subscribe)
 // failing over to another instance.
 TEST_P(SchedulerTest, SchedulerFailover)
 {
-  master::Flags flags = CreateMasterFlags();
-  flags.authenticate_frameworks = false;
-
-  Try<Owned<cluster::Master>> master = StartMaster(flags);
+  Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
 
   auto scheduler = std::make_shared<MockV1HTTPScheduler>();
@@ -182,14 +184,14 @@ TEST_P(SchedulerTest, SchedulerFailover)
 
   auto scheduler2 = std::make_shared<MockV1HTTPScheduler>();
 
+  Future<Nothing> connected2;
   EXPECT_CALL(*scheduler2, connected(_))
-    .WillOnce(FutureSatisfy(&connected))
-    .WillRepeatedly(Return()); // Ignore future invocations.
+    .WillOnce(FutureSatisfy(&connected2));
 
   // Failover to another scheduler instance.
   scheduler::TestV1Mesos mesos2(master.get()->pid, contentType, scheduler2);
 
-  AWAIT_READY(connected);
+  AWAIT_READY(connected2);
 
   // The previously connected scheduler instance should receive an
   // error/disconnected event.
@@ -224,22 +226,13 @@ TEST_P(SchedulerTest, SchedulerFailover)
   AWAIT_READY(subscribed);
 
   EXPECT_EQ(frameworkId, subscribed.get().framework_id());
-
-  EXPECT_CALL(*scheduler, disconnected(_))
-    .Times(AtMost(1));
-
-  EXPECT_CALL(*scheduler2, disconnected(_))
-    .Times(AtMost(1));
 }
 
 
 // This test verifies that the scheduler can subscribe after a master failover.
 TEST_P(SchedulerTest, MasterFailover)
 {
-  master::Flags flags = CreateMasterFlags();
-  flags.authenticate_frameworks = false;
-
-  Try<Owned<cluster::Master>> master = StartMaster(flags);
+  Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
 
   auto scheduler = std::make_shared<MockV1HTTPScheduler>();
@@ -285,18 +278,18 @@ TEST_P(SchedulerTest, MasterFailover)
 
   // Failover the master.
   master->reset();
-  master = StartMaster(flags);
+  master = StartMaster();
   ASSERT_SOME(master);
 
   AWAIT_READY(disconnected);
 
+  Future<Nothing> connected2;
   EXPECT_CALL(*scheduler, connected(_))
-    .WillOnce(FutureSatisfy(&connected))
-    .WillRepeatedly(Return()); // Ignore future invocations.
+    .WillOnce(FutureSatisfy(&connected2));
 
   detector->appoint(master.get()->pid);
 
-  AWAIT_READY(connected);
+  AWAIT_READY(connected2);
 
   EXPECT_CALL(*scheduler, subscribed(_, _))
     .WillOnce(FutureArg<1>(&subscribed));
@@ -321,10 +314,7 @@ TEST_P(SchedulerTest, MasterFailover)
 
 TEST_P(SchedulerTest, TaskRunning)
 {
-  master::Flags flags = CreateMasterFlags();
-  flags.authenticate_frameworks = false;
-
-  Try<Owned<cluster::Master>> master = StartMaster(flags);
+  Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
 
   auto scheduler = std::make_shared<MockV1HTTPScheduler>();
@@ -339,8 +329,7 @@ TEST_P(SchedulerTest, TaskRunning)
 
   Future<Nothing> connected;
   EXPECT_CALL(*scheduler, connected(_))
-    .WillOnce(FutureSatisfy(&connected))
-    .WillRepeatedly(Return()); // Ignore future invocations.
+    .WillOnce(FutureSatisfy(&connected));
 
   ContentType contentType = GetParam();
 
@@ -440,18 +429,12 @@ TEST_P(SchedulerTest, TaskRunning)
 
   EXPECT_CALL(*executor, disconnected(_))
     .Times(AtMost(1));
-
-  EXPECT_CALL(*scheduler, disconnected(_))
-    .Times(AtMost(1));
 }
 
 
 TEST_P(SchedulerTest, ReconcileTask)
 {
-  master::Flags flags = CreateMasterFlags();
-  flags.authenticate_frameworks = false;
-
-  Try<Owned<cluster::Master>> master = StartMaster(flags);
+  Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
 
   auto scheduler = std::make_shared<MockV1HTTPScheduler>();
@@ -466,8 +449,7 @@ TEST_P(SchedulerTest, ReconcileTask)
 
   Future<Nothing> connected;
   EXPECT_CALL(*scheduler, connected(_))
-    .WillOnce(FutureSatisfy(&connected))
-    .WillRepeatedly(Return()); // Ignore future invocations.
+    .WillOnce(FutureSatisfy(&connected));
 
   ContentType contentType = GetParam();
 
@@ -572,18 +554,12 @@ TEST_P(SchedulerTest, ReconcileTask)
 
   EXPECT_CALL(*executor, disconnected(_))
     .Times(AtMost(1));
-
-  EXPECT_CALL(*scheduler, disconnected(_))
-    .Times(AtMost(1));
 }
 
 
 TEST_P(SchedulerTest, KillTask)
 {
-  master::Flags flags = CreateMasterFlags();
-  flags.authenticate_frameworks = false;
-
-  Try<Owned<cluster::Master>> master = StartMaster(flags);
+  Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
 
   auto scheduler = std::make_shared<MockV1HTTPScheduler>();
@@ -598,8 +574,7 @@ TEST_P(SchedulerTest, KillTask)
 
   Future<Nothing> connected;
   EXPECT_CALL(*scheduler, connected(_))
-    .WillOnce(FutureSatisfy(&connected))
-    .WillRepeatedly(Return()); // Ignore future invocations.
+    .WillOnce(FutureSatisfy(&connected));
 
   ContentType contentType = GetParam();
 
@@ -721,18 +696,12 @@ TEST_P(SchedulerTest, KillTask)
 
   EXPECT_CALL(*executor, disconnected(_))
     .Times(AtMost(1));
-
-  EXPECT_CALL(*scheduler, disconnected(_))
-    .Times(AtMost(1));
 }
 
 
 TEST_P(SchedulerTest, ShutdownExecutor)
 {
-  master::Flags flags = CreateMasterFlags();
-  flags.authenticate_frameworks = false;
-
-  Try<Owned<cluster::Master>> master = StartMaster(flags);
+  Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
 
   auto scheduler = std::make_shared<MockV1HTTPScheduler>();
@@ -747,8 +716,7 @@ TEST_P(SchedulerTest, ShutdownExecutor)
 
   Future<Nothing> connected;
   EXPECT_CALL(*scheduler, connected(_))
-    .WillOnce(FutureSatisfy(&connected))
-    .WillRepeatedly(Return()); // Ignore future invocations.
+    .WillOnce(FutureSatisfy(&connected));
 
   ContentType contentType = GetParam();
 
@@ -853,18 +821,12 @@ TEST_P(SchedulerTest, ShutdownExecutor)
   // Executor termination results in a 'FAILURE' event.
   AWAIT_READY(failure);
   EXPECT_EQ(executorId, devolve(failure->executor_id()));
-
-  EXPECT_CALL(*scheduler, disconnected(_))
-    .Times(AtMost(1));
 }
 
 
 TEST_P(SchedulerTest, Teardown)
 {
-  master::Flags flags = CreateMasterFlags();
-  flags.authenticate_frameworks = false;
-
-  Try<Owned<cluster::Master>> master = StartMaster(flags);
+  Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
 
   auto scheduler = std::make_shared<MockV1HTTPScheduler>();
@@ -962,6 +924,10 @@ TEST_P(SchedulerTest, Teardown)
   EXPECT_CALL(*executor, shutdown(_))
     .WillOnce(FutureSatisfy(&shutdown));
 
+  Future<Nothing> disconnected;
+  EXPECT_CALL(*scheduler, disconnected(_))
+    .WillOnce(FutureSatisfy(&disconnected));
+
   {
     Call call;
     call.mutable_framework_id()->CopyFrom(frameworkId);
@@ -971,16 +937,13 @@ TEST_P(SchedulerTest, Teardown)
   }
 
   AWAIT_READY(shutdown);
-
-  EXPECT_CALL(*scheduler, disconnected(_))
-    .Times(AtMost(1));
+  AWAIT_READY(disconnected);
 }
 
 
 TEST_P(SchedulerTest, Decline)
 {
   master::Flags flags = CreateMasterFlags();
-  flags.authenticate_frameworks = false;
 
   Try<Owned<cluster::Master>> master = StartMaster(flags);
   ASSERT_SOME(master);
@@ -993,8 +956,7 @@ TEST_P(SchedulerTest, Decline)
 
   Future<Nothing> connected;
   EXPECT_CALL(*scheduler, connected(_))
-    .WillOnce(FutureSatisfy(&connected))
-    .WillRepeatedly(Return()); // Ignore future invocations.
+    .WillOnce(FutureSatisfy(&connected));
 
   ContentType contentType = GetParam();
 
@@ -1036,6 +998,9 @@ TEST_P(SchedulerTest, Decline)
   EXPECT_CALL(*scheduler, offers(_, _))
     .WillOnce(FutureArg<1>(&offers2));
 
+  Future<Nothing> recoverResources =
+    FUTURE_DISPATCH(_, &MesosAllocatorProcess::recoverResources);
+
   {
     Call call;
     call.mutable_framework_id()->CopyFrom(frameworkId);
@@ -1052,23 +1017,24 @@ TEST_P(SchedulerTest, Decline)
     mesos.send(call);
   }
 
+  // Make sure the dispatch event for `recoverResources` has been enqueued.
+  AWAIT_READY(recoverResources);
+
+  Clock::pause();
+  Clock::advance(flags.allocation_interval);
+  Clock::resume();
+
   // If the resources were properly declined, the scheduler should
   // get another offer with same amount of resources.
   AWAIT_READY(offers2);
   ASSERT_EQ(1, offers2->offers().size());
   ASSERT_EQ(offer.resources(), offers2->offers(0).resources());
-
-  EXPECT_CALL(*scheduler, disconnected(_))
-    .Times(AtMost(1));
 }
 
 
 TEST_P(SchedulerTest, Revive)
 {
-  master::Flags flags = CreateMasterFlags();
-  flags.authenticate_frameworks = false;
-
-  Try<Owned<cluster::Master>> master = StartMaster(flags);
+  Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
 
   Owned<MasterDetector> detector = master.get()->createDetector();
@@ -1079,8 +1045,7 @@ TEST_P(SchedulerTest, Revive)
 
   Future<Nothing> connected;
   EXPECT_CALL(*scheduler, connected(_))
-    .WillOnce(FutureSatisfy(&connected))
-    .WillRepeatedly(Return()); // Ignore future invocations.
+    .WillOnce(FutureSatisfy(&connected));
 
   ContentType contentType = GetParam();
 
@@ -1159,18 +1124,12 @@ TEST_P(SchedulerTest, Revive)
   AWAIT_READY(offers2);
   EXPECT_NE(0, offers2->offers().size());
   ASSERT_EQ(offer.resources(), offers2->offers(0).resources());
-
-  EXPECT_CALL(*scheduler, disconnected(_))
-    .Times(AtMost(1));
 }
 
 
 TEST_P(SchedulerTest, Suppress)
 {
-  master::Flags flags = CreateMasterFlags();
-  flags.authenticate_frameworks = false;
-
-  Try<Owned<cluster::Master>> master = StartMaster(flags);
+  Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
 
   Owned<MasterDetector> detector = master.get()->createDetector();
@@ -1181,8 +1140,7 @@ TEST_P(SchedulerTest, Suppress)
 
   Future<Nothing> connected;
   EXPECT_CALL(*scheduler, connected(_))
-    .WillOnce(FutureSatisfy(&connected))
-    .WillRepeatedly(Return()); // Ignore future invocations.
+    .WillOnce(FutureSatisfy(&connected));
 
   ContentType contentType = GetParam();
 
@@ -1278,18 +1236,12 @@ TEST_P(SchedulerTest, Suppress)
 
   EXPECT_NE(0, offers2->offers().size());
   ASSERT_EQ(offer.resources(), offers2->offers(0).resources());
-
-  EXPECT_CALL(*scheduler, disconnected(_))
-    .Times(AtMost(1));
 }
 
 
 TEST_P(SchedulerTest, Message)
 {
-  master::Flags flags = CreateMasterFlags();
-  flags.authenticate_frameworks = false;
-
-  Try<Owned<cluster::Master>> master = StartMaster(flags);
+  Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
 
   auto scheduler = std::make_shared<MockV1HTTPScheduler>();
@@ -1304,8 +1256,7 @@ TEST_P(SchedulerTest, Message)
 
   Future<Nothing> connected;
   EXPECT_CALL(*scheduler, connected(_))
-    .WillOnce(FutureSatisfy(&connected))
-    .WillRepeatedly(Return()); // Ignore future invocations.
+    .WillOnce(FutureSatisfy(&connected));
 
   ContentType contentType = GetParam();
 
@@ -1408,26 +1359,19 @@ TEST_P(SchedulerTest, Message)
 
   EXPECT_CALL(*executor, disconnected(_))
     .Times(AtMost(1));
-
-  EXPECT_CALL(*scheduler, disconnected(_))
-    .Times(AtMost(1));
 }
 
 
 TEST_P(SchedulerTest, Request)
 {
-  master::Flags flags = CreateMasterFlags();
-  flags.authenticate_frameworks = false;
-
-  Try<Owned<cluster::Master>> master = StartMaster(flags);
+  Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
 
   auto scheduler = std::make_shared<MockV1HTTPScheduler>();
 
   Future<Nothing> connected;
   EXPECT_CALL(*scheduler, connected(_))
-    .WillOnce(FutureSatisfy(&connected))
-    .WillRepeatedly(Return()); // Ignore future invocations.
+    .WillOnce(FutureSatisfy(&connected));
 
   ContentType contentType = GetParam();
 
@@ -1472,14 +1416,203 @@ TEST_P(SchedulerTest, Request)
   }
 
   AWAIT_READY(requestResources);
+}
+
+
+// This test verifies that the scheduler is able to force a reconnection with
+// the master.
+TEST_P(SchedulerTest, SchedulerReconnect)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  auto scheduler = std::make_shared<MockV1HTTPScheduler>();
+  auto detector = std::make_shared<StandaloneMasterDetector>(master.get()->pid);
+
+  Future<Nothing> connected;
+  EXPECT_CALL(*scheduler, connected(_))
+    .WillOnce(FutureSatisfy(&connected));
+
+  ContentType contentType = GetParam();
+
+  scheduler::TestV1Mesos mesos(
+      master.get()->pid, contentType, scheduler, detector);
+
+  AWAIT_READY(connected);
+
+  Future<Nothing> disconnected;
+  EXPECT_CALL(*scheduler, disconnected(_))
+    .WillOnce(FutureSatisfy(&disconnected));
+
+  EXPECT_CALL(*scheduler, connected(_))
+    .WillOnce(FutureSatisfy(&connected));
+
+  // Force a reconnection with the master. This should result in a
+  // `disconnected` callback followed by a `connected` callback.
+  mesos.reconnect();
+
+  AWAIT_READY(disconnected);
+
+  // The scheduler should be able to immediately reconnect with the master.
+  AWAIT_READY(connected);
 
   EXPECT_CALL(*scheduler, disconnected(_))
-    .Times(AtMost(1));
+    .WillOnce(FutureSatisfy(&disconnected));
+
+  // Simulate a spurious master failure event at the scheduler.
+  detector->appoint(None());
+
+  AWAIT_READY(disconnected);
+
+  EXPECT_CALL(*scheduler, disconnected(_))
+    .Times(0);
+
+  EXPECT_CALL(*scheduler, connected(_))
+    .Times(0);
+
+  mesos.reconnect();
+
+  // Flush any possible remaining events. The mocked scheduler will fail if the
+  // reconnection attempt resulted in any additional callbacks after the
+  // scheduler has disconnected.
+  Clock::pause();
+  Clock::settle();
 }
 
 
 // TODO(benh): Write test for sending Call::Acknowledgement through
 // master to slave when Event::Update was generated locally.
+
+
+class SchedulerReconcileTasks_BENCHMARK_Test
+  : public MesosTest,
+    public WithParamInterface<size_t> {};
+
+
+// The scheduler reconcile benchmark tests are parameterized by the number of
+// tasks that need to be reconciled.
+INSTANTIATE_TEST_CASE_P(
+    Tasks,
+    SchedulerReconcileTasks_BENCHMARK_Test,
+    ::testing::Values(1000U, 10000U, 50000U, 100000U));
+
+
+// This benchmark simulates a large reconcile request containing tasks unknown
+// to the master using the scheduler library/driver. It then measures the time
+// required for processing the received `TASK_LOST` status updates.
+TEST_P(SchedulerReconcileTasks_BENCHMARK_Test, SchedulerLibrary)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  auto scheduler = std::make_shared<MockV1HTTPScheduler>();
+
+  Future<Nothing> connected;
+  EXPECT_CALL(*scheduler, connected(_))
+    .WillOnce(FutureSatisfy(&connected));
+
+  scheduler::TestV1Mesos mesos(
+      master.get()->pid, ContentType::PROTOBUF, scheduler);
+
+  AWAIT_READY(connected);
+
+  Future<Event::Subscribed> subscribed;
+  EXPECT_CALL(*scheduler, subscribed(_, _))
+    .WillOnce(FutureArg<1>(&subscribed));
+
+  EXPECT_CALL(*scheduler, heartbeat(_))
+    .WillRepeatedly(Return()); // Ignore heartbeats.
+
+  {
+    Call call;
+    call.set_type(Call::SUBSCRIBE);
+
+    Call::Subscribe* subscribe = call.mutable_subscribe();
+    subscribe->mutable_framework_info()->CopyFrom(DEFAULT_V1_FRAMEWORK_INFO);
+
+    mesos.send(call);
+  }
+
+  AWAIT_READY(subscribed);
+
+  v1::FrameworkID frameworkId(subscribed->framework_id());
+
+  const size_t tasks = GetParam();
+
+  EXPECT_CALL(*scheduler, update(_, _))
+    .Times(tasks);
+
+  Call call;
+  call.mutable_framework_id()->CopyFrom(frameworkId);
+  call.set_type(Call::RECONCILE);
+
+  for (size_t i = 0; i < tasks; ++i) {
+    Call::Reconcile::Task* task = call.mutable_reconcile()->add_tasks();
+    task->mutable_task_id()->set_value("task " + stringify(i));
+  }
+
+  Stopwatch watch;
+  watch.start();
+
+  mesos.send(call);
+
+  Clock::pause();
+  Clock::settle();
+
+  cout << "Reconciling " << tasks << " tasks took " << watch.elapsed()
+       << " using the scheduler library" << endl;
+}
+
+
+TEST_P(SchedulerReconcileTasks_BENCHMARK_Test, SchedulerDriver)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched,
+      DEFAULT_FRAMEWORK_INFO,
+      master.get()->pid,
+      false,
+      DEFAULT_CREDENTIAL);
+
+  Future<FrameworkID> frameworkId;
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .WillOnce(FutureArg<1>(&frameworkId));
+
+  driver.start();
+
+  AWAIT_READY(frameworkId);
+
+  const size_t tasks = GetParam();
+
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .Times(tasks);
+
+  vector<TaskStatus> statuses;
+
+  for (size_t i = 0; i < tasks; ++i) {
+    TaskStatus status;
+    status.mutable_task_id()->set_value("task " + stringify(i));
+
+    statuses.push_back(status);
+  }
+
+  Stopwatch watch;
+  watch.start();
+
+  driver.reconcileTasks(statuses);
+
+  Clock::pause();
+  Clock::settle();
+
+  cout << "Reconciling " << tasks << " tasks took " << watch.elapsed()
+       << " using the scheduler driver" << endl;
+
+  driver.stop();
+  driver.join();
+}
 
 } // namespace tests {
 } // namespace internal {

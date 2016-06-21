@@ -79,29 +79,6 @@ Future<hashset<ContainerID>> PosixLauncher::recover(
 }
 
 
-// The setup function in child before the exec.
-static int childSetup(const Option<lambda::function<int()>>& setup)
-{
-  // POSIX guarantees a forked child's pid does not match any existing
-  // process group id so only a single setsid() is required and the
-  // session id will be the pid.
-  // TODO(idownes): perror is not listed as async-signal-safe and
-  // should be reimplemented safely.
-  // TODO(jieyu): Move this logic to the subprocess (i.e.,
-  // mesos-containerizer launch).
-  if (::setsid() == -1) {
-    perror("Failed to put child in a new session");
-    _exit(1);
-  }
-
-  if (setup.isSome()) {
-    return setup.get()();
-  }
-
-  return 0;
-}
-
-
 Try<pid_t> PosixLauncher::fork(
     const ContainerID& containerId,
     const string& path,
@@ -111,9 +88,13 @@ Try<pid_t> PosixLauncher::fork(
     const Subprocess::IO& err,
     const Option<flags::FlagsBase>& flags,
     const Option<map<string, string>>& environment,
-    const Option<lambda::function<int()>>& setup,
-    const Option<int>& namespaces)
+    const Option<int>& namespaces,
+    vector<process::Subprocess::Hook> parentHooks)
 {
+  if (namespaces.isSome() && namespaces.get() != 0) {
+    return Error("Posix launcher does not support namespaces");
+  }
+
   if (pids.contains(containerId)) {
     return Error("Process has already been forked for container " +
                  stringify(containerId));
@@ -121,7 +102,6 @@ Try<pid_t> PosixLauncher::fork(
 
   // If we are on systemd, then extend the life of the child. Any
   // grandchildren's lives will also be extended.
-  std::vector<Subprocess::Hook> parentHooks;
 #ifdef __linux__
   if (systemd::enabled()) {
     parentHooks.emplace_back(Subprocess::Hook(&systemd::mesos::extendLifetime));
@@ -134,9 +114,9 @@ Try<pid_t> PosixLauncher::fork(
       in,
       out,
       err,
+      SETSID,
       flags,
       environment,
-      lambda::bind(&childSetup, setup),
       None(),
       parentHooks);
 
@@ -186,6 +166,12 @@ Future<Nothing> _destroy(const Future<Option<int>>& future)
     return Failure("Failed to kill all processes: " +
                    (future.isFailed() ? future.failure() : "unknown error"));
   }
+}
+
+
+Try<Launcher*> WindowsLauncher::create(const Flags& flags)
+{
+  return new WindowsLauncher();
 }
 
 } // namespace slave {

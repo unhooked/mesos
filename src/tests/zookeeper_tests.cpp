@@ -18,6 +18,11 @@
 
 #include <gmock/gmock.h>
 
+#include <mesos/zookeeper/authentication.hpp>
+#include <mesos/zookeeper/contender.hpp>
+#include <mesos/zookeeper/detector.hpp>
+#include <mesos/zookeeper/group.hpp>
+
 #include <process/gmock.hpp>
 #include <process/gtest.hpp>
 #include <process/owned.hpp>
@@ -26,11 +31,6 @@
 #include <stout/strings.hpp>
 
 #include "master/constants.hpp"
-
-#include "zookeeper/authentication.hpp"
-#include "zookeeper/contender.hpp"
-#include "zookeeper/detector.hpp"
-#include "zookeeper/group.hpp"
 
 #include "tests/zookeeper.hpp"
 
@@ -53,7 +53,7 @@ TEST_F(ZooKeeperTest, Auth)
                          "42",
                          zookeeper::EVERYONE_READ_CREATOR_ALL,
                          0,
-                         NULL);
+                         nullptr);
   ASSERT_ZK_GET("42", &authenticatedZk, "/test");
 
   ZooKeeper unauthenticatedZk(server->connectString(), NO_TIMEOUT, &watcher);
@@ -104,13 +104,13 @@ TEST_F(ZooKeeperTest, Create)
                                         "",
                                         zookeeper::EVERYONE_READ_CREATOR_ALL,
                                         0,
-                                        NULL,
+                                        nullptr,
                                         true));
   authenticatedZk.create("/foo/bar/baz",
                          "43",
                          zookeeper::EVERYONE_CREATE_AND_READ_CREATOR_ALL,
                          0,
-                         NULL);
+                         nullptr);
   ASSERT_ZK_GET("43", &authenticatedZk, "/foo/bar/baz");
 
   ZooKeeper nonOwnerZk(server->connectString(), NO_TIMEOUT, &watcher);
@@ -120,13 +120,13 @@ TEST_F(ZooKeeperTest, Create)
                                            "",
                                            zookeeper::EVERYONE_READ_CREATOR_ALL,
                                            0,
-                                           NULL,
+                                           nullptr,
                                            true));
   EXPECT_EQ(ZOK, nonOwnerZk.create("/foo/bar/baz/bam",
                                    "44",
                                    zookeeper::EVERYONE_READ_CREATOR_ALL,
                                    0,
-                                   NULL,
+                                   nullptr,
                                    true));
   ASSERT_ZK_GET("44", &nonOwnerZk, "/foo/bar/baz/bam");
 

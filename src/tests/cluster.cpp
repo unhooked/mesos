@@ -22,14 +22,24 @@
 
 #include <mesos/authorizer/authorizer.hpp>
 
+#include <mesos/log/log.hpp>
+
 #include <mesos/master/allocator.hpp>
 
 #include <mesos/slave/resource_estimator.hpp>
+
+#include <mesos/state/in_memory.hpp>
+#include <mesos/state/log.hpp>
+#include <mesos/state/protobuf.hpp>
+#include <mesos/state/storage.hpp>
+
+#include <mesos/zookeeper/url.hpp>
 
 #include <process/clock.hpp>
 #include <process/future.hpp>
 #include <process/gmock.hpp>
 #include <process/gtest.hpp>
+#include <process/http.hpp>
 #include <process/id.hpp>
 #include <process/limiter.hpp>
 #include <process/owned.hpp>
@@ -52,19 +62,22 @@
 
 #include "authorizer/local/authorizer.hpp"
 
+#include "common/http.hpp"
+
 #include "files/files.hpp"
 
-#include "log/log.hpp"
-
 #include "master/constants.hpp"
-#include "master/contender.hpp"
-#include "master/detector.hpp"
 #include "master/flags.hpp"
 #include "master/master.hpp"
 #include "master/registrar.hpp"
-#include "master/repairer.hpp"
 
 #include "master/allocator/mesos/hierarchical.hpp"
+
+#include "master/contender/standalone.hpp"
+#include "master/contender/zookeeper.hpp"
+
+#include "master/detector/standalone.hpp"
+#include "master/detector/zookeeper.hpp"
 
 #include "slave/flags.hpp"
 #include "slave/gc.hpp"
@@ -74,15 +87,14 @@
 #include "slave/containerizer/containerizer.hpp"
 #include "slave/containerizer/fetcher.hpp"
 
-#include "state/in_memory.hpp"
-#include "state/log.hpp"
-#include "state/protobuf.hpp"
-#include "state/storage.hpp"
-
-#include "zookeeper/url.hpp"
-
 #include "tests/cluster.hpp"
 
+using mesos::master::contender::StandaloneMasterContender;
+using mesos::master::contender::ZooKeeperMasterContender;
+
+using mesos::master::detector::MasterDetector;
+using mesos::master::detector::StandaloneMasterDetector;
+using mesos::master::detector::ZooKeeperMasterDetector;
 
 namespace mesos {
 namespace internal {
@@ -115,6 +127,10 @@ Try<process::Owned<Master>> Master::start(
 
   // If the authorizer is not provided, create a default one.
   if (authorizer.isNone()) {
+    // Indicates whether or not the caller explicitly specified the
+    // authorization configuration for this master.
+    bool authorizationSpecified = true;
+
     std::vector<std::string> authorizerNames =
       strings::split(flags.authorizers, ",");
 
@@ -139,6 +155,9 @@ Try<process::Owned<Master>> Master::start(
         LOG(INFO) << "Creating default '" << authorizerName << "' authorizer";
 
         authorizer = Authorizer::create(flags.acls.get());
+        CHECK_SOME(authorizer);
+      } else {
+        authorizationSpecified = false;
       }
     }
 
@@ -148,7 +167,16 @@ Try<process::Owned<Master>> Master::start(
           authorizer.error());
     } else if (authorizer.isSome()) {
       master->authorizer.reset(authorizer.get());
+
+      if (authorizationSpecified) {
+        // Authorization config was explicitly provided, so set authorization
+        // callbacks in libprocess.
+        master->setAuthorizationCallbacks(authorizer.get());
+      }
     }
+  } else {
+    // An authorizer was provided, so set authorization callbacks in libprocess.
+    master->setAuthorizationCallbacks(authorizer.get());
   }
 
   // Create the appropriate master contender/detector.
@@ -184,7 +212,7 @@ Try<process::Owned<Master>> Master::start(
   if (flags.registry == "replicated_log") {
     if (zookeeperUrl.isSome()) {
       // Use ZooKeeper-based replicated log.
-      master->log.reset(new log::Log(
+      master->log.reset(new mesos::log::Log(
           flags.quorum.get(),
           path::join(flags.work_dir.get(), "replicated_log"),
           zookeeperUrl.get().servers,
@@ -193,7 +221,7 @@ Try<process::Owned<Master>> Master::start(
           zookeeperUrl.get().authentication,
           flags.log_auto_initialize));
     } else {
-      master->log.reset(new log::Log(
+      master->log.reset(new mesos::log::Log(
           1,
           path::join(flags.work_dir.get(), "replicated_log"),
           std::set<process::UPID>(),
@@ -203,47 +231,47 @@ Try<process::Owned<Master>> Master::start(
 
   // Create the registry's storage backend.
   if (flags.registry == "in_memory") {
-    master->storage.reset(new state::InMemoryStorage());
+    master->storage.reset(new mesos::state::InMemoryStorage());
   } else if (flags.registry == "replicated_log") {
-    master->storage.reset(new state::LogStorage(master->log.get()));
+    master->storage.reset(new mesos::state::LogStorage(master->log.get()));
   } else {
     return Error(
         "Unsupported option for registry persistence: " + flags.registry);
   }
 
   // Instantiate some other master dependencies.
-  master->state.reset(new state::protobuf::State(master->storage.get()));
-  master->registrar.reset(new master::Registrar(flags, master->state.get()));
-  master->repairer.reset(new master::Repairer());
+  master->state.reset(new mesos::state::protobuf::State(master->storage.get()));
+  master->registrar.reset(new master::Registrar(
+      flags, master->state.get(), master::DEFAULT_HTTP_AUTHENTICATION_REALM));
 
-  if (slaveRemovalLimiter.isNone() && flags.slave_removal_rate_limit.isSome()) {
+  if (slaveRemovalLimiter.isNone() && flags.agent_removal_rate_limit.isSome()) {
     // Parse the flag value.
     // TODO(vinod): Move this parsing logic to flags once we have a
     // 'Rate' abstraction in stout.
     std::vector<std::string> tokens =
-      strings::tokenize(flags.slave_removal_rate_limit.get(), "/");
+      strings::tokenize(flags.agent_removal_rate_limit.get(), "/");
 
     if (tokens.size() != 2) {
       return Error(
-          "Invalid slave_removal_rate_limit: " +
-          flags.slave_removal_rate_limit.get() +
-          ". Format is <Number of slaves>/<Duration>");
+          "Invalid agent_removal_rate_limit: " +
+          flags.agent_removal_rate_limit.get() +
+          ". Format is <Number of agents>/<Duration>");
     }
 
     Try<int> permits = numify<int>(tokens[0]);
     if (permits.isError()) {
       return Error(
-          "Invalid slave_removal_rate_limit: " +
-          flags.slave_removal_rate_limit.get() +
-          ". Format is <Number of slaves>/<Duration>: " + permits.error());
+          "Invalid agent_removal_rate_limit: " +
+          flags.agent_removal_rate_limit.get() +
+          ". Format is <Number of agents>/<Duration>: " + permits.error());
     }
 
     Try<Duration> duration = Duration::parse(tokens[1]);
     if (duration.isError()) {
       return Error(
-          "Invalid slave_removal_rate_limit: " +
-          flags.slave_removal_rate_limit.get() +
-          ". Format is <Number of slaves>/<Duration>: " + duration.error());
+          "Invalid agent_removal_rate_limit: " +
+          flags.agent_removal_rate_limit.get() +
+          ". Format is <Number of agents>/<Duration>: " + duration.error());
     }
 
     master->slaveRemovalLimiter =
@@ -254,7 +282,6 @@ Try<process::Owned<Master>> Master::start(
   master->master.reset(new master::Master(
       allocator.getOrElse(master->allocator.get()),
       master->registrar.get(),
-      master->repairer.get(),
       &master->files,
       master->contender.get(),
       master->detector.get(),
@@ -306,6 +333,11 @@ Try<process::Owned<Master>> Master::start(
 
 Master::~Master()
 {
+  // Remove any libprocess authorization callbacks that were installed.
+  if (authorizationCallbacksSet) {
+    process::http::authorization::unsetCallbacks();
+  }
+
   // NOTE: Authenticators' lifetimes are tied to libprocess's lifetime.
   // This means that multiple masters in tests are not supported.
   process::http::authentication::unsetAuthenticator(
@@ -333,6 +365,15 @@ MasterInfo Master::getMasterInfo()
 }
 
 
+void Master::setAuthorizationCallbacks(Authorizer* authorizer)
+{
+  process::http::authorization::setCallbacks(
+      mesos::createAuthorizationCallbacks(authorizer));
+
+  authorizationCallbacksSet = true;
+}
+
+
 Try<process::Owned<Slave>> Slave::start(
     MasterDetector* detector,
     const slave::Flags& flags,
@@ -341,7 +382,8 @@ Try<process::Owned<Slave>> Slave::start(
     const Option<slave::GarbageCollector*>& gc,
     const Option<slave::StatusUpdateManager*>& statusUpdateManager,
     const Option<mesos::slave::ResourceEstimator*>& resourceEstimator,
-    const Option<mesos::slave::QoSController*>& qosController)
+    const Option<mesos::slave::QoSController*>& qosController,
+    const Option<Authorizer*>& providedAuthorizer)
 {
   process::Owned<Slave> slave(new Slave());
 
@@ -366,6 +408,52 @@ Try<process::Owned<Slave>> Slave::start(
 
     slave->ownedContainerizer.reset(_containerizer.get());
     slave->containerizer = _containerizer.get();
+  }
+
+  Option<Authorizer*> authorizer = providedAuthorizer;
+
+  // If the authorizer is not provided, create a default one.
+  if (providedAuthorizer.isNone()) {
+    // Indicates whether or not the caller explicitly specified the
+    // authorization configuration for this agent.
+    bool authorizationSpecified = true;
+
+    std::string authorizerName = flags.authorizer;
+
+    Result<Authorizer*> createdAuthorizer((None()));
+    if (authorizerName != slave::DEFAULT_AUTHORIZER) {
+      LOG(INFO) << "Creating '" << authorizerName << "' authorizer";
+
+      // NOTE: The contents of --acls will be ignored.
+      createdAuthorizer = Authorizer::create(authorizerName);
+    } else {
+      // `authorizerName` is `DEFAULT_AUTHORIZER` at this point.
+      if (flags.acls.isSome()) {
+        LOG(INFO) << "Creating default '" << authorizerName << "' authorizer";
+
+        createdAuthorizer = Authorizer::create(flags.acls.get());
+      } else {
+        // Neither a non-default authorizer nor a set of ACLs were specified.
+        authorizationSpecified = false;
+      }
+    }
+
+    if (createdAuthorizer.isError()) {
+      EXIT(EXIT_FAILURE) << "Could not create '" << authorizerName
+                         << "' authorizer: " << createdAuthorizer.error();
+    } else if (createdAuthorizer.isSome()) {
+      slave->authorizer.reset(createdAuthorizer.get());
+      authorizer = createdAuthorizer.get();
+
+      if (authorizationSpecified) {
+        // Authorization config was explicitly provided, so set authorization
+        // callbacks in libprocess.
+        slave->setAuthorizationCallbacks(authorizer.get());
+      }
+    }
+  } else {
+    // An authorizer was provided, so set authorization callbacks in libprocess.
+    slave->setAuthorizationCallbacks(providedAuthorizer.get());
   }
 
   // If the garbage collector is not provided, create a default one.
@@ -414,7 +502,8 @@ Try<process::Owned<Slave>> Slave::start(
       gc.getOrElse(slave->gc.get()),
       statusUpdateManager.getOrElse(slave->statusUpdateManager.get()),
       resourceEstimator.getOrElse(slave->resourceEstimator.get()),
-      qosController.getOrElse(slave->qosController.get())));
+      qosController.getOrElse(slave->qosController.get()),
+      authorizer));
 
   slave->pid = process::spawn(slave->slave.get());
 
@@ -424,10 +513,20 @@ Try<process::Owned<Slave>> Slave::start(
 
 Slave::~Slave()
 {
+  // Remove any libprocess authorization callbacks that were installed.
+  if (authorizationCallbacksSet) {
+    process::http::authorization::unsetCallbacks();
+  }
+
   // If either `shutdown()` or `terminate()` were called already,
   // skip the below container cleanup logic.  Additionally, we can skip
   // termination, as the shutdown/terminate will do this too.
   if (!cleanUpContainersInDestructor) {
+    return;
+  }
+
+  // Startup didn't complete so don't try to do the full shutdown.
+  if (!containerizer) {
     return;
   }
 
@@ -463,6 +562,15 @@ Slave::~Slave()
 }
 
 
+void Slave::setAuthorizationCallbacks(Authorizer* authorizer)
+{
+  process::http::authorization::setCallbacks(
+      mesos::createAuthorizationCallbacks(authorizer));
+
+  authorizationCallbacksSet = true;
+}
+
+
 void Slave::shutdown()
 {
   cleanUpContainersInDestructor = false;
@@ -488,29 +596,31 @@ void Slave::wait()
 #ifdef __linux__
   // Remove all of this processes threads into the root cgroups - this
   // simulates the slave process terminating and permits a new slave to start
-  // when the --slave_subsystems flag is used.
-  if (flags.slave_subsystems.isSome()) {
+  // when the --agent_subsystems flag is used.
+  if (flags.agent_subsystems.isSome()) {
     foreach (const std::string& subsystem,
-             strings::tokenize(flags.slave_subsystems.get(), ",")) {
+             strings::tokenize(flags.agent_subsystems.get(), ",")) {
       std::string hierarchy = path::join(flags.cgroups_hierarchy, subsystem);
 
       std::string cgroup = path::join(flags.cgroups_root, "slave");
 
       Try<bool> exists = cgroups::exists(hierarchy, cgroup);
       if (exists.isError() || !exists.get()) {
-        EXIT(1) << "Failed to find cgroup " << cgroup
-                << " for subsystem " << subsystem
-                << " under hierarchy " << hierarchy
-                << " for slave: " + exists.error();
+        EXIT(EXIT_FAILURE)
+          << "Failed to find cgroup " << cgroup
+          << " for subsystem " << subsystem
+          << " under hierarchy " << hierarchy
+          << " for agent: " + exists.error();
       }
 
       // Move all of our threads into the root cgroup.
       Try<Nothing> assign = cgroups::assign(hierarchy, "", getpid());
       if (assign.isError()) {
-        EXIT(1) << "Failed to move slave threads into cgroup " << cgroup
-                << " for subsystem " << subsystem
-                << " under hierarchy " << hierarchy
-                << " for slave: " + assign.error();
+        EXIT(EXIT_FAILURE)
+          << "Failed to move agent threads into cgroup " << cgroup
+          << " for subsystem " << subsystem
+          << " under hierarchy " << hierarchy
+          << " for agent: " + assign.error();
       }
     }
   }

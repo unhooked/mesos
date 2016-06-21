@@ -54,6 +54,10 @@
 
 #include "master/allocator/mesos/allocator.hpp"
 
+#include "master/contender/zookeeper.hpp"
+
+#include "master/detector/standalone.hpp"
+
 #include "slave/constants.hpp"
 #include "slave/gc.hpp"
 #include "slave/flags.hpp"
@@ -76,6 +80,11 @@ using mesos::internal::slave::GarbageCollectorProcess;
 using mesos::internal::slave::Slave;
 using mesos::internal::slave::Containerizer;
 using mesos::internal::slave::MesosContainerizerProcess;
+
+using mesos::master::contender::MASTER_CONTENDER_ZK_SESSION_TIMEOUT;
+
+using mesos::master::detector::MasterDetector;
+using mesos::master::detector::StandaloneMasterDetector;
 
 using process::Clock;
 using process::Future;
@@ -653,7 +662,8 @@ TEST_F(MasterTest, StatusUpdateAck)
 
 TEST_F(MasterTest, RecoverResources)
 {
-  Try<Owned<cluster::Master>> master = StartMaster();
+  master::Flags masterFlags = CreateMasterFlags();
+  Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
   ASSERT_SOME(master);
 
   MockExecutor exec(DEFAULT_EXECUTOR_ID);
@@ -661,7 +671,7 @@ TEST_F(MasterTest, RecoverResources)
 
   slave::Flags flags = CreateSlaveFlags();
   flags.resources = Option<string>(
-      "cpus:2;mem:1024;disk:1024;ports:[1-10, 20-30]");
+      "cpus:2;gpus:0;mem:1024;disk:1024;ports:[1-10, 20-30]");
 
   Owned<MasterDetector> detector = master.get()->createDetector();
 
@@ -754,6 +764,14 @@ TEST_F(MasterTest, RecoverResources)
 
   // Now kill the executor, scheduler should get an offer it's resources.
   containerizer.destroy(offer.framework_id(), executorInfo.executor_id());
+
+  // Ensure the container is destroyed, `ExitedExecutorMessage` message
+  // is received by the master and hence its resources will be recovered
+  // before a batch allocation is triggered.
+  Clock::pause();
+  Clock::settle();
+  Clock::advance(masterFlags.allocation_interval);
+  Clock::resume();
 
   // TODO(benh): We can't do driver.reviveOffers() because we need to
   // wait for the killed executors resources to get aggregated! We
@@ -988,7 +1006,8 @@ TEST_F(MasterTest, MasterInfo)
 
 TEST_F(MasterTest, MasterInfoOnReElection)
 {
-  Try<Owned<cluster::Master>> master = StartMaster();
+  master::Flags masterFlags = CreateMasterFlags();
+  Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
   ASSERT_SOME(master);
 
   StandaloneMasterDetector detector(master.get()->pid);
@@ -1041,6 +1060,11 @@ TEST_F(MasterTest, MasterInfoOnReElection)
 
   EXPECT_EQ(MESOS_VERSION, masterInfo.get().version());
 
+  // Advance the clock and trigger a batch allocation.
+  Clock::pause();
+  Clock::advance(masterFlags.allocation_interval);
+  Clock::resume();
+
   // The re-registered framework should get offers.
   AWAIT_READY(resourceOffers2);
 
@@ -1070,7 +1094,7 @@ TEST_F(WhitelistTest, WhitelistSlave)
   Try<string> hostname = net::hostname();
   ASSERT_SOME(hostname);
 
-  string hosts = hostname.get() + "\n" + "dummy-slave";
+  string hosts = hostname.get() + "\n" + "dummy-agent";
   ASSERT_SOME(os::write(path, hosts)) << "Error writing whitelist";
 
   master::Flags flags = CreateMasterFlags();
@@ -1188,7 +1212,8 @@ TEST_F(MasterTest, MasterLost)
 // all slave resources and a single task should be able to run on these.
 TEST_F(MasterTest, LaunchCombinedOfferTest)
 {
-  Try<Owned<cluster::Master>> master = StartMaster();
+  master::Flags masterFlags = CreateMasterFlags();
+  Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
   ASSERT_SOME(master);
 
   MockExecutor exec(DEFAULT_EXECUTOR_ID);
@@ -1256,6 +1281,11 @@ TEST_F(MasterTest, LaunchCombinedOfferTest)
   AWAIT_READY(status1);
   EXPECT_EQ(TASK_RUNNING, status1.get().state());
 
+  // Advance the clock and trigger a batch allocation.
+  Clock::pause();
+  Clock::advance(masterFlags.allocation_interval);
+  Clock::resume();
+
   // Await 2nd offer.
   AWAIT_READY(offers2);
   EXPECT_NE(0u, offers2.get().size());
@@ -1282,6 +1312,11 @@ TEST_F(MasterTest, LaunchCombinedOfferTest)
 
   AWAIT_READY(status2);
   EXPECT_EQ(TASK_KILLED, status2.get().state());
+
+  // Advance the clock and trigger a batch allocation.
+  Clock::pause();
+  Clock::advance(masterFlags.allocation_interval);
+  Clock::resume();
 
   // Await 3rd offer - 2nd and 3rd offer to same slave are now ready.
   AWAIT_READY(offers3);
@@ -1607,6 +1642,10 @@ TEST_F(MasterTest, MetricsInMetricsEndpoint)
   EXPECT_EQ(1u, snapshot.values.count("master/cpus_used"));
   EXPECT_EQ(1u, snapshot.values.count("master/cpus_percent"));
 
+  EXPECT_EQ(1u, snapshot.values.count("master/gpus_total"));
+  EXPECT_EQ(1u, snapshot.values.count("master/gpus_used"));
+  EXPECT_EQ(1u, snapshot.values.count("master/gpus_percent"));
+
   EXPECT_EQ(1u, snapshot.values.count("master/mem_total"));
   EXPECT_EQ(1u, snapshot.values.count("master/mem_used"));
   EXPECT_EQ(1u, snapshot.values.count("master/mem_percent"));
@@ -1623,7 +1662,10 @@ TEST_F(MasterTest, MetricsInMetricsEndpoint)
   EXPECT_EQ(1u, snapshot.values.count("registrar/state_store_ms"));
 
   // Allocator Metrics.
-  EXPECT_EQ(1u, snapshot.values.count("allocator/event_queue_dispatches"));
+  EXPECT_EQ(1u, snapshot.values.count(
+      "allocator/event_queue_dispatches"));
+  EXPECT_EQ(1u, snapshot.values.count(
+      "allocator/mesos/event_queue_dispatches"));
 }
 
 
@@ -1659,7 +1701,7 @@ TEST_F(MasterTest, SlavesEndpointWithoutSlaves)
 }
 
 
-// Ensures that the number of registered slaves resported by
+// Ensures that the number of registered slaves reported by
 // /master/slaves coincides with the actual number of registered
 // slaves.
 TEST_F(MasterTest, SlavesEndpointTwoSlaves)
@@ -1678,6 +1720,8 @@ TEST_F(MasterTest, SlavesEndpointTwoSlaves)
   Try<Owned<cluster::Slave>> slave1 = StartSlave(detector.get());
   ASSERT_SOME(slave1);
 
+  AWAIT_READY(slave1RegisteredMessage);
+
   Future<SlaveRegisteredMessage> slave2RegisteredMessage =
     FUTURE_PROTOBUF(
         SlaveRegisteredMessage(), master.get()->pid, Not(slave1.get()->pid));
@@ -1685,8 +1729,6 @@ TEST_F(MasterTest, SlavesEndpointTwoSlaves)
   Try<Owned<cluster::Slave>> slave2 = StartSlave(detector.get());
   ASSERT_SOME(slave2);
 
-  // Wait for the slaves to be registered.
-  AWAIT_READY(slave1RegisteredMessage);
   AWAIT_READY(slave2RegisteredMessage);
 
   // Query the master.
@@ -1704,7 +1746,7 @@ TEST_F(MasterTest, SlavesEndpointTwoSlaves)
 
   ASSERT_SOME(parse);
 
-  // Check that there are at least two elements in the array.
+  // Check that there are two elements in the array.
   Result<JSON::Array> array = parse.get().find<JSON::Array>("slaves");
   ASSERT_SOME(array);
   EXPECT_EQ(2u, array.get().values.size());
@@ -1764,7 +1806,7 @@ TEST_F(MasterTest, RecoveredSlaveDoesNotReregister)
     .WillOnce(FutureSatisfy(&slaveLost));
 
   Clock::pause();
-  Clock::advance(masterFlags.slave_reregister_timeout);
+  Clock::advance(masterFlags.agent_reregister_timeout);
 
   AWAIT_READY(slaveLost);
 
@@ -1847,7 +1889,7 @@ TEST_F(MasterTest, NonStrictRegistryWriteOnly)
     .WillRepeatedly(FutureSatisfy(&slaveLost));
 
   Clock::pause();
-  Clock::advance(masterFlags.slave_reregister_timeout);
+  Clock::advance(masterFlags.agent_reregister_timeout);
   Clock::settle();
 
   ASSERT_TRUE(slaveLost.isPending());
@@ -1928,7 +1970,7 @@ TEST_F(MasterTest, RateLimitRecoveredSlaveRemoval)
 
   // Trigger the slave re-registration timeout.
   Clock::pause();
-  Clock::advance(masterFlags.slave_reregister_timeout);
+  Clock::advance(masterFlags.agent_reregister_timeout);
 
   // The master should attempt to acquire a permit.
   AWAIT_READY(acquire);
@@ -2005,7 +2047,7 @@ TEST_F(MasterTest, CancelRecoveredSlaveRemoval)
 
   // Trigger the slave re-registration timeout.
   Clock::pause();
-  Clock::advance(masterFlags.slave_reregister_timeout);
+  Clock::advance(masterFlags.agent_reregister_timeout);
 
   // The master should attempt to acquire a permit.
   AWAIT_READY(acquire);
@@ -2109,7 +2151,7 @@ TEST_F(MasterTest, RecoveredSlaveReregisters)
     .WillRepeatedly(FutureSatisfy(&slaveLost));
 
   Clock::pause();
-  Clock::advance(masterFlags.slave_reregister_timeout);
+  Clock::advance(masterFlags.agent_reregister_timeout);
   Clock::settle();
 
   ASSERT_TRUE(slaveLost.isPending());
@@ -2420,6 +2462,95 @@ TEST_F(MasterTest, OrphanTasks)
 }
 
 
+// This tests /tasks endpoint to return correct task information.
+TEST_F(MasterTest, TasksEndpoint)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  MockExecutor exec(DEFAULT_EXECUTOR_ID);
+  TestContainerizer containerizer(&exec);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), &containerizer);
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .Times(1);
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  EXPECT_NE(0u, offers.get().size());
+
+  TaskInfo task;
+  task.set_name("test");
+  task.mutable_task_id()->set_value("1");
+  task.mutable_slave_id()->MergeFrom(offers.get()[0].slave_id());
+  task.mutable_resources()->MergeFrom(offers.get()[0].resources());
+  task.mutable_executor()->MergeFrom(DEFAULT_EXECUTOR_INFO);
+
+  EXPECT_CALL(exec, registered(_, _, _, _))
+    .Times(1);
+
+  EXPECT_CALL(exec, launchTask(_, _))
+    .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING));
+
+  Future<TaskStatus> status;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&status));
+
+  driver.launchTasks(offers.get()[0].id(), {task});
+
+  AWAIT_READY(status);
+  EXPECT_EQ(TASK_RUNNING, status.get().state());
+  EXPECT_TRUE(status.get().has_executor_id());
+  EXPECT_EQ(exec.id, status.get().executor_id());
+
+  Future<Response> response = process::http::get(
+      master.get()->pid,
+      "tasks",
+      None(),
+      createBasicAuthHeaders(DEFAULT_CREDENTIAL));
+
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
+  AWAIT_EXPECT_RESPONSE_HEADER_EQ(APPLICATION_JSON, "Content-Type", response);
+
+  Try<JSON::Value> value = JSON::parse<JSON::Value>(response.get().body);
+  ASSERT_SOME(value);
+
+  Try<JSON::Value> expected = JSON::parse(
+      "{"
+        "\"tasks\":"
+          "[{"
+              "\"executor_id\":\"default\","
+              "\"id\":\"1\","
+              "\"name\":\"test\","
+              "\"state\":\"TASK_RUNNING\""
+          "}]"
+      "}");
+
+  ASSERT_SOME(expected);
+
+  EXPECT_TRUE(value.get().contains(expected.get()));
+
+  EXPECT_CALL(exec, shutdown(_))
+    .Times(AtMost(1));
+
+  driver.stop();
+  driver.join();
+}
+
+
 // This test verifies that the master will strip ephemeral ports
 // resource from offers so that frameworks cannot see it.
 TEST_F(MasterTest, IgnoreEphemeralPortsResource)
@@ -2428,7 +2559,7 @@ TEST_F(MasterTest, IgnoreEphemeralPortsResource)
   ASSERT_SOME(master);
 
   string resourcesWithoutEphemeralPorts =
-    "cpus:2;mem:1024;disk:1024;ports:[31000-32000]";
+    "cpus:2;gpus:0;mem:1024;disk:1024;ports:[31000-32000]";
 
   string resourcesWithEphemeralPorts =
     resourcesWithoutEphemeralPorts + ";ephemeral_ports:[30001-30999]";
@@ -2468,7 +2599,7 @@ TEST_F(MasterTest, IgnoreEphemeralPortsResource)
 TEST_F(MasterTest, MaxExecutorsPerSlave)
 {
   master::Flags flags = CreateMasterFlags();
-  flags.max_executors_per_slave = 0;
+  flags.max_executors_per_agent = 0;
 
   Try<Owned<cluster::Master>> master = StartMaster(flags);
   ASSERT_SOME(master);
@@ -2555,6 +2686,11 @@ TEST_F(MasterTest, OfferTimeout)
   AWAIT_READY(offerRescinded);
 
   AWAIT_READY(recoverResources);
+
+  // Advance the clock and trigger a batch allocation.
+  Clock::pause();
+  Clock::advance(masterFlags.allocation_interval);
+  Clock::resume();
 
   // Expect that the resources are re-offered to the framework after
   // the rescind.
@@ -3121,6 +3257,100 @@ TEST_F(MasterTest, StateSummaryEndpoint)
 }
 
 
+// This test verifies that executor labels are
+// exposed in the master's state endpoint.
+TEST_F(MasterTest, ExecutorLabels)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  MockExecutor exec(DEFAULT_EXECUTOR_ID);
+  TestContainerizer containerizer(&exec);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), &containerizer);
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .Times(1);
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  EXPECT_NE(0u, offers.get().size());
+
+  TaskInfo task;
+  task.set_name("");
+  task.mutable_task_id()->set_value("1");
+  task.mutable_slave_id()->MergeFrom(offers.get()[0].slave_id());
+  task.mutable_resources()->MergeFrom(offers.get()[0].resources());
+  task.mutable_executor()->MergeFrom(DEFAULT_EXECUTOR_INFO);
+
+  // Add three labels to the executor, two of which shares the same key.
+  Labels* labels = task.mutable_executor()->mutable_labels();
+
+  labels->add_labels()->CopyFrom(createLabel("key1", "value1"));
+  labels->add_labels()->CopyFrom(createLabel("key2", "value2"));
+  labels->add_labels()->CopyFrom(createLabel("key1", "value3"));
+
+  EXPECT_CALL(exec, registered(_, _, _, _))
+    .Times(1);
+
+  EXPECT_CALL(exec, launchTask(_, _))
+    .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING));
+
+  Future<TaskStatus> status;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&status));
+
+  driver.launchTasks(offers.get()[0].id(), {task});
+
+  AWAIT_READY(status);
+  EXPECT_EQ(TASK_RUNNING, status.get().state());
+
+  // Verify label key and value in the master's state endpoint.
+  Future<Response> response = process::http::get(
+      master.get()->pid,
+      "state",
+      None(),
+      createBasicAuthHeaders(DEFAULT_CREDENTIAL));
+
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
+  AWAIT_EXPECT_RESPONSE_HEADER_EQ(APPLICATION_JSON, "Content-Type", response);
+
+  Try<JSON::Object> parse = JSON::parse<JSON::Object>(response->body);
+  ASSERT_SOME(parse);
+
+  Result<JSON::Array> labels_ = parse->find<JSON::Array>(
+      "frameworks[0].executors[0].labels");
+  EXPECT_SOME(labels_);
+
+  // Verify the contents of labels.
+  EXPECT_EQ(3u, labels_->values.size());
+  EXPECT_EQ(JSON::Value(JSON::protobuf(createLabel("key1", "value1"))),
+            labels_->values[0]);
+  EXPECT_EQ(JSON::Value(JSON::protobuf(createLabel("key2", "value2"))),
+            labels_->values[1]);
+  EXPECT_EQ(JSON::Value(JSON::protobuf(createLabel("key1", "value3"))),
+            labels_->values[2]);
+
+  EXPECT_CALL(exec, shutdown(_))
+    .Times(AtMost(1));
+
+  driver.stop();
+  driver.join();
+}
+
+
 // This test verifies that label values are exposed over the master's
 // state endpoint.
 TEST_F(MasterTest, TaskLabels)
@@ -3385,8 +3615,13 @@ TEST_F(MasterTest, TaskStatusContainerStatus)
   EXPECT_TRUE(status->has_container_status());
   ContainerStatus containerStatus = status->container_status();
   EXPECT_EQ(1, containerStatus.network_infos().size());
-  EXPECT_TRUE(containerStatus.network_infos(0).has_ip_address());
-  EXPECT_EQ(slaveIPAddress, containerStatus.network_infos(0).ip_address());
+  EXPECT_EQ(1, containerStatus.network_infos(0).ip_addresses().size());
+
+  NetworkInfo::IPAddress ipAddress =
+    containerStatus.network_infos(0).ip_addresses(0);
+
+  ASSERT_TRUE(ipAddress.has_ip_address());
+  EXPECT_EQ(slaveIPAddress, ipAddress.ip_address());
 
   // Now do the same validation with state endpoint.
   Future<Response> response = process::http::get(
@@ -3407,7 +3642,8 @@ TEST_F(MasterTest, TaskStatusContainerStatus)
       slaveIPAddress,
       parse.get().find<JSON::String>(
           "frameworks[0].tasks[0].statuses[0]"
-          ".container_status.network_infos[0].ip_address"));
+          ".container_status.network_infos[0]"
+          ".ip_addresses[0].ip_address"));
 
   // Now test for explicit reconciliation.
   Future<TaskStatus> explicitReconciliationStatus;
@@ -3428,8 +3664,12 @@ TEST_F(MasterTest, TaskStatusContainerStatus)
 
   containerStatus = explicitReconciliationStatus->container_status();
   EXPECT_EQ(1, containerStatus.network_infos().size());
-  EXPECT_TRUE(containerStatus.network_infos(0).has_ip_address());
-  EXPECT_EQ(slaveIPAddress, containerStatus.network_infos(0).ip_address());
+  EXPECT_EQ(1, containerStatus.network_infos(0).ip_addresses().size());
+
+  ipAddress = containerStatus.network_infos(0).ip_addresses(0);
+
+  ASSERT_TRUE(ipAddress.has_ip_address());
+  EXPECT_EQ(slaveIPAddress, ipAddress.ip_address());
 
   Future<TaskStatus> implicitReconciliationStatus;
   EXPECT_CALL(sched, statusUpdate(&driver, _))
@@ -3444,8 +3684,12 @@ TEST_F(MasterTest, TaskStatusContainerStatus)
 
   containerStatus = implicitReconciliationStatus->container_status();
   EXPECT_EQ(1, containerStatus.network_infos().size());
-  EXPECT_TRUE(containerStatus.network_infos(0).has_ip_address());
-  EXPECT_EQ(slaveIPAddress, containerStatus.network_infos(0).ip_address());
+  EXPECT_EQ(1, containerStatus.network_infos(0).ip_addresses().size());
+
+  ipAddress = containerStatus.network_infos(0).ip_addresses(0);
+
+  ASSERT_TRUE(ipAddress.has_ip_address());
+  EXPECT_EQ(slaveIPAddress, ipAddress.ip_address());
 
   EXPECT_CALL(exec, shutdown(_))
     .Times(AtMost(1));
@@ -3921,6 +4165,32 @@ TEST_F(MasterTest, FrameworkInfoLabels)
 }
 
 
+// This test ensures that if a framework scheduler provides invalid
+// role in its FrameworkInfo message, the master will reject it.
+TEST_F(MasterTest, RejectFrameworkWithInvalidRole)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  FrameworkInfo framework = DEFAULT_FRAMEWORK_INFO;
+
+  // Add invalid role to the FrameworkInfo.
+  framework.set_role("/test/test1");
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, framework, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  Future<string> error;
+  EXPECT_CALL(sched, error(&driver, _))
+    .WillOnce(FutureArg<1>(&error));
+
+  driver.start();
+
+  AWAIT_READY(error);
+}
+
+
 TEST_F(MasterTest, FrameworksEndpointWithoutFrameworks)
 {
   master::Flags flags = CreateMasterFlags();
@@ -4302,6 +4572,33 @@ TEST_F(MasterTest, EndpointsBadAuthentication)
 
     AWAIT_EXPECT_RESPONSE_STATUS_EQ(Unauthorized({}).status, response);
   }
+}
+
+
+TEST_F(MasterTest, RejectFrameworkWithInvalidFailoverTimeout)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  FrameworkInfo framework = DEFAULT_FRAMEWORK_INFO;
+
+  // Add invalid failover timeout to the FrameworkInfo.
+  // As the timeout is represented using nanoseconds as an int64, the
+  // following value converted to seconds is too large and does not
+  // fit in int64.
+  framework.set_failover_timeout(99999999999999999);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, framework, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  Future<string> error;
+  EXPECT_CALL(sched, error(&driver, _))
+    .WillOnce(FutureArg<1>(&error));
+
+  driver.start();
+
+  AWAIT_READY(error);
 }
 
 } // namespace tests {

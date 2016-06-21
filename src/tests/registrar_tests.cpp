@@ -24,6 +24,14 @@
 #include <mesos/attributes.hpp>
 #include <mesos/type_utils.hpp>
 
+#include <mesos/authentication/http/basic_authenticator_factory.hpp>
+
+#include <mesos/log/log.hpp>
+
+#include <mesos/state/log.hpp>
+#include <mesos/state/protobuf.hpp>
+#include <mesos/state/storage.hpp>
+
 #include <process/clock.hpp>
 #include <process/gmock.hpp>
 #include <process/gtest.hpp>
@@ -38,28 +46,25 @@
 
 #include "common/protobuf_utils.hpp"
 
-#include "log/log.hpp"
 #include "log/replica.hpp"
 
 #include "log/tool/initialize.hpp"
-
-#include "messages/state.hpp"
 
 #include "master/flags.hpp"
 #include "master/maintenance.hpp"
 #include "master/master.hpp"
 #include "master/quota.hpp"
 #include "master/registrar.hpp"
+#include "master/weights.hpp"
 
-#include "state/log.hpp"
-#include "state/protobuf.hpp"
-#include "state/storage.hpp"
+#include "tests/mesos.hpp"
 
 using namespace mesos::internal::master;
 
 using namespace process;
 
-using mesos::internal::log::Log;
+using mesos::log::Log;
+
 using mesos::internal::log::Replica;
 
 using std::cout;
@@ -70,6 +75,11 @@ using std::string;
 using std::vector;
 
 using process::Clock;
+using process::Owned;
+
+using process::http::OK;
+using process::http::Response;
+using process::http::Unauthorized;
 
 using google::protobuf::RepeatedPtrField;
 
@@ -90,18 +100,40 @@ namespace internal {
 namespace tests {
 
 namespace quota = mesos::internal::master::quota;
+namespace weights = mesos::internal::master::weights;
+
+namespace authentication = process::http::authentication;
 
 using namespace mesos::maintenance;
 using namespace mesos::quota;
 
 using namespace mesos::internal::master::maintenance;
 using namespace mesos::internal::master::quota;
+using namespace mesos::internal::master::weights;
+
+using mesos::http::authentication::BasicAuthenticatorFactory;
+
+using mesos::state::LogStorage;
+using mesos::state::Storage;
+using mesos::state::protobuf::State;
 
 using state::Entry;
-using state::LogStorage;
-using state::Storage;
 
-using state::protobuf::State;
+
+static vector<WeightInfo> getWeightInfos(
+    const hashmap<string, double>& weights) {
+  vector<WeightInfo> weightInfos;
+
+  foreachpair (const string& role, double weight, weights) {
+    WeightInfo weightInfo;
+    weightInfo.set_role(role);
+    weightInfo.set_weight(weight);
+    weightInfos.push_back(weightInfo);
+  }
+
+  return weightInfos;
+}
+
 
 // TODO(xujyan): This class copies code from LogStateTest. It would
 // be nice to find a common location for log related base tests when
@@ -110,10 +142,10 @@ class RegistrarTestBase : public TemporaryDirectoryTest
 {
 public:
   RegistrarTestBase()
-    : log(NULL),
-      storage(NULL),
-      state(NULL),
-      replica2(NULL) {}
+    : log(nullptr),
+      storage(nullptr),
+      state(nullptr),
+      replica2(nullptr) {}
 
 protected:
   virtual void SetUp()
@@ -222,9 +254,9 @@ TEST_P(RegistrarTest, Recover)
   AWAIT_READY(registry);
   EXPECT_EQ(master, registry.get().master().info());
 
-  AWAIT_EQ(true, admit);
-  AWAIT_EQ(true, readmit);
-  AWAIT_EQ(true, remove);
+  AWAIT_TRUE(admit);
+  AWAIT_TRUE(readmit);
+  AWAIT_TRUE(remove);
 }
 
 
@@ -233,12 +265,12 @@ TEST_P(RegistrarTest, Admit)
   Registrar registrar(flags, state);
   AWAIT_READY(registrar.recover(master));
 
-  AWAIT_EQ(true, registrar.apply(Owned<Operation>(new AdmitSlave(slave))));
+  AWAIT_TRUE(registrar.apply(Owned<Operation>(new AdmitSlave(slave))));
 
   if (flags.registry_strict) {
-    AWAIT_EQ(false, registrar.apply(Owned<Operation>(new AdmitSlave(slave))));
+    AWAIT_FALSE(registrar.apply(Owned<Operation>(new AdmitSlave(slave))));
   } else {
-    AWAIT_EQ(true, registrar.apply(Owned<Operation>(new AdmitSlave(slave))));
+    AWAIT_TRUE(registrar.apply(Owned<Operation>(new AdmitSlave(slave))));
   }
 }
 
@@ -262,14 +294,14 @@ TEST_P(RegistrarTest, Readmit)
   info2.set_hostname("localhost");
   info2.mutable_id()->CopyFrom(id2);
 
-  AWAIT_EQ(true, registrar.apply(Owned<Operation>(new AdmitSlave(info1))));
+  AWAIT_TRUE(registrar.apply(Owned<Operation>(new AdmitSlave(info1))));
 
-  AWAIT_EQ(true, registrar.apply(Owned<Operation>(new ReadmitSlave(info1))));
+  AWAIT_TRUE(registrar.apply(Owned<Operation>(new ReadmitSlave(info1))));
 
   if (flags.registry_strict) {
-    AWAIT_EQ(false, registrar.apply(Owned<Operation>(new ReadmitSlave(info2))));
+    AWAIT_FALSE(registrar.apply(Owned<Operation>(new ReadmitSlave(info2))));
   } else {
-    AWAIT_EQ(true, registrar.apply(Owned<Operation>(new ReadmitSlave(info2))));
+    AWAIT_TRUE(registrar.apply(Owned<Operation>(new ReadmitSlave(info2))));
   }
 }
 
@@ -300,34 +332,34 @@ TEST_P(RegistrarTest, Remove)
   info3.set_hostname("localhost");
   info3.mutable_id()->CopyFrom(id3);
 
-  AWAIT_EQ(true, registrar.apply(Owned<Operation>(new AdmitSlave(info1))));
-  AWAIT_EQ(true, registrar.apply(Owned<Operation>(new AdmitSlave(info2))));
-  AWAIT_EQ(true, registrar.apply(Owned<Operation>(new AdmitSlave(info3))));
+  AWAIT_TRUE(registrar.apply(Owned<Operation>(new AdmitSlave(info1))));
+  AWAIT_TRUE(registrar.apply(Owned<Operation>(new AdmitSlave(info2))));
+  AWAIT_TRUE(registrar.apply(Owned<Operation>(new AdmitSlave(info3))));
 
-  AWAIT_EQ(true, registrar.apply(Owned<Operation>(new RemoveSlave(info1))));
+  AWAIT_TRUE(registrar.apply(Owned<Operation>(new RemoveSlave(info1))));
 
   if (flags.registry_strict) {
-    AWAIT_EQ(false, registrar.apply(Owned<Operation>(new RemoveSlave(info1))));
+    AWAIT_FALSE(registrar.apply(Owned<Operation>(new RemoveSlave(info1))));
   } else {
-    AWAIT_EQ(true, registrar.apply(Owned<Operation>(new RemoveSlave(info1))));
+    AWAIT_TRUE(registrar.apply(Owned<Operation>(new RemoveSlave(info1))));
   }
 
-  AWAIT_EQ(true, registrar.apply(Owned<Operation>(new AdmitSlave(info1))));
+  AWAIT_TRUE(registrar.apply(Owned<Operation>(new AdmitSlave(info1))));
 
-  AWAIT_EQ(true, registrar.apply(Owned<Operation>(new RemoveSlave(info2))));
+  AWAIT_TRUE(registrar.apply(Owned<Operation>(new RemoveSlave(info2))));
 
   if (flags.registry_strict) {
-    AWAIT_EQ(false, registrar.apply(Owned<Operation>(new RemoveSlave(info2))));
+    AWAIT_FALSE(registrar.apply(Owned<Operation>(new RemoveSlave(info2))));
   } else {
-    AWAIT_EQ(true, registrar.apply(Owned<Operation>(new RemoveSlave(info2))));
+    AWAIT_TRUE(registrar.apply(Owned<Operation>(new RemoveSlave(info2))));
   }
 
-  AWAIT_EQ(true, registrar.apply(Owned<Operation>(new RemoveSlave(info3))));
+  AWAIT_TRUE(registrar.apply(Owned<Operation>(new RemoveSlave(info3))));
 
   if (flags.registry_strict) {
-    AWAIT_EQ(false, registrar.apply(Owned<Operation>(new RemoveSlave(info3))));
+    AWAIT_FALSE(registrar.apply(Owned<Operation>(new RemoveSlave(info3))));
   } else {
-    AWAIT_EQ(true, registrar.apply(Owned<Operation>(new RemoveSlave(info3))));
+    AWAIT_TRUE(registrar.apply(Owned<Operation>(new RemoveSlave(info3))));
   }
 }
 
@@ -708,7 +740,7 @@ TEST_P(RegistrarTest, UpdateQuota)
     AWAIT_READY(registry);
 
     // Store quota for a role without quota.
-    AWAIT_EQ(true, registrar.apply(Owned<Operation>(new UpdateQuota(quota1))));
+    AWAIT_TRUE(registrar.apply(Owned<Operation>(new UpdateQuota(quota1))));
   }
 
   {
@@ -728,7 +760,7 @@ TEST_P(RegistrarTest, UpdateQuota)
     quota1.mutable_guarantee()->CopyFrom(quotaResources2);
 
     // Update the only stored quota.
-    AWAIT_EQ(true, registrar.apply(Owned<Operation>(new UpdateQuota(quota1))));
+    AWAIT_TRUE(registrar.apply(Owned<Operation>(new UpdateQuota(quota1))));
   }
 
   {
@@ -745,7 +777,7 @@ TEST_P(RegistrarTest, UpdateQuota)
     EXPECT_EQ(quotaResources2, storedResources);
 
     // Store one more quota for a role without quota.
-    AWAIT_EQ(true, registrar.apply(Owned<Operation>(new UpdateQuota(quota2))));
+    AWAIT_TRUE(registrar.apply(Owned<Operation>(new UpdateQuota(quota2))));
   }
 
   {
@@ -771,7 +803,7 @@ TEST_P(RegistrarTest, UpdateQuota)
     quota2.mutable_guarantee()->CopyFrom(quotaResources2);
 
     // Update quota for `role2` in presence of multiple quotas.
-    AWAIT_EQ(true, registrar.apply(Owned<Operation>(new UpdateQuota(quota2))));
+    AWAIT_TRUE(registrar.apply(Owned<Operation>(new UpdateQuota(quota2))));
   }
 
   {
@@ -834,8 +866,8 @@ TEST_P(RegistrarTest, RemoveQuota)
     Option<Error> validateError2 = quota::validation::quotaInfo(quota2);
     EXPECT_NONE(validateError2);
 
-    AWAIT_EQ(true, registrar.apply(Owned<Operation>(new UpdateQuota(quota1))));
-    AWAIT_EQ(true, registrar.apply(Owned<Operation>(new UpdateQuota(quota2))));
+    AWAIT_TRUE(registrar.apply(Owned<Operation>(new UpdateQuota(quota1))));
+    AWAIT_TRUE(registrar.apply(Owned<Operation>(new UpdateQuota(quota2))));
   }
 
   {
@@ -852,7 +884,7 @@ TEST_P(RegistrarTest, RemoveQuota)
     EXPECT_EQ(ROLE2, registry.get().quotas(1).info().role());
 
     // Remove quota for `role2`.
-    AWAIT_EQ(true, registrar.apply(Owned<Operation>(new RemoveQuota(ROLE2))));
+    AWAIT_TRUE(registrar.apply(Owned<Operation>(new RemoveQuota(ROLE2))));
   }
 
   {
@@ -865,7 +897,7 @@ TEST_P(RegistrarTest, RemoveQuota)
     EXPECT_EQ(ROLE1, registry.get().quotas(0).info().role());
 
     // Remove quota for `ROLE1`.
-    AWAIT_EQ(true, registrar.apply(Owned<Operation>(new RemoveQuota(ROLE1))));
+    AWAIT_TRUE(registrar.apply(Owned<Operation>(new RemoveQuota(ROLE1))));
   }
 
   {
@@ -879,6 +911,70 @@ TEST_P(RegistrarTest, RemoveQuota)
 }
 
 
+// Tests that updating weights in the registry works properly.
+TEST_P(RegistrarTest, UpdateWeights)
+{
+  const string ROLE1 = "role1";
+  double WEIGHT1 = 2.0;
+  double UPDATED_WEIGHT1 = 1.0;
+
+  const string ROLE2 = "role2";
+  double WEIGHT2 = 3.5;
+
+  {
+    // Prepare the registrar.
+    Registrar registrar(flags, state);
+    Future<Registry> registry = registrar.recover(master);
+    AWAIT_READY(registry);
+
+    ASSERT_EQ(0, registry.get().weights_size());
+
+    // Store the weight for 'ROLE1' previously without weight.
+    hashmap<string, double> weights;
+    weights[ROLE1] = WEIGHT1;
+    vector<WeightInfo> weightInfos = getWeightInfos(weights);
+
+    AWAIT_TRUE(registrar.apply(
+        Owned<Operation>(new UpdateWeights(weightInfos))));
+  }
+
+  {
+    Registrar registrar(flags, state);
+    Future<Registry> registry = registrar.recover(master);
+    AWAIT_READY(registry);
+
+    // Check that the recovered weights matches the weights we stored
+    // previously.
+    ASSERT_EQ(1, registry.get().weights_size());
+    EXPECT_EQ(ROLE1, registry.get().weights(0).info().role());
+    ASSERT_EQ(WEIGHT1, registry.get().weights(0).info().weight());
+
+    // Change weight for 'ROLE1', and store the weight for 'ROLE2'.
+    hashmap<string, double> weights;
+    weights[ROLE1] = UPDATED_WEIGHT1;
+    weights[ROLE2] = WEIGHT2;
+    vector<WeightInfo> weightInfos = getWeightInfos(weights);
+
+    AWAIT_TRUE(registrar.apply(
+        Owned<Operation>(new UpdateWeights(weightInfos))));
+  }
+
+  {
+    Registrar registrar(flags, state);
+    Future<Registry> registry = registrar.recover(master);
+    AWAIT_READY(registry);
+
+    // Check that the recovered weights matches the weights we updated
+    // previously.
+    ASSERT_EQ(2, registry.get().weights_size());
+    EXPECT_EQ(ROLE1, registry.get().weights(0).info().role());
+    ASSERT_EQ(UPDATED_WEIGHT1, registry.get().weights(0).info().weight());
+    EXPECT_EQ(ROLE2, registry.get().weights(1).info().role());
+    ASSERT_EQ(WEIGHT2, registry.get().weights(1).info().weight());
+  }
+}
+
+
 TEST_P(RegistrarTest, Bootstrap)
 {
   // Run 1 readmits a slave that is not present.
@@ -888,11 +984,9 @@ TEST_P(RegistrarTest, Bootstrap)
 
     // If not strict, we should be allowed to readmit the slave.
     if (flags.registry_strict) {
-      AWAIT_EQ(false,
-               registrar.apply(Owned<Operation>(new ReadmitSlave(slave))));
+      AWAIT_FALSE(registrar.apply(Owned<Operation>(new ReadmitSlave(slave))));
     } else {
-      AWAIT_EQ(true,
-               registrar.apply(Owned<Operation>(new ReadmitSlave(slave))));
+      AWAIT_TRUE(registrar.apply(Owned<Operation>(new ReadmitSlave(slave))));
     }
   }
 
@@ -1010,6 +1104,57 @@ TEST_P(RegistrarTest, Abort)
 }
 
 
+// Tests that requests to the '/registry' endpoint are authenticated when HTTP
+// authentication is enabled.
+TEST_P(RegistrarTest, Authentication)
+{
+  const string AUTHENTICATION_REALM = "realm";
+
+  Credentials credentials;
+  credentials.add_credentials()->CopyFrom(DEFAULT_CREDENTIAL);
+
+  Try<authentication::Authenticator*> authenticator =
+    BasicAuthenticatorFactory::create(AUTHENTICATION_REALM, credentials);
+
+  ASSERT_SOME(authenticator);
+
+  AWAIT_READY(authentication::setAuthenticator(
+      AUTHENTICATION_REALM,
+      Owned<authentication::Authenticator>(authenticator.get())));
+
+  Registrar registrar(flags, state, AUTHENTICATION_REALM);
+
+  // Requests without credentials should be rejected.
+  Future<Response> response = process::http::get(registrar.pid(), "registry");
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(Unauthorized({}).status, response)
+    << response.get().body;
+
+  Credential badCredential;
+  badCredential.set_principal("bad-principal");
+  badCredential.set_secret("bad-secret");
+
+  // Requests with bad credentials should be rejected.
+  response = process::http::get(
+      registrar.pid(),
+      "registry",
+      None(),
+      createBasicAuthHeaders(badCredential));
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(Unauthorized({}).status, response)
+    << response.get().body;
+
+  // Requests with good credentials should be permitted.
+  response = process::http::get(
+      registrar.pid(),
+      "registry",
+      None(),
+      createBasicAuthHeaders(DEFAULT_CREDENTIAL));
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
+    << response.get().body;
+
+  AWAIT_READY(authentication::unsetAuthenticator(AUTHENTICATION_REALM));
+}
+
+
 class Registrar_BENCHMARK_Test
   : public RegistrarTestBase,
     public WithParamInterface<size_t> {};
@@ -1055,7 +1200,7 @@ TEST_P(Registrar_BENCHMARK_Test, Performance)
     result = registrar.apply(Owned<Operation>(new AdmitSlave(info)));
   }
   AWAIT_READY_FOR(result, Minutes(5));
-  LOG(INFO) << "Admitted " << slaveCount << " slaves in " << watch.elapsed();
+  LOG(INFO) << "Admitted " << slaveCount << " agents in " << watch.elapsed();
 
   // Shuffle the slaves so we are readmitting them in random order (
   // same as in production).
@@ -1067,7 +1212,7 @@ TEST_P(Registrar_BENCHMARK_Test, Performance)
     result = registrar.apply(Owned<Operation>(new ReadmitSlave(info)));
   }
   AWAIT_READY_FOR(result, Minutes(5));
-  LOG(INFO) << "Readmitted " << slaveCount << " slaves in " << watch.elapsed();
+  LOG(INFO) << "Readmitted " << slaveCount << " agents in " << watch.elapsed();
 
   // Recover slaves.
   Registrar registrar2(flags, state);
@@ -1078,7 +1223,7 @@ TEST_P(Registrar_BENCHMARK_Test, Performance)
   info.set_port(5050);
   Future<Registry> registry = registrar2.recover(info);
   AWAIT_READY(registry);
-  LOG(INFO) << "Recovered " << slaveCount << " slaves ("
+  LOG(INFO) << "Recovered " << slaveCount << " agents ("
             << Bytes(registry.get().ByteSize()) << ") in " << watch.elapsed();
 
   // Shuffle the slaves so we are removing them in random order (same
@@ -1091,7 +1236,7 @@ TEST_P(Registrar_BENCHMARK_Test, Performance)
     result = registrar2.apply(Owned<Operation>(new RemoveSlave(info)));
   }
   AWAIT_READY_FOR(result, Minutes(5));
-  cout << "Removed " << slaveCount << " slaves in " << watch.elapsed() << endl;
+  cout << "Removed " << slaveCount << " agents in " << watch.elapsed() << endl;
 }
 
 } // namespace tests {

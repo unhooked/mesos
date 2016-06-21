@@ -11,8 +11,8 @@ There are different ways you can get Mesos:
 
 1\. Download the latest stable release from [Apache](http://mesos.apache.org/downloads/) (***Recommended***)
 
-    $ wget http://www.apache.org/dist/mesos/0.28.0/mesos-0.28.0.tar.gz
-    $ tar -zxf mesos-0.28.0.tar.gz
+    $ wget http://www.apache.org/dist/mesos/0.28.2/mesos-0.28.2.tar.gz
+    $ tar -zxf mesos-0.28.2.tar.gz
 
 2\. Clone the Mesos git [repository](https://git-wip-us.apache.org/repos/asf/mesos.git) (***Advanced Users Only***)
 
@@ -45,7 +45,7 @@ Following are the instructions for stock Ubuntu 14.04. If you are using a differ
     $ sudo apt-get install -y autoconf libtool
 
     # Install other Mesos dependencies.
-    $ sudo apt-get -y install build-essential python-dev python-boto libcurl4-nss-dev libsasl2-dev libsasl2-modules maven libapr1-dev libsvn-dev
+    $ sudo apt-get -y install build-essential python-dev libcurl4-nss-dev libsasl2-dev libsasl2-modules maven libapr1-dev libsvn-dev
 
 ### Mac OS X Yosemite & El Capitan
 
@@ -199,8 +199,8 @@ described in the ***Building Mesos*** section above.
     # Start mesos master (Ensure work directory exists and has proper permissions).
     $ ./bin/mesos-master.sh --ip=127.0.0.1 --work_dir=/var/lib/mesos
 
-    # Start mesos slave.
-    $ ./bin/mesos-slave.sh --master=127.0.0.1:5050
+    # Start mesos agent.
+    $ ./bin/mesos-agent.sh --master=127.0.0.1:5050
 
     # Visit the mesos web page.
     $ http://127.0.0.1:5050

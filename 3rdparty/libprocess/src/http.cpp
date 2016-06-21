@@ -10,7 +10,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License
 
+#ifndef __WINDOWS__
 #include <arpa/inet.h>
+#endif // __WINDOWS__
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -29,7 +31,6 @@
 #include <tuple>
 #include <vector>
 
-#include <process/async.hpp>
 #include <process/defer.hpp>
 #include <process/dispatch.hpp>
 #include <process/future.hpp>
@@ -452,7 +453,7 @@ bool Pipe::Reader::close()
 }
 
 
-bool Pipe::Writer::write(const string& s)
+bool Pipe::Writer::write(string s)
 {
   bool written = false;
   Owned<Promise<string>> read;
@@ -463,7 +464,7 @@ bool Pipe::Writer::write(const string& s)
       // Don't bother surfacing empty writes to the readers.
       if (!s.empty()) {
         if (data->reads.empty()) {
-          data->writes.push(s);
+          data->writes.push(std::move(s));
         } else {
           read = data->reads.front();
           data->reads.pop();
@@ -475,8 +476,8 @@ bool Pipe::Writer::write(const string& s)
 
   // NOTE: We set the promise outside the critical section to avoid
   // triggering callbacks that try to reacquire the lock.
-  if (read.get() != NULL) {
-    read->set(s);
+  if (read.get() != nullptr) {
+    read->set(std::move(s));
   }
 
   return written;
@@ -1156,11 +1157,18 @@ private:
 
 struct Connection::Data
 {
+  // We spawn `ConnectionProcess` as a managed process to guarantee
+  // that it does not wait on itself (this would cause a deadlock!).
+  // See MESOS-4658 for details.
+  //
+  // TODO(bmahler): This surfaces a general pattern that we
+  // should enforce: have libprocess manage a Process when
+  // it cannot be guaranteed that the Process will be waited
+  // on within a different execution context. More generally,
+  // we should be passing Process ownership to libprocess to
+  // ensure all interaction with a Process occurs through a PID.
   Data(const Socket& s)
-    : process(new internal::ConnectionProcess(s))
-  {
-    spawn(process.get());
-  }
+    : process(spawn(new internal::ConnectionProcess(s), true)) {}
 
   ~Data()
   {
@@ -1169,11 +1177,10 @@ struct Connection::Data
     // to ensure we don't drop any queued request dispatches
     // which would leave the caller with a future stuck in
     // a pending state.
-    terminate(process.get(), false);
-    wait(process.get());
+    terminate(process, false);
   }
 
-  Owned<internal::ConnectionProcess> process;
+  PID<internal::ConnectionProcess> process;
 };
 
 
@@ -1186,7 +1193,7 @@ Future<Response> Connection::send(
     bool streamedResponse)
 {
   return dispatch(
-      data->process.get(),
+      data->process,
       &internal::ConnectionProcess::send,
       request,
       streamedResponse);
@@ -1196,7 +1203,7 @@ Future<Response> Connection::send(
 Future<Nothing> Connection::disconnect()
 {
   return dispatch(
-      data->process.get(),
+      data->process,
       &internal::ConnectionProcess::disconnect,
       None());
 }
@@ -1205,7 +1212,7 @@ Future<Nothing> Connection::disconnect()
 Future<Nothing> Connection::disconnected()
 {
   return dispatch(
-      data->process.get(),
+      data->process,
       &internal::ConnectionProcess::disconnected);
 }
 
@@ -1319,20 +1326,16 @@ Future<Response> request(const Request& request, bool streamedResponse)
   // We rely on the connection closing after the response.
   CHECK(!request.keepAlive);
 
-  // This is a one time request which will close the connection when
-  // the response is received. Since 'Connection' is reference-counted,
-  // we must keep a copy around until the disconnection occurs. Note
-  // that in order to avoid a deadlock (Connection destruction occurring
-  // from the ConnectionProcess execution context), we use 'async'.
   return http::connect(request.url)
     .then([=](Connection connection) {
       Future<Response> response = connection.send(request, streamedResponse);
 
-      Connection* copy = new Connection(std::move(connection));
-      auto deleter = [copy](){ delete copy; };
-
-      copy->disconnected()
-        .onAny([=]() { async(deleter); });
+      // This is a non Keep-Alive request which means the connection
+      // will be closed when the response is received. Since the
+      // 'Connection' is reference-counted, we must maintain a copy
+      // until the disconnection occurs.
+      connection.disconnected()
+        .onAny([connection]() {});
 
       return response;
     });

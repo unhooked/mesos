@@ -95,7 +95,7 @@ public:
     if (strings::contains(test->test_case_name(), pattern) ||
         strings::contains(test->name(), pattern)) {
       return true;
-    } else if (test->type_param() != NULL &&
+    } else if (test->type_param() != nullptr &&
                strings::contains(test->type_param(), pattern)) {
       return true;
     }
@@ -248,6 +248,31 @@ public:
 
 private:
   bool curlError;
+};
+
+
+class NvidiaGpuFilter : public TestFilter
+{
+public:
+  NvidiaGpuFilter()
+  {
+    exists = os::system("which nvidia-smi") == 0;
+    if (!exists) {
+      std::cerr
+        << "-------------------------------------------------------------\n"
+        << "No 'nvidia-smi' command found so no Nvidia GPU tests will run\n"
+        << "-------------------------------------------------------------"
+        << std::endl;
+    }
+  }
+
+  bool disable(const ::testing::TestInfo* test) const
+  {
+    return matches(test, "NVIDIA_GPU_") && !exists;
+  }
+
+private:
+  bool exists;
 };
 
 
@@ -459,38 +484,69 @@ private:
 };
 
 
-class OverlayFSTestFilter : public TestFilter
+class SupportedFilesystemTestFilter : public TestFilter
 {
 public:
-  OverlayFSTestFilter()
+  explicit SupportedFilesystemTestFilter(const string fsname)
   {
 #ifdef __linux__
-    Try<bool> check = fs::supported("overlayfs");
+    Try<bool> check = fs::supported(fsname);
     if (check.isError()) {
-      overlayfsError = check.error();
+      fsSupportError = check.error();
     } else if (!check.get()) {
-      overlayfsError = Error("Overlayfs is not supported on your systems");
+      fsSupportError = Error(fsname + " is not supported on your systems");
     }
 #else
-    overlayfsError =
-      Error("Overlayfs tests not supported on non-Linux systems");
-#endif // __linux__
-    if (overlayfsError.isSome()) {
+    fsSupportError =
+      Error(fsname + " tests not supported on non-Linux systems");
+#endif
+
+    if (fsSupportError.isSome()) {
       std::cerr
         << "-------------------------------------------------------------\n"
-        << "We cannot run any overlayfs tests because:\n"
-        << overlayfsError.get().message << "\n"
+        << "We cannot run any " << fsname << " tests because:\n"
+        << fsSupportError.get().message << "\n"
         << "-------------------------------------------------------------\n";
     }
   }
 
+  Option<Error> fsSupportError;
+};
+
+
+class AufsFilter : public SupportedFilesystemTestFilter
+{
+public:
+  AufsFilter() : SupportedFilesystemTestFilter("aufs") {}
+
   bool disable(const ::testing::TestInfo* test) const
   {
-    return overlayfsError.isSome() && matches(test, "OVERLAYFS_");
+    return fsSupportError.isSome() && matches(test, "AUFS_");
   }
+};
 
-private:
-  Option<Error> overlayfsError;
+
+class OverlayFSFilter : public SupportedFilesystemTestFilter
+{
+public:
+  OverlayFSFilter() : SupportedFilesystemTestFilter("overlayfs") {}
+
+  bool disable(const ::testing::TestInfo* test) const
+  {
+    return fsSupportError.isSome() && matches(test, "OVERLAYFS_");
+  }
+};
+
+
+class XfsFilter : public SupportedFilesystemTestFilter
+{
+public:
+  XfsFilter() : SupportedFilesystemTestFilter("xfs") {}
+
+  bool disable(const ::testing::TestInfo* test) const
+  {
+    return fsSupportError.isSome() && matches(test, "XFS_");
+  }
 };
 
 
@@ -600,6 +656,31 @@ public:
 };
 
 
+class UnzipFilter : public TestFilter
+{
+public:
+  UnzipFilter()
+  {
+    unzipError = os::system("which unzip") != 0;
+    if (unzipError) {
+      std::cerr
+        << "-------------------------------------------------------------\n"
+        << "No 'unzip' command found so no 'unzip' tests will be run\n"
+        << "-------------------------------------------------------------"
+        << std::endl;
+    }
+  }
+
+  bool disable(const ::testing::TestInfo* test) const
+  {
+    return matches(test, "UNZIP_") && unzipError;
+  }
+
+private:
+  bool unzipError;
+};
+
+
 // Return list of disabled tests based on test name based filters.
 static vector<string> disabled(
     const ::testing::UnitTest* unitTest,
@@ -666,6 +747,7 @@ Environment::Environment(const Flags& _flags) : flags(_flags)
 
   vector<Owned<TestFilter> > filters;
 
+  filters.push_back(Owned<TestFilter>(new AufsFilter()));
   filters.push_back(Owned<TestFilter>(new BenchmarkFilter()));
   filters.push_back(Owned<TestFilter>(new CfsFilter()));
   filters.push_back(Owned<TestFilter>(new CgroupsFilter()));
@@ -676,10 +758,13 @@ Environment::Environment(const Flags& _flags) : flags(_flags)
   filters.push_back(Owned<TestFilter>(new NetcatFilter()));
   filters.push_back(Owned<TestFilter>(new NetClsCgroupsFilter()));
   filters.push_back(Owned<TestFilter>(new NetworkIsolatorTestFilter()));
-  filters.push_back(Owned<TestFilter>(new OverlayFSTestFilter()));
+  filters.push_back(Owned<TestFilter>(new NvidiaGpuFilter()));
+  filters.push_back(Owned<TestFilter>(new OverlayFSFilter()));
   filters.push_back(Owned<TestFilter>(new PerfCPUCyclesFilter()));
   filters.push_back(Owned<TestFilter>(new PerfFilter()));
   filters.push_back(Owned<TestFilter>(new RootFilter()));
+  filters.push_back(Owned<TestFilter>(new UnzipFilter()));
+  filters.push_back(Owned<TestFilter>(new XfsFilter()));
 
   // Construct the filter string to handle system or platform specific tests.
   ::testing::UnitTest* unitTest = ::testing::UnitTest::GetInstance();
@@ -695,6 +780,11 @@ Environment::Environment(const Flags& _flags) : flags(_flags)
 
   listeners.Append(process::FilterTestEventListener::instance());
   listeners.Append(process::ClockTestEventListener::instance());
+
+  // Add the temporary directory event listener which will clean up
+  // any directories created after each test finishes.
+  temporaryDirectoryEventListener = new TemporaryDirectoryEventListener();
+  listeners.Append(temporaryDirectoryEventListener);
 }
 
 
@@ -702,7 +792,7 @@ void Environment::SetUp()
 {
   // Clear any MESOS_ environment variables so they don't affect our tests.
   char** environ = os::raw::environment();
-  for (int i = 0; environ[i] != NULL; i++) {
+  for (int i = 0; environ[i] != nullptr; i++) {
     string variable = environ[i];
     if (variable.find("MESOS_") == 0) {
       string key;
@@ -723,12 +813,35 @@ void Environment::SetUp()
   }
 
   if (!GTEST_IS_THREADSAFE) {
-    EXIT(1) << "Testing environment is not thread safe, bailing!";
+    EXIT(EXIT_FAILURE) << "Testing environment is not thread safe, bailing!";
   }
 }
 
 
 void Environment::TearDown()
+{
+  // Make sure we haven't left any child processes lying around.
+  // TODO(benh): Look for processes in the same group or session that
+  // might have been reparented.
+  // TODO(jmlvanre): Consider doing this `OnTestEnd` in a listener so
+  // that we can identify leaked processes more precisely.
+  Try<os::ProcessTree> pstree = os::pstree(0);
+
+  if (pstree.isSome() && !pstree.get().children.empty()) {
+    FAIL() << "Tests completed with child processes remaining:\n"
+           << pstree.get();
+  }
+}
+
+
+Try<string> Environment::mkdtemp()
+{
+  return temporaryDirectoryEventListener->mkdtemp();
+}
+
+
+void tests::Environment::TemporaryDirectoryEventListener::OnTestEnd(
+    const testing::TestInfo&)
 {
   foreach (const string& directory, directories) {
 #ifdef __linux__
@@ -753,26 +866,17 @@ void Environment::TearDown()
                  << "': " << rmdir.error();
     }
   }
+
   directories.clear();
-
-  // Make sure we haven't left any child processes lying around.
-  // TODO(benh): Look for processes in the same group or session that
-  // might have been reparented.
-  Try<os::ProcessTree> pstree = os::pstree(0);
-
-  if (pstree.isSome() && !pstree.get().children.empty()) {
-    FAIL() << "Tests completed with child processes remaining:\n"
-           << pstree.get();
-  }
 }
 
 
-Try<string> Environment::mkdtemp()
+Try<string> Environment::TemporaryDirectoryEventListener::mkdtemp()
 {
   const ::testing::TestInfo* const testInfo =
     ::testing::UnitTest::GetInstance()->current_test_info();
 
-  if (testInfo == NULL) {
+  if (testInfo == nullptr) {
     return Error("Failed to determine the current test information");
   }
 
@@ -791,8 +895,14 @@ Try<string> Environment::mkdtemp()
     testName = strings::remove(testName, "DISABLED_", strings::PREFIX);
   }
 
+  Option<string> tmpdir = os::getenv("TMPDIR");
+
+  if (tmpdir.isNone()) {
+    tmpdir = "/tmp";
+  }
+
   const string& path =
-    path::join("/tmp", strings::join("_", testCase, testName, "XXXXXX"));
+    path::join(tmpdir.get(), strings::join("_", testCase, testName, "XXXXXX"));
 
   Try<string> mkdtemp = os::mkdtemp(path);
   if (mkdtemp.isSome()) {

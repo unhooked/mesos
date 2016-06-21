@@ -64,6 +64,8 @@ using mesos::internal::master::allocator::MesosAllocatorProcess;
 
 using mesos::internal::slave::Slave;
 
+using mesos::master::detector::MasterDetector;
+
 using mesos::v1::scheduler::Call;
 using mesos::v1::scheduler::Event;
 using mesos::v1::scheduler::Mesos;
@@ -123,13 +125,6 @@ public:
 
     // Initialize the default `Unavailability`.
     unavailability = createUnavailability(Clock::now());
-  }
-
-  virtual master::Flags CreateMasterFlags()
-  {
-    master::Flags masterFlags = MesosTest::CreateMasterFlags();
-    masterFlags.authenticate_frameworks = false;
-    return masterFlags;
   }
 
   virtual slave::Flags CreateSlaveFlags()
@@ -378,8 +373,6 @@ TEST_F(MasterMaintenanceTest, FailToUnscheduleDeactivatedMachines)
 // slave is scheduled to go down for maintenance.
 TEST_F(MasterMaintenanceTest, PendingUnavailabilityTest)
 {
-  // Set up a master.
-  // NOTE: We don't use `StartMaster()` because we need to access these flags.
   master::Flags flags = CreateMasterFlags();
 
   Try<Owned<cluster::Master>> master = StartMaster(flags);
@@ -441,9 +434,11 @@ TEST_F(MasterMaintenanceTest, PendingUnavailabilityTest)
     .WillOnce(FutureSatisfy(&offerRescinded));
 
   Future<Event::Offers> unavailabilityOffers;
-  Future<Event::Offers> inverseOffers;
   EXPECT_CALL(*scheduler, offers(_, _))
-    .WillOnce(FutureArg<1>(&unavailabilityOffers))
+    .WillOnce(FutureArg<1>(&unavailabilityOffers));
+
+  Future<Event::InverseOffers> inverseOffers;
+  EXPECT_CALL(*scheduler, inverseOffers(_, _))
     .WillOnce(FutureArg<1>(&inverseOffers));
 
   // Schedule this slave for maintenance.
@@ -713,7 +708,7 @@ TEST_F(MasterMaintenanceTest, EnterMaintenanceMode)
   Clock::advance(slaveFlags.executor_shutdown_grace_period);
   Clock::resume();
 
-  // Wait on the agent to terminate so that it wipes out it's latest symlink.
+  // Wait on the agent to terminate so that it wipes out its latest symlink.
   // This way when we launch a new agent it will register with a new agent id.
   wait(slave.get()->pid);
 
@@ -727,7 +722,7 @@ TEST_F(MasterMaintenanceTest, EnterMaintenanceMode)
 
   AWAIT_READY(shutdownMessage);
 
-  // Wait on the agent to terminate so that it wipes out it's latest symlink.
+  // Wait on the agent to terminate so that it wipes out its latest symlink.
   // This way when we launch a new agent it will register with a new agent id.
   wait(slave.get()->pid);
 
@@ -1083,8 +1078,8 @@ TEST_F(MasterMaintenanceTest, InverseOffers)
   Callbacks callbacks;
   Queue<Event> events;
 
-  // Set up a master.
   master::Flags masterFlags = CreateMasterFlags();
+
   Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
   ASSERT_SOME(master);
 
@@ -1092,6 +1087,7 @@ TEST_F(MasterMaintenanceTest, InverseOffers)
   TestContainerizer containerizer(&exec);
 
   Owned<MasterDetector> detector = master.get()->createDetector();
+
   Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), &containerizer);
   ASSERT_SOME(slave);
 
@@ -1149,7 +1145,8 @@ TEST_F(MasterMaintenanceTest, InverseOffers)
       ContentType::PROTOBUF,
       lambda::bind(&Callbacks::connected, lambda::ref(callbacks)),
       lambda::bind(&Callbacks::disconnected, lambda::ref(callbacks)),
-      lambda::bind(&Callbacks::received, lambda::ref(callbacks), lambda::_1));
+      lambda::bind(&Callbacks::received, lambda::ref(callbacks), lambda::_1),
+      DEFAULT_V1_CREDENTIAL);
 
   AWAIT_READY(connected);
 
@@ -1177,7 +1174,6 @@ TEST_F(MasterMaintenanceTest, InverseOffers)
   AWAIT_READY(event);
   EXPECT_EQ(Event::OFFERS, event.get().type());
   EXPECT_NE(0, event.get().offers().offers().size());
-  EXPECT_EQ(0, event.get().offers().inverse_offers().size());
 
   // All the offers should have unavailability.
   foreach (const v1::Offer& offer, event.get().offers().offers()) {
@@ -1217,12 +1213,12 @@ TEST_F(MasterMaintenanceTest, InverseOffers)
   // Expect an inverse offer.
   event = events.get();
   AWAIT_READY(event);
-  EXPECT_EQ(Event::OFFERS, event.get().type());
-  EXPECT_EQ(0, event.get().offers().offers().size());
-  EXPECT_EQ(1, event.get().offers().inverse_offers().size());
+  EXPECT_EQ(Event::INVERSE_OFFERS, event.get().type());
+  EXPECT_EQ(1, event.get().inverse_offers().inverse_offers().size());
 
   // Save this inverse offer so we can decline it later.
-  v1::InverseOffer inverseOffer = event.get().offers().inverse_offers(0);
+  v1::InverseOffer inverseOffer =
+    event.get().inverse_offers().inverse_offers(0);
 
   // Wait for the task to start running.
   event = events.get();
@@ -1254,10 +1250,10 @@ TEST_F(MasterMaintenanceTest, InverseOffers)
     // Decline an inverse offer, with a filter.
     Call call;
     call.mutable_framework_id()->CopyFrom(id);
-    call.set_type(Call::DECLINE);
+    call.set_type(Call::DECLINE_INVERSE_OFFERS);
 
-    Call::Decline* decline = call.mutable_decline();
-    decline->add_offer_ids()->CopyFrom(inverseOffer.id());
+    Call::DeclineInverseOffers* decline = call.mutable_decline_inverse_offers();
+    decline->add_inverse_offer_ids()->CopyFrom(inverseOffer.id());
 
     // Set a 0 second filter to immediately get another inverse offer.
     v1::Filters filters;
@@ -1276,12 +1272,11 @@ TEST_F(MasterMaintenanceTest, InverseOffers)
   // Expect another inverse offer.
   event = events.get();
   AWAIT_READY(event);
-  EXPECT_EQ(Event::OFFERS, event.get().type());
+  EXPECT_EQ(Event::INVERSE_OFFERS, event.get().type());
   Clock::resume();
 
-  EXPECT_EQ(0, event.get().offers().offers().size());
-  EXPECT_EQ(1, event.get().offers().inverse_offers().size());
-  inverseOffer = event.get().offers().inverse_offers(0);
+  EXPECT_EQ(1, event.get().inverse_offers().inverse_offers().size());
+  inverseOffer = event.get().inverse_offers().inverse_offers(0);
 
   // Check that the status endpoint shows the inverse offer as declined.
   response = process::http::get(
@@ -1319,10 +1314,10 @@ TEST_F(MasterMaintenanceTest, InverseOffers)
     // Accept an inverse offer, with filter.
     Call call;
     call.mutable_framework_id()->CopyFrom(id);
-    call.set_type(Call::ACCEPT);
+    call.set_type(Call::ACCEPT_INVERSE_OFFERS);
 
-    Call::Accept* accept = call.mutable_accept();
-    accept->add_offer_ids()->CopyFrom(inverseOffer.id());
+    Call::AcceptInverseOffers* accept = call.mutable_accept_inverse_offers();
+    accept->add_inverse_offer_ids()->CopyFrom(inverseOffer.id());
 
     // Set a 0 second filter to immediately get another inverse offer.
     v1::Filters filters;
@@ -1341,11 +1336,10 @@ TEST_F(MasterMaintenanceTest, InverseOffers)
   // Expect yet another inverse offer.
   event = events.get();
   AWAIT_READY(event);
-  EXPECT_EQ(Event::OFFERS, event.get().type());
+  EXPECT_EQ(Event::INVERSE_OFFERS, event.get().type());
   Clock::resume();
 
-  EXPECT_EQ(0, event.get().offers().offers().size());
-  EXPECT_EQ(1, event.get().offers().inverse_offers().size());
+  EXPECT_EQ(1, event.get().inverse_offers().inverse_offers().size());
 
   // Check that the status endpoint shows the inverse offer as accepted.
   response = process::http::get(
@@ -1392,8 +1386,6 @@ TEST_F(MasterMaintenanceTest, InverseOffersFilters)
   Callbacks callbacks;
   Queue<Event> events;
 
-  // Set up a master.
-  // NOTE: We don't use `StartMaster()` because we need to access these flags.
   master::Flags flags = CreateMasterFlags();
 
   Try<Owned<cluster::Master>> master = StartMaster(flags);
@@ -1478,10 +1470,6 @@ TEST_F(MasterMaintenanceTest, InverseOffersFilters)
 
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
 
-  // Pause the clock before starting a framework.
-  // This ensures deterministic offer-ing behavior during the test.
-  Clock::pause();
-
   // Now start a framework.
   Future<Nothing> connected;
   EXPECT_CALL(callbacks, connected())
@@ -1493,12 +1481,17 @@ TEST_F(MasterMaintenanceTest, InverseOffersFilters)
       ContentType::PROTOBUF,
       lambda::bind(&Callbacks::connected, lambda::ref(callbacks)),
       lambda::bind(&Callbacks::disconnected, lambda::ref(callbacks)),
-      lambda::bind(&Callbacks::received, lambda::ref(callbacks), lambda::_1));
+      lambda::bind(&Callbacks::received, lambda::ref(callbacks), lambda::_1),
+      DEFAULT_V1_CREDENTIAL);
 
   AWAIT_READY(connected);
 
   EXPECT_CALL(callbacks, received(_))
     .WillRepeatedly(Enqueue(&events));
+
+  // Pause the clock before subscribing the framework.
+  // This ensures deterministic offer-ing behavior during the test.
+  Clock::pause();
 
   {
     Call call;
@@ -1523,7 +1516,6 @@ TEST_F(MasterMaintenanceTest, InverseOffersFilters)
   AWAIT_READY(event);
   EXPECT_EQ(Event::OFFERS, event.get().type());
   EXPECT_EQ(2, event.get().offers().offers().size());
-  EXPECT_EQ(0, event.get().offers().inverse_offers().size());
 
   // All the offers should have unavailability.
   foreach (const v1::Offer& offer, event.get().offers().offers()) {
@@ -1576,13 +1568,15 @@ TEST_F(MasterMaintenanceTest, InverseOffersFilters)
   // Expect two inverse offers.
   event = events.get();
   AWAIT_READY(event);
-  EXPECT_EQ(Event::OFFERS, event.get().type());
-  EXPECT_EQ(0, event.get().offers().offers().size());
-  EXPECT_EQ(2, event.get().offers().inverse_offers().size());
+  EXPECT_EQ(Event::INVERSE_OFFERS, event.get().type());
+  EXPECT_EQ(2, event.get().inverse_offers().inverse_offers().size());
 
   // Save these inverse offers.
-  v1::InverseOffer inverseOffer1 = event.get().offers().inverse_offers(0);
-  v1::InverseOffer inverseOffer2 = event.get().offers().inverse_offers(1);
+  v1::InverseOffer inverseOffer1 =
+    event.get().inverse_offers().inverse_offers(0);
+
+  v1::InverseOffer inverseOffer2 =
+    event.get().inverse_offers().inverse_offers(1);
 
   // We want to acknowledge TASK_RUNNING updates for the two tasks we
   // have launched. We don't know which task will be launched first,
@@ -1652,10 +1646,10 @@ TEST_F(MasterMaintenanceTest, InverseOffersFilters)
     // allocations for the remainder of this test.
     Call call;
     call.mutable_framework_id()->CopyFrom(id);
-    call.set_type(Call::DECLINE);
+    call.set_type(Call::DECLINE_INVERSE_OFFERS);
 
-    Call::Decline* decline = call.mutable_decline();
-    decline->add_offer_ids()->CopyFrom(inverseOffer2.id());
+    Call::DeclineInverseOffers* decline = call.mutable_decline_inverse_offers();
+    decline->add_inverse_offer_ids()->CopyFrom(inverseOffer2.id());
 
     v1::Filters filters;
     filters.set_refuse_seconds(flags.allocation_interval.secs() + 100);
@@ -1675,10 +1669,10 @@ TEST_F(MasterMaintenanceTest, InverseOffersFilters)
   {
     Call call;
     call.mutable_framework_id()->CopyFrom(id);
-    call.set_type(Call::ACCEPT);
+    call.set_type(Call::ACCEPT_INVERSE_OFFERS);
 
-    Call::Accept* accept = call.mutable_accept();
-    accept->add_offer_ids()->CopyFrom(inverseOffer1.id());
+    Call::AcceptInverseOffers* accept = call.mutable_accept_inverse_offers();
+    accept->add_inverse_offer_ids()->CopyFrom(inverseOffer1.id());
 
     v1::Filters filters;
     filters.set_refuse_seconds(0);
@@ -1695,14 +1689,13 @@ TEST_F(MasterMaintenanceTest, InverseOffersFilters)
   event = events.get();
   AWAIT_READY(event);
 
-  EXPECT_EQ(Event::OFFERS, event.get().type());
-  EXPECT_EQ(0, event.get().offers().offers().size());
-  EXPECT_EQ(1, event.get().offers().inverse_offers().size());
+  EXPECT_EQ(Event::INVERSE_OFFERS, event.get().type());
+  EXPECT_EQ(1, event.get().inverse_offers().inverse_offers().size());
   EXPECT_EQ(
       inverseOffer1.agent_id(),
-      event.get().offers().inverse_offers(0).agent_id());
+      event.get().inverse_offers().inverse_offers(0).agent_id());
 
-  inverseOffer1 = event.get().offers().inverse_offers(0);
+  inverseOffer1 = event.get().inverse_offers().inverse_offers(0);
 
   updateInverseOffer =
     FUTURE_DISPATCH(_, &MesosAllocatorProcess::updateInverseOffer);
@@ -1711,10 +1704,10 @@ TEST_F(MasterMaintenanceTest, InverseOffersFilters)
     // Do another immediate filter, but decline it this time.
     Call call;
     call.mutable_framework_id()->CopyFrom(id);
-    call.set_type(Call::DECLINE);
+    call.set_type(Call::DECLINE_INVERSE_OFFERS);
 
-    Call::Decline* decline = call.mutable_decline();
-    decline->add_offer_ids()->CopyFrom(inverseOffer1.id());
+    Call::DeclineInverseOffers* decline = call.mutable_decline_inverse_offers();
+    decline->add_inverse_offer_ids()->CopyFrom(inverseOffer1.id());
 
     v1::Filters filters;
     filters.set_refuse_seconds(0);
@@ -1731,12 +1724,11 @@ TEST_F(MasterMaintenanceTest, InverseOffersFilters)
   event = events.get();
   AWAIT_READY(event);
 
-  EXPECT_EQ(Event::OFFERS, event.get().type());
-  EXPECT_EQ(0, event.get().offers().offers().size());
-  EXPECT_EQ(1, event.get().offers().inverse_offers().size());
+  EXPECT_EQ(Event::INVERSE_OFFERS, event.get().type());
+  EXPECT_EQ(1, event.get().inverse_offers().inverse_offers().size());
   EXPECT_EQ(
       inverseOffer1.agent_id(),
-      event.get().offers().inverse_offers(0).agent_id());
+      event.get().inverse_offers().inverse_offers(0).agent_id());
 
   EXPECT_CALL(exec1, shutdown(_))
     .Times(AtMost(1));

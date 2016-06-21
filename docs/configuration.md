@@ -6,10 +6,10 @@ layout: documentation
 
 # Mesos Configuration
 
-The Mesos master and slave can take a variety of configuration options
+The Mesos master and agent can take a variety of configuration options
 through command-line arguments, or environment variables. A list of
 the available options can be seen by running `mesos-master --help` or
-`mesos-slave --help`. Each option can be set in two ways:
+`mesos-agent --help`. Each option can be set in two ways:
 
 * By passing it to the binary using `--option_name=value`, either
 specifying the value directly, or specifying a file in which the value
@@ -31,9 +31,9 @@ definitive source for which flags your version of Mesos supports can
 be found by running the binary with the flag `--help`, for example
 `mesos-master --help`.
 
-## Master and Slave Options
+## Master and Agent Options
 
-*These options can be supplied to both masters and slaves.*
+*These options can be supplied to both masters and agents.*
 
 <table class="table table-striped">
   <thead>
@@ -51,9 +51,9 @@ be found by running the binary with the flag `--help`, for example
     --advertise_ip=VALUE
   </td>
   <td>
-IP address advertised to reach this Mesos master/slave.
-The master/slave does not bind to this IP address.
-However, this IP address may be used to access this master/slave.
+IP address advertised to reach this Mesos master/agent.
+The master/agent does not bind to this IP address.
+However, this IP address may be used to access this master/agent.
   </td>
 </tr>
 <tr>
@@ -61,10 +61,31 @@ However, this IP address may be used to access this master/slave.
     --advertise_port=VALUE
   </td>
   <td>
-Port advertised to reach this Mesos master/slave (along with
-<code>advertise_ip</code>). The master/slave does not bind using this port.
+Port advertised to reach this Mesos master/agent (along with
+<code>advertise_ip</code>). The master/agent does not bind using this port.
 However, this port (along with <code>advertise_ip</code>) may be used to
-access Mesos master/slave.
+access Mesos master/agent.
+  </td>
+</tr>
+<tr>
+  <td>
+    --[no-]authenticate_http
+  </td>
+  <td>
+If <code>true</code>, only authenticated requests for HTTP endpoints supporting
+authentication are allowed. If <code>false</code>, unauthenticated requests to
+HTTP endpoints are also allowed. (default: false)
+  </td>
+</tr>
+<tr>
+  <td>
+    --[no-]authenticate_http_frameworks
+  </td>
+  <td>
+If <code>true</code>, only authenticated HTTP based frameworks are allowed to
+register. If <code>false</code>, HTTP frameworks are not authenticated. For more
+about HTTP frameworks see the Scheduler HTTP API
+<a href="/documentation/latest/scheduler-http-api">documentation</a>. (default: false)
   </td>
 </tr>
 <tr>
@@ -100,11 +121,38 @@ Show the help message and exit. (default: false)
 </tr>
 <tr>
   <td>
+    --http_authenticators=VALUE
+  </td>
+  <td>
+HTTP authenticator implementation to use when handling requests to
+authenticated endpoints. Use the default
+<code>basic</code>, or load an alternate
+HTTP authenticator module using <code>--modules</code>.
+<p/>
+Currently there is no support for multiple HTTP authenticators. (default: basic)
+  </td>
+</tr>
+<tr>
+  <td>
+    --http_framework_authenticators=VALUE
+  </td>
+  <td>
+HTTP authenticator implementation to use when authenticating HTTP frameworks.
+Use the <code>basic</code> authenticator or load an alternate HTTP authenticator
+module using <code>--modules</code>. This must be used in conjunction with
+<code>--authenticate_http_frameworks</code>.
+<p/>
+Currently there is no support for multiple HTTP authenticators.
+  </td>
+</tr>
+
+<tr>
+  <td>
     --ip=VALUE
   </td>
   <td>
 IP address to listen on. This cannot be used in conjunction
-with <code>--ip_discovery_command</code>. (master default: 5050; slave default: 5051)
+with <code>--ip_discovery_command</code>. (master default: 5050; agent default: 5051)
   </td>
 </tr>
 <tr>
@@ -113,7 +161,7 @@ with <code>--ip_discovery_command</code>. (master default: 5050; slave default: 
   </td>
   <td>
 Optional IP discovery binary: if set, it is expected to emit
-the IP address which the master/slave will try to bind to.
+the IP address which the master/agent will try to bind to.
 Cannot be used in conjunction with <code>--ip</code>.
   </td>
 </tr>
@@ -138,7 +186,7 @@ Show version and exit. (default: false)
     --hooks=VALUE
   </td>
   <td>
-A comma-separated list of hook modules to be installed inside master/slave.
+A comma-separated list of hook modules to be installed inside master/agent.
   </td>
 </tr>
 <tr>
@@ -146,10 +194,10 @@ A comma-separated list of hook modules to be installed inside master/slave.
     --hostname=VALUE
   </td>
   <td>
-The hostname the slave node should report, or that the master
+The hostname the agent node should report, or that the master
 should advertise in ZooKeeper.
 If left unset, the hostname is resolved from the IP address
-that the master/slave binds to; unless the user explicitly prevents
+that the master/agent binds to; unless the user explicitly prevents
 that, using <code>--no-hostname_lookup</code>, in which case the IP itself
 is used.
   </td>
@@ -213,7 +261,7 @@ Example:
 </tr>
 </table>
 
-*These logging options can also be supplied to both masters and slaves.*
+*These logging options can also be supplied to both masters and agents.*
 For more about logging, see the [logging documentation](logging.md).
 
 <table class="table table-striped">
@@ -272,10 +320,10 @@ written to <code>--log_dir</code>, if specified. (default: INFO)
     --[no-]initialize_driver_logging
   </td>
   <td>
-Whether the master/slave should initialize Google logging for the
+Whether the master/agent should initialize Google logging for the
 Mesos scheduler and executor drivers, in same way as described here.
 The scheduler/executor drivers have separate logs and do not get
-written to the master/slave logs.
+written to the master/agent logs.
 <p/>
 This option has no effect when using the HTTP scheduler/executor APIs.
 (default: true)
@@ -331,8 +379,11 @@ masters i.e., <code>quorum > (number of masters)/2</code>.
     --work_dir=VALUE
   </td>
   <td>
-Directory path to store the persistent information stored in the
-Registry. (example: <code>/var/lib/mesos/master</code>)
+Path of the master work directory. This is where the persistent
+information of the cluster will be stored. Note that locations like
+<code>/tmp</code> which are cleaned automatically are not suitable for the work
+directory when running in production, since long-running masters could
+lose data when cleanup occurs. (Example: <code>/var/lib/mesos/master</code>)
   </td>
 </tr>
 <tr>
@@ -377,7 +428,7 @@ Note that if the flag <code>--authorizers</code> is provided with a value
 different than <code>local</code>, the ACLs contents will be
 ignored.
 <p/>
-See the ACLs protobuf in authorizer.proto for the expected format.
+See the ACLs protobuf in acls.proto for the expected format.
 <p/>
 Example:
 <pre><code>{
@@ -410,6 +461,12 @@ Example:
       "principals": { "values": ["a"] },
       "quota_principals": { "values": ["a"] }
     }
+  ],
+  "get_endpoints": [
+    {
+      "principals": { "values": ["a"] },
+      "paths": { "values": ["/flags"] }
+    }
   ]
 }</code></pre>
   </td>
@@ -440,27 +497,17 @@ load an alternate allocator module using <code>--modules</code>.
   </td>
   <td>
 If <code>true</code>, only authenticated frameworks are allowed to register. If
-<code>false</code>, unauthenticated frameworks are also allowed to register. (default: false)
+<code>false</code>, unauthenticated frameworks are also allowed to register. For
+HTTP based frameworks use the <code>--authenticate_http_frameworks</code> flag. (default: false)
   </td>
 </tr>
 <tr>
   <td>
-    --[no-]authenticate_http
+    --[no-]authenticate_agents
   </td>
   <td>
-If <code>true</code> only authenticated requests for HTTP endpoints supporting
-authentication are allowed.
-If <code>false</code> unauthenticated HTTP endpoint requests are also allowed.
-(default: false)
-  </td>
-</tr>
-<tr>
-  <td>
-    --[no-]authenticate_slaves
-  </td>
-  <td>
-If <code>true</code> only authenticated slaves are allowed to register.
-If <code>false</code> unauthenticated slaves are also allowed to register. (default: false)
+If <code>true</code> only authenticated agents are allowed to register.
+If <code>false</code> unauthenticated agents are also allowed to register. (default: false)
   </td>
 </tr>
 <tr>
@@ -469,7 +516,7 @@ If <code>false</code> unauthenticated slaves are also allowed to register. (defa
   </td>
   <td>
 Authenticator implementation to use when authenticating frameworks
-and/or slaves. Use the default <code>crammd5</code>, or
+and/or agents. Use the default <code>crammd5</code>, or
 load an alternate authenticator module using <code>--modules</code>. (default: crammd5)
   </td>
 </tr>
@@ -503,11 +550,9 @@ Human readable name for the cluster, displayed in the webui.
     --credentials=VALUE
   </td>
   <td>
-Either a path to a text file with a list of credentials,
-each line containing <code>principal</code> and <code>secret</code> separated by whitespace,
-or, a path to a JSON-formatted file containing credentials.
-Path could be of the form <code>file:///path/to/file</code> or <code>/path/to/file</code>.
-JSON file Example:
+Path to a JSON-formatted file containing credentials.
+Path can be of the form <code>file:///path/to/file</code> or <code>/path/to/file</code>.
+Example:
 <pre><code>{
   "credentials": [
     {
@@ -516,8 +561,6 @@ JSON file Example:
     }
   ]
 }</code></pre>
-Text file Example:
-<pre><code>username secret</code></pre>
   </td>
 </tr>
 <tr>
@@ -528,19 +571,6 @@ Text file Example:
 Policy to use for allocating resources
 between a given user's frameworks. Options
 are the same as for user_allocator. (default: drf)
-  </td>
-</tr>
-<tr>
-  <td>
-    --http_authenticators=VALUE
-  </td>
-  <td>
-HTTP authenticator implementation to use when handling requests to
-authenticated endpoints. Use the default
-<code>basic</code>, or load an alternate HTTP
-authenticator module using <code>--modules</code>.
-<p/>
-Currently there is no support for multiple HTTP authenticators. (default: basic)
   </td>
 </tr>
 <tr>
@@ -572,12 +602,12 @@ Maximum number of completed tasks per framework to store in memory. (default: 10
 </tr>
 <tr>
   <td>
-    --max_slave_ping_timeouts=VALUE
+    --max_agent_ping_timeouts=VALUE
   </td>
   <td>
-The number of times a slave can fail to respond to a
-ping from the master. Slaves that do not respond within
-<code>max_slave_ping_timeouts</code> ping retries will be asked to shutdown.
+The number of times a agent can fail to respond to a
+ping from the master. Agents that do not respond within
+<code>max_agent_ping_timeouts</code> ping retries will be asked to shutdown.
 (default: 5)
   </td>
 </tr>
@@ -622,19 +652,19 @@ Example:
 </tr>
 <tr>
   <td>
-    --recovery_slave_removal_limit=VALUE
+    --recovery_agent_removal_limit=VALUE
   </td>
   <td>
-For failovers, limit on the percentage of slaves that can be removed
+For failovers, limit on the percentage of agents that can be removed
 from the registry *and* shutdown after the re-registration timeout
 elapses. If the limit is exceeded, the master will fail over rather
-than remove the slaves.
+than remove the agents.
 This can be used to provide safety guarantees for production
 environments. Production environments may expect that across master
-failovers, at most a certain percentage of slaves will fail
+failovers, at most a certain percentage of agents will fail
 permanently (e.g. due to rack-level failures).
 Setting this limit would ensure that a human needs to get
-involved should an unexpected widespread failure of slaves occur
+involved should an unexpected widespread failure of agents occur
 in the cluster.
 Values: [0%-100%] (default: 100%)
   </td>
@@ -674,7 +704,7 @@ after which the operation is considered a failure. (default: 20secs)
 Whether the master will take actions based on the persistent
 information stored in the Registry. Setting this to false means
 that the Registrar will never reject the admission, readmission,
-or removal of a slave. Consequently, <code>false</code> can be used to
+or removal of a agent. Consequently, <code>false</code> can be used to
 bootstrap the persistent state on a running cluster.
 <b>NOTE</b>: This flag is *experimental* and should not be used in
 production yet. (default: false)
@@ -700,36 +730,36 @@ Can root submit frameworks? (default: true)
 </tr>
 <tr>
   <td>
-    --slave_ping_timeout=VALUE
+    --agent_ping_timeout=VALUE
   </td>
   <td>
-The timeout within which each slave is expected to respond to a
-ping from the master. Slaves that do not respond within
-max_slave_ping_timeouts ping retries will be asked to shutdown.
-<b>NOTE</b>: The total ping timeout (<code>slave_ping_timeout</code> multiplied by
-<code>max_slave_ping_timeouts</code>) should be greater than the ZooKeeper
+The timeout within which each agent is expected to respond to a
+ping from the master. Agents that do not respond within
+max_agent_ping_timeouts ping retries will be asked to shutdown.
+<b>NOTE</b>: The total ping timeout (<code>agent_ping_timeout</code> multiplied by
+<code>max_agent_ping_timeouts</code>) should be greater than the ZooKeeper
 session timeout to prevent useless re-registration attempts.
 (default: 15secs)
   </td>
 </tr>
 <tr>
   <td>
-    --slave_removal_rate_limit=VALUE
+    --agent_removal_rate_limit=VALUE
   </td>
   <td>
-The maximum rate (e.g., <code>1/10mins</code>, <code>2/3hrs</code>, etc) at which slaves
+The maximum rate (e.g., <code>1/10mins</code>, <code>2/3hrs</code>, etc) at which agents
 will be removed from the master when they fail health checks.
-By default, slaves will be removed as soon as they fail the health
-checks. The value is of the form <code>(Number of slaves)/(Duration)</code>.
+By default, agents will be removed as soon as they fail the health
+checks. The value is of the form <code>(Number of agents)/(Duration)</code>.
   </td>
 </tr>
 <tr>
   <td>
-    --slave_reregister_timeout=VALUE
+    --agent_reregister_timeout=VALUE
   </td>
   <td>
-The timeout within which all slaves are expected to re-register
-when a new master is elected as the leader. Slaves that do not
+The timeout within which all agents are expected to re-register
+when a new master is elected as the leader. Agents that do not
 re-register within the timeout will be removed from the registry
 and will be shutdown if they attempt to communicate with master.
 <b>NOTE</b>: This value has to be at least 10mins. (default: 10mins)
@@ -770,9 +800,9 @@ using the <code>/weights</code> HTTP endpoint.
     --whitelist=VALUE
   </td>
   <td>
-Path to a file which contains a list of slaves (one per line) to
+Path to a file which contains a list of agents (one per line) to
 advertise offers for. The file is watched, and periodically re-read to
-refresh the slave whitelist. By default there is no whitelist / all
+refresh the agent whitelist. By default there is no whitelist / all
 machines are accepted. Path could be of the form
 <code>file:///path/to/file</code> or <code>/path/to/file</code>.
   </td>
@@ -802,18 +832,18 @@ ZooKeeper session timeout. (default: 10secs)
   </thead>
 <tr>
   <td>
-    --max_executors_per_slave=VALUE
+    --max_executors_per_agent=VALUE
   </td>
   <td>
-Maximum number of executors allowed per slave. The network
+Maximum number of executors allowed per agent. The network
 monitoring/isolation technique imposes an implicit resource
 acquisition on each executor (# ephemeral ports), as a result
-one can only run a certain number of executors on each slave.
+one can only run a certain number of executors on each agent.
   </td>
 </tr>
 </table>
 
-## Slave Options
+## Agent Options
 
 *Required Flags*
 
@@ -840,6 +870,19 @@ May be one of:
   <code>file:///path/to/file</code> (where file contains one of the above)
   </td>
 </tr>
+<tr>
+  <td>
+    --work_dir=VALUE
+  </td>
+  <td>
+Path of the agent work directory. This is where executor sandboxes
+will be placed, as well as the agent's checkpointed state in case of
+failover. Note that locations like <code>/tmp</code> which are cleaned
+automatically are not suitable for the work directory when running in
+production, since long-running agents could lose data when cleanup
+occurs. (Example: <code>/var/lib/mesos/agent</code>)
+  </td>
+</tr>
 </table>
 
 *Optional Flags*
@@ -857,6 +900,44 @@ May be one of:
   </thead>
 <tr>
   <td>
+    --acls=VALUE
+  </td>
+  <td>
+The value could be a JSON-formatted string of ACLs
+or a file path containing the JSON-formatted ACLs used
+for authorization. Path could be of the form <code>file:///path/to/file</code>
+or <code>/path/to/file</code>.
+<p/>
+Note that if the <code>--authorizer</code> flag is provided with a value
+other than <code>local</code>, the ACLs contents will be
+ignored.
+<p/>
+See the ACLs protobuf in acls.proto for the expected format.
+<p/>
+Example:
+<pre><code>{
+  "get_endpoints": [
+    {
+      "principals": { "values": ["a"] },
+      "paths": { "values": ["/flags", "/monitor/statistics"] }
+    }
+  ]
+}</code></pre>
+  </td>
+</tr>
+<tr>
+  <td>
+    --appc_simple_discovery_uri_prefix=VALUE
+  </td>
+  <td>
+URI prefix to be used for simple discovery of appc images,
+e.g., <code>http://</code>, <code>https://</code>,
+<code>hdfs://<hostname>:9000/user/abc/cde</code>.
+(default: http://)
+  </td>
+</tr>
+<tr>
+  <td>
     --appc_store_dir=VALUE
   </td>
   <td>
@@ -869,7 +950,7 @@ Directory the appc provisioner will store images in.
     --attributes=VALUE
   </td>
   <td>
-Attributes of the slave machine, in the form:
+Attributes of the agent machine, in the form:
 <code>rack:2</code> or <code>rack:2;u:1</code>
   </td>
 </tr>
@@ -881,6 +962,21 @@ Attributes of the slave machine, in the form:
 Authenticatee implementation to use when authenticating against the
 master. Use the default <code>crammd5</code>, or
 load an alternate authenticatee module using <code>--modules</code>. (default: crammd5)
+  </td>
+</tr>
+<tr>
+  <td>
+    --authorizer=VALUE
+  </td>
+  <td>
+Authorizer implementation to use when authorizing actions that
+require it.
+Use the default <code>local</code>, or
+load an alternate authorizer module using <code>--modules</code>.
+<p/>
+Note that if the <code>--authorizer</code> flag is provided with a value
+other than the default <code>local</code>, the ACLs
+passed through the <code>--acls</code> flag will be ignored.
   </td>
 </tr>
 <tr>
@@ -951,7 +1047,7 @@ Name of the root cgroup. (default: mesos)
   </td>
   <td>
 The interval between disk quota checks for containers. This flag is
-used for the <code>posix/disk</code> isolator. (default: 15secs)
+used for the <code>disk/du</code> isolator. (default: 15secs)
   </td>
 </tr>
 <tr>
@@ -992,9 +1088,8 @@ are specified is the order they are tried.
     --credential=VALUE
   </td>
   <td>
-Either a path to a text with a single line
-containing <code>principal</code> and <code>secret</code> separated by whitespace.
-Or a path containing the JSON-formatted information used for one credential.
+Path to a JSON-formatted file containing the credential
+to use to authenticate with the master.
 Path could be of the form <code>file:///path/to/file</code> or <code>/path/to/file</code>.
 Example:
 <pre><code>{
@@ -1028,7 +1123,7 @@ Example:
   "type": "MESOS",
   "volumes": [
     {
-      "host_path": "./.private/tmp",
+      "host_path": ".private/tmp",
       "container_path": "/tmp",
       "mode": "RW"
     }
@@ -1054,7 +1149,7 @@ this role. (default: *)
   </td>
   <td>
 Periodic time interval (e.g., 10secs, 2mins, etc)
-to check the overall disk usage managed by the slave.
+to check the overall disk usage managed by the agent.
 This drives the garbage collection of archived
 information and sandboxes. (default: 1mins)
   </td>
@@ -1071,13 +1166,35 @@ containerizer.
 </tr>
 <tr>
   <td>
+    --docker_config=VALUE
+  </td>
+  <td>
+The default docker config file for agent. Can be provided either as a
+path pointing to the agent local docker config file, or as a JSON-formatted
+string. The format of the docker config file should be identical to docker's
+default one (e.g., either <code>~/.docker/config.json</code> or
+<code>~/.dockercfg</code>).
+Example JSON (<code>~/.docker/config.json</code>):
+<pre><code>{
+  "auths": {
+    "https://index.docker.io/v1/": {
+      "auth": "xXxXxXxXxXx=",
+      "email": "username@example.com"
+    }
+  }
+}
+</code></pre>
+  </td>
+</tr>
+<tr>
+  <td>
     --[no-]docker_kill_orphans
   </td>
   <td>
 Enable docker containerizer to kill orphaned containers.
 You should consider setting this to false when you launch multiple
-slaves in the same OS, to avoid one of the DockerContainerizer
-removing docker tasks launched by other slaves.
+agents in the same OS, to avoid one of the DockerContainerizer
+removing docker tasks launched by other agents.
 (default: true)
   </td>
 </tr>
@@ -1086,10 +1203,10 @@ removing docker tasks launched by other slaves.
     --docker_mesos_image=VALUE
   </td>
   <td>
-The Docker image used to launch this Mesos slave instance.
-If an image is specified, the docker containerizer assumes the slave
+The Docker image used to launch this Mesos agent instance.
+If an image is specified, the docker containerizer assumes the agent
 is running in a docker container, and launches executors with
-docker containers in order to recover them when the slave restarts and
+docker containers in order to recover them when the agent restarts and
 recovers.
   </td>
 </tr>
@@ -1121,7 +1238,7 @@ The amount of time to wait before removing docker containers
   <td>
 The UNIX socket path to be mounted into the docker executor container
 to provide docker CLI access to the docker daemon. This must be the
-path used by the slave's docker image.
+path used by the agent's docker image.
 (default: /var/run/docker.sock)
   </td>
 </tr>
@@ -1130,8 +1247,9 @@ path used by the slave's docker image.
     --docker_stop_timeout=VALUE
   </td>
   <td>
-The time as a duration for docker to wait after stopping an instance
-before it kills that instance. (default: 0ns)
+The time docker daemon waits after stopping a container before killing
+that container. This flag is deprecated; use task's kill policy instead.
+(default: 0ns)
   </td>
 </tr>
 <tr>
@@ -1144,11 +1262,21 @@ Directory the Docker provisioner will store images in (default: /tmp/mesos/store
 </tr>
 <tr>
   <td>
+    --docker_volume_checkpoint_dir=VALUE
+  </td>
+  <td>
+The root directory where we checkpoint the information about docker
+volumes that each container uses.
+(default: /var/run/mesos/isolators/docker/volume)
+  </td>
+</tr>
+<tr>
+  <td>
     --[no-]enforce_container_disk_quota
   </td>
   <td>
 Whether to enable disk quota enforcement for containers. This flag
-is used for the <code>posix/disk</code> isolator. (default: false)
+is used for the <code>disk/du</code> isolator. (default: false)
   </td>
 </tr>
 <tr>
@@ -1157,8 +1285,8 @@ is used for the <code>posix/disk</code> isolator. (default: false)
   </td>
   <td>
 JSON object representing the environment variables that should be
-passed to the executor, and thus subsequently task(s). By default the
-executor will inherit the slave's environment variables.
+passed to the executor, and thus subsequently task(s). By default this
+flag is none. Users have to define executor environment explicitly.
 Example:
 <pre><code>{
   "PATH": "/bin:/usr/bin",
@@ -1172,7 +1300,7 @@ Example:
   </td>
   <td>
 Amount of time to wait for an executor
-to register with the slave before considering it hung and
+to register with the agent before considering it hung and
 shutting it down (e.g., 60secs, 3mins, etc) (default: 1mins)
   </td>
 </tr>
@@ -1181,8 +1309,13 @@ shutting it down (e.g., 60secs, 3mins, etc) (default: 1mins)
     --executor_shutdown_grace_period=VALUE
   </td>
   <td>
-Amount of time to wait for an executor
-to shut down (e.g., 60secs, 3mins, etc) (default: 5secs)
+Default amount of time to wait for an executor to shut down
+(e.g. 60secs, 3mins, etc). ExecutorInfo.shutdown_grace_period
+overrides this default. Note that the executor must not assume
+that it will always be allotted the full grace period, as the
+agent may decide to allot a shorter period, and failures / forcible
+terminations may occur.
+(default: 5secs)
   </td>
 </tr>
 <tr>
@@ -1191,7 +1324,7 @@ to shut down (e.g., 60secs, 3mins, etc) (default: 5secs)
   </td>
   <td>
 Parent directory for fetcher cache directories
-(one subdirectory per slave). (default: /tmp/mesos/fetch)
+(one subdirectory per agent). (default: /tmp/mesos/fetch)
   </td>
 </tr>
 <tr>
@@ -1247,6 +1380,40 @@ environment or find hadoop on <code>PATH</code>) (default: )
 </tr>
 <tr>
   <td>
+    --http_credentials=VALUE
+  </td>
+  <td>
+Path to a JSON-formatted file containing credentials. These
+credentials are used to authenticate HTTP endpoints on the agent.
+Path can be of the form <code>file:///path/to/file</code> or <code>/path/to/file</code>.
+<p/>
+Example:
+<pre><code>{
+  "credentials": [
+    {
+      "principal": "yoda",
+      "secret": "usetheforce"
+    }
+  ]
+}
+</code></pre>
+  </td>
+</tr>
+<tr>
+  <td>
+    --[no-]http_command_executor
+  </td>
+  <td>
+The underlying executor library to be used for the command executor.
+If set to <code>true</code>, the command executor would use the HTTP based
+executor library to interact with the Mesos agent. If set to <code>false</code>,
+the driver based implementation would be used.
+<b>NOTE</b>: This flag is *experimental* and should not be used in
+production yet. (default: false)
+  </td>
+</tr>
+<tr>
+  <td>
     --image_providers=VALUE
   </td>
   <td>
@@ -1259,8 +1426,8 @@ e.g., <code>APPC,DOCKER</code>.
     --image_provisioner_backend=VALUE
   </td>
   <td>
-Strategy for provisioning container rootfs from images,
-e.g., <code>bind</code>, <code>copy</code>. (default: copy)
+Strategy for provisioning container rootfs from images, e.g., <code>aufs</code>,
+<code>bind</code>, <code>copy</code>, <code>overlay</code>. (default: copy)
   </td>
 </tr>
 <tr>
@@ -1271,6 +1438,8 @@ e.g., <code>bind</code>, <code>copy</code>. (default: copy)
 Isolation mechanisms to use, e.g., <code>posix/cpu,posix/mem</code>, or
 <code>cgroups/cpu,cgroups/mem</code>, or network/port_mapping
 (configure with flag: <code>--with-network-isolator</code> to enable),
+or `cgroups/devices/gpus/nvidia` for nvidia specific gpu isolation
+(configure with flag: `--enable-nvidia-gpu-support` to enable),
 or <code>external</code>, or load an alternate isolator module using
 the <code>--modules</code> flag. Note that this flag is only relevant
 for the Mesos Containerizer. (default: posix/cpu,posix/mem)
@@ -1284,7 +1453,7 @@ for the Mesos Containerizer. (default: posix/cpu,posix/mem)
 The launcher to be used for Mesos containerizer. It could either be
 <code>linux</code> or <code>posix</code>. The Linux launcher is required for cgroups
 isolation and for any isolators that require Linux namespaces such as
-network, pid, etc. If unspecified, the slave will choose the Linux
+network, pid, etc. If unspecified, the agent will choose the Linux
 launcher if it's running as root on Linux.
   </td>
 </tr>
@@ -1300,10 +1469,46 @@ directory. (default: /usr/local/libexec/mesos)
 </tr>
 <tr>
   <td>
+    --nvidia_gpu_devices=VALUE
+  </td>
+  <td>
+A comma-separated list of Nvidia GPU devices. When `gpus` is specified
+in the `--resources` flag, this flag determines which GPU devices will
+be made available. The devices should be listed as numbers that
+correspond to Nvidia's NVML device enumeration (as seen by running the
+command `nvidia-smi` on an Nvidia GPU equipped system). The GPUs
+listed will only be isolated if the `--isolation` flag contains the
+string `cgroups/devices/gpus/nvidia`. This flag will only work if
+mesos has been configured with `--enable-nvidia-gpu-support`.
+  </td>
+</tr>
+<tr>
+  <td>
+    --network_cni_plugins_dir=VALUE
+  </td>
+  <td>
+Directory path of the CNI plugin binaries. The <code>network/cni</code>
+isolator will find CNI plugins under this directory so that it can execute
+the plugins to add/delete container from the CNI networks. It is the operator’s
+responsibility to install the CNI plugin binaries in the specified directory.
+  </td>
+</tr>
+<tr>
+  <td>
+    --network_cni_config_dir=VALUE
+  </td>
+  <td>
+Directory path of the CNI network configuration files. For each network that
+containers launched in Mesos agent can connect to, the operator should install
+a network configuration file in JSON format in the specified directory.
+  </td>
+</tr>
+<tr>
+  <td>
     --oversubscribed_resources_interval=VALUE
   </td>
   <td>
-The slave periodically updates the master with the current estimation
+The agent periodically updates the master with the current estimation
 about the total amount of oversubscribed resources that are allocated
 and available. The interval between updates is controlled by this flag.
 (default: 15secs)
@@ -1356,7 +1561,7 @@ The name of the QoS Controller to use for oversubscription.
     --qos_correction_interval_min=VALUE
   </td>
   <td>
-The slave polls and carries out QoS corrections from the QoS
+The agent polls and carries out QoS corrections from the QoS
 Controller based on its observed performance of running tasks.
 The smallest interval between these corrections is controlled by
 this flag. (default: 0secs)
@@ -1371,7 +1576,7 @@ Whether to recover status updates and reconnect with old executors.
 Valid values for <code>recover</code> are
 reconnect: Reconnect with any old live executors.
 cleanup  : Kill any old live executors and exit.
-           Use this option when doing an incompatible slave
+           Use this option when doing an incompatible agent
            or executor upgrade!). (default: reconnect)
   </td>
 </tr>
@@ -1380,9 +1585,9 @@ cleanup  : Kill any old live executors and exit.
     --recovery_timeout=VALUE
   </td>
   <td>
-Amount of time allotted for the slave to recover. If the slave takes
+Amount of time allotted for the agent to recover. If the agent takes
 longer than recovery_timeout to recover, any executors that are
-waiting to reconnect to the slave will self-terminate.
+waiting to reconnect to the agent will self-terminate.
 (default: 15mins)
   </td>
 </tr>
@@ -1391,7 +1596,7 @@ waiting to reconnect to the slave will self-terminate.
     --registration_backoff_factor=VALUE
   </td>
   <td>
-Slave initially picks a random amount of time between <code>[0, b]</code>, where
+Agent initially picks a random amount of time between <code>[0, b]</code>, where
 <code>b = registration_backoff_factor</code>, to (re-)register with a new master.
 Subsequent retries are exponentially backed off based on this
 interval (e.g., 1st retry uses a random value between <code>[0, b * 2^1]</code>,
@@ -1412,7 +1617,7 @@ The name of the resource estimator to use for oversubscription.
     --resources=VALUE
   </td>
   <td>
-Total consumable resources per slave. Can be provided in JSON format
+Total consumable resources per agent. Can be provided in JSON format
 or as a semicolon-delimited list of key:value pairs, with the role
 optionally specified.
 <p/>
@@ -1465,10 +1670,10 @@ sandbox is mapped to.
 </tr>
 <tr>
   <td>
-    --slave_subsystems=VALUE
+    --agent_subsystems=VALUE
   </td>
   <td>
-List of comma-separated cgroup subsystems to run the slave binary
+List of comma-separated cgroup subsystems to run the agent binary
 in, e.g., <code>memory,cpuacct</code>. The default is none.
 Present functionality is intended for resource monitoring and
 no cgroup limits are set, they are inherited from the root mesos
@@ -1481,8 +1686,8 @@ cgroup.
   </td>
   <td>
 If <code>strict=true</code>, any and all recovery errors are considered fatal.
-If <code>strict=false</code>, any expected errors (e.g., slave cannot recover
-information about an executor, because the slave died right before
+If <code>strict=false</code>, any expected errors (e.g., agent cannot recover
+information about an executor, because the agent died right before
 the executor registered.) during recovery are ignored and as much
 state as possible is recovered.
 (default: true)
@@ -1493,14 +1698,14 @@ state as possible is recovered.
     --[no-]switch_user
   </td>
   <td>
-If set to <code>true</code>, the slave will attempt to run tasks as
+If set to <code>true</code>, the agent will attempt to run tasks as
 the <code>user</code> who submitted them (as defined in <code>FrameworkInfo</code>)
 (this requires <code>setuid</code> permission and that the given <code>user</code>
-exists on the slave).
+exists on the agent).
 If the user does not exist, an error occurs and the task will fail.
 If set to <code>false</code>, tasks will be run as the same user as the Mesos
-slave process.
-<b>NOTE</b>: This feature is not yet supported on Windows slave, and
+agent process.
+<b>NOTE</b>: This feature is not yet supported on Windows agent, and
 therefore the flag currently does not exist on that platform. (default: true)
   </td>
 </tr>
@@ -1523,15 +1728,6 @@ the agent is launched as a systemd unit.
   <td>
 The path to the systemd system run time directory.
 (default: /run/systemd/system)
-  </td>
-</tr>
-<tr>
-  <td>
-    --work_dir=VALUE
-  </td>
-  <td>
-Directory path to place framework work directories
-(default: /tmp/mesos)
   </td>
 </tr>
 </table>
@@ -1644,6 +1840,31 @@ isolator. (default: false)
 </tr>
 </table>
 
+*XFS disk isolator flags available when configured with
+`--enable-xfs-disk-isolator`*
+
+<table class="table table-striped">
+  <thead>
+    <tr>
+      <th width="30%">
+        Flag
+      </th>
+      <th>
+        Explanation
+      </th>
+    </tr>
+  </thead>
+<tr>
+  <td>
+    --xfs_project_range=VALUE
+  </td>
+<td>
+The ranges of XFS project IDs that the isolator can use to track disk
+quotas for container sandbox directories. Valid project IDs range from
+1 to max(uint32). (default `[5000-10000]`)
+</td>
+</tr>
+</table>
 
 ## Libprocess Options
 
@@ -1709,6 +1930,16 @@ isolator. (default: false)
       applied to the /metrics/snapshot endpoint. The format is
       `<number of requests>/<interval duration>`.
       Examples: `10/1secs`, `100/10secs`, etc.
+    </td>
+  </tr>
+  <tr>
+    <td>
+      LIBPROCESS_NUM_WORKER_THREADS
+    </td>
+    <td>
+      If set to an integer value in the range 1 to 1024, it overrides
+      the default setting of the number of libprocess worker threads,
+      which is the maximum of 8 and the number of cores on the machine.
     </td>
   </tr>
 </table>
@@ -1813,6 +2044,14 @@ isolator. (default: false)
     <td>
       Whether optimizations are enabled. If CFLAGS/CXXFLAGS are set,
       this option won't change them. [default=no]
+    </td>
+  </tr>
+  <tr>
+    <td>
+      --enable-perftools
+    </td>
+    <td>
+      Whether profiling with Google perftools is enabled. [default=no]
     </td>
   </tr>
   <tr>

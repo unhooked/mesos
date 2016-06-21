@@ -14,27 +14,32 @@
 // See the License for the specific language governing permissions and
 // limitations under the License
 
-#include <set>
 #include <string>
 
+#include <glog/logging.h>
+
+#include <mesos/zookeeper/contender.hpp>
+#include <mesos/zookeeper/detector.hpp>
+#include <mesos/zookeeper/group.hpp>
+
+#include <process/check.hpp>
 #include <process/defer.hpp>
 #include <process/dispatch.hpp>
 #include <process/future.hpp>
 #include <process/id.hpp>
+#include <process/process.hpp>
 
 #include <stout/check.hpp>
 #include <stout/lambda.hpp>
+#include <stout/nothing.hpp>
 #include <stout/option.hpp>
-#include <stout/some.hpp>
 
-#include "zookeeper/contender.hpp"
-#include "zookeeper/detector.hpp"
-#include "zookeeper/group.hpp"
-
-using namespace process;
-
-using std::set;
 using std::string;
+
+using process::Failure;
+using process::Future;
+using process::Process;
+using process::Promise;
 
 namespace zookeeper {
 
@@ -49,7 +54,7 @@ public:
   virtual ~LeaderContenderProcess();
 
   // LeaderContender implementation.
-  Future<Future<Nothing> > contend();
+  Future<Future<Nothing>> contend();
   Future<bool> withdraw();
 
 protected:
@@ -76,7 +81,7 @@ private:
   // is assigned.
 
   // Holds the promise for the future for contend().
-  Option<Promise<Future<Nothing> >*> contending;
+  Option<Promise<Future<Nothing>>*> contending;
 
   // Holds the promise for the inner future enclosed by contend()'s
   // result which is satisfied when the contender's candidacy is
@@ -95,7 +100,7 @@ LeaderContenderProcess::LeaderContenderProcess(
     Group* _group,
     const string& _data,
     const Option<string>& _label)
-  : ProcessBase(ID::generate("leader-contender")),
+  : ProcessBase(process::ID::generate("leader-contender")),
     group(_group),
     data(_data),
     label(_label) {}
@@ -138,7 +143,7 @@ void LeaderContenderProcess::finalize()
 }
 
 
-Future<Future<Nothing> > LeaderContenderProcess::contend()
+Future<Future<Nothing>> LeaderContenderProcess::contend()
 {
   if (contending.isSome()) {
     return Failure("Cannot contend more than once");
@@ -150,7 +155,7 @@ Future<Future<Nothing> > LeaderContenderProcess::contend()
     .onAny(defer(self(), &Self::joined));
 
   // Okay, we wait and see what unfolds.
-  contending = new Promise<Future<Nothing> >();
+  contending = new Promise<Future<Nothing>>();
   return contending.get()->future();
 }
 
@@ -208,7 +213,7 @@ void LeaderContenderProcess::cancel()
 
 void LeaderContenderProcess::cancelled(const Future<bool>& result)
 {
-  CHECK(candidacy.isReady());
+  CHECK_READY(candidacy);
   LOG(INFO) << "Membership cancelled: " << candidacy.get().id();
 
   // Can be called as a result of either withdraw() or server side
@@ -294,7 +299,7 @@ LeaderContender::~LeaderContender()
 }
 
 
-Future<Future<Nothing> > LeaderContender::contend()
+Future<Future<Nothing>> LeaderContender::contend()
 {
   return dispatch(process, &LeaderContenderProcess::contend);
 }

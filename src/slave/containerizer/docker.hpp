@@ -38,14 +38,14 @@ namespace slave {
 // created by Mesos from those created manually.
 extern const std::string DOCKER_NAME_PREFIX;
 
-// Seperator used to compose docker container name, which is made up
+// Separator used to compose docker container name, which is made up
 // of slave ID and container ID.
 extern const std::string DOCKER_NAME_SEPERATOR;
 
 // Directory that stores all the symlinked sandboxes that is mapped
 // into Docker containers. This is a relative directory that will
 // joined with the slave path. Only sandbox paths that contains a
-// colon will be symlinked due to the limiitation of the Docker CLI.
+// colon will be symlinked due to the limitation of the Docker CLI.
 extern const std::string DOCKER_SYMLINK_DIRECTORY;
 
 
@@ -142,9 +142,12 @@ public:
       const process::PID<Slave>& slavePid,
       bool checkpoint);
 
+  // force = true causes the containerizer to update the resources
+  // for the container, even if they match what it has cached.
   virtual process::Future<Nothing> update(
       const ContainerID& containerId,
-      const Resources& resources);
+      const Resources& resources,
+      bool force);
 
   virtual process::Future<ResourceStatistics> usage(
       const ContainerID& containerId);
@@ -174,8 +177,15 @@ private:
       const ContainerID& containerId,
       pid_t pid);
 
+  process::Future<bool> _launch(
+      const ContainerID& containerId,
+      const Option<TaskInfo>& taskInfo,
+      const ExecutorInfo& executorInfo,
+      const std::string& directory,
+      const SlaveID& slaveId);
+
   process::Future<Nothing> _recover(
-      const state::SlaveState& state,
+      const Option<state::SlaveState>& state,
       const std::list<Docker::Container>& containers);
 
   process::Future<Nothing> __recover(
@@ -212,6 +222,10 @@ private:
       const ContainerID& containerId,
       bool killed,
       const process::Future<Option<int>>& status);
+
+  process::Future<Nothing> destroyTimeout(
+      const ContainerID& containerId,
+      process::Future<Nothing> future);
 
   process::Future<Nothing> _update(
       const ContainerID& containerId,
@@ -344,8 +358,7 @@ private:
             slaveId,
             slavePid,
             checkpoint,
-            flags,
-            false);
+            flags);
       }
     }
 
@@ -390,7 +403,7 @@ private:
       return executor.container().docker().force_pull_image();
     }
 
-    // The DockerContainerier needs to be able to properly clean up
+    // The DockerContainerizer needs to be able to properly clean up
     // Docker containers, regardless of when they are destroyed. For
     // example, if a container gets destroyed while we are fetching,
     // we need to not keep running the fetch, nor should we try and
@@ -404,10 +417,10 @@ private:
     //     DESTROYING
     //
     // In particular, we made 'PULLING' be it's own state so that we
-    // could easily destroy and cleanup when a user initiated pulling
+    // can easily destroy and cleanup when a user initiated pulling
     // a really big image but we timeout due to the executor
-    // registration timeout. Since we curently have no way to discard
-    // a Docker::run, we needed to explicitely do the pull (which is
+    // registration timeout. Since we currently have no way to discard
+    // a Docker::run, we needed to explicitly do the pull (which is
     // the part that takes the longest) so that we can also explicitly
     // kill it when asked. Once the functions at Docker::* get support
     // for discarding, then we won't need to make pull be it's own
@@ -428,6 +441,10 @@ private:
     ContainerInfo container;
     CommandInfo command;
     std::map<std::string, std::string> environment;
+
+    // Environment variables that the command executor should pass
+    // onto a docker-ized task. This is set by a hook.
+    Option<std::map<std::string, std::string>> taskEnvironment;
 
     // The sandbox directory for the container. This holds the
     // symlinked path if symlinked boolean is true.

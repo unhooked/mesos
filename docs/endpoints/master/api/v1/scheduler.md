@@ -9,7 +9,16 @@ layout: documentation
 >        /master/api/v1/scheduler
 
 ### TL;DR; ###
-Endpoint for schedulers to make Calls against the master.
+Endpoint for schedulers to make calls against the master.
 
 ### DESCRIPTION ###
 Returns 202 Accepted iff the request is accepted.
+Returns 307 TEMPORARY_REDIRECT redirect to the leading master when
+current master is not the leader.
+Returns 503 SERVICE_UNAVAILABLE if the leading master cannot be
+found.
+
+
+### AUTHENTICATION ###
+This endpoint requires authentication iff HTTP authentication is
+enabled.

@@ -91,20 +91,27 @@ TEST_F(OverlayBackendTest, ROOT_OVERLAYFS_OverlayFSBackend)
   hashmap<string, Owned<Backend>> backends = Backend::create(slave::Flags());
   ASSERT_TRUE(backends.contains("overlay"));
 
-  AWAIT_READY(backends["overlay"]->provision({layer1, layer2}, rootfs));
+  AWAIT_READY(backends["overlay"]->provision(
+      {layer1, layer2},
+      rootfs,
+      sandbox.get()));
 
   EXPECT_TRUE(os::exists(path::join(rootfs, "dir1", "1")));
-  Try<string> read = os::read(path::join(rootfs, "dir1", "1"));
-  EXPECT_SOME_EQ("1", read);
+  EXPECT_SOME_EQ("1", os::read(path::join(rootfs, "dir1", "1")));
 
   EXPECT_TRUE(os::exists(path::join(rootfs, "dir2", "2")));
-  read = os::read(path::join(rootfs, "dir2", "2"));
-  EXPECT_SOME_EQ("2", read);
+  EXPECT_SOME_EQ("2", os::read(path::join(rootfs, "dir2", "2")));
 
-  EXPECT_TRUE(os::exists(path::join(rootfs, "file")));
-  read = os::read(path::join(rootfs, "file"));
   // Last layer should overwrite existing file of earlier layers.
-  EXPECT_SOME_EQ("test2", read);
+  EXPECT_TRUE(os::exists(path::join(rootfs, "file")));
+  EXPECT_SOME_EQ("test2", os::read(path::join(rootfs, "file")));
+
+  // Rootfs should be writable.
+  ASSERT_SOME(os::write(path::join(rootfs, "file"), "test3"));
+
+  // Files created in rootfs should shadow the files of lower dirs.
+  EXPECT_SOME_EQ("test3", os::read(path::join(rootfs, "file")));
+  EXPECT_SOME_EQ("test2", os::read(path::join(layer2, "file")));
 
   AWAIT_READY(backends["overlay"]->destroy(rootfs));
 
@@ -130,7 +137,10 @@ TEST_F(BindBackendTest, ROOT_BindBackend)
 
   string target = path::join(os::getcwd(), "target");
 
-  AWAIT_READY(backends["bind"]->provision({rootfs}, target));
+  AWAIT_READY(backends["bind"]->provision(
+      {rootfs},
+      target,
+      sandbox.get()));
 
   EXPECT_TRUE(os::stat::isdir(path::join(target, "tmp")));
 
@@ -143,6 +153,57 @@ TEST_F(BindBackendTest, ROOT_BindBackend)
   AWAIT_READY(backends["bind"]->destroy(target));
 
   EXPECT_FALSE(os::exists(target));
+}
+
+
+class AufsBackendTest : public MountBackendTest {};
+
+
+// Provision a rootfs using multiple layers with the aufs backend.
+TEST_F(AufsBackendTest, ROOT_AUFS_AufsBackend)
+{
+  string layer1 = path::join(os::getcwd(), "source1");
+  ASSERT_SOME(os::mkdir(layer1));
+  ASSERT_SOME(os::mkdir(path::join(layer1, "dir1")));
+  ASSERT_SOME(os::write(path::join(layer1, "dir1", "1"), "1"));
+  ASSERT_SOME(os::write(path::join(layer1, "file"), "test1"));
+
+  string layer2 = path::join(os::getcwd(), "source2");
+  ASSERT_SOME(os::mkdir(layer2));
+  ASSERT_SOME(os::mkdir(path::join(layer2, "dir2")));
+  ASSERT_SOME(os::write(path::join(layer2, "dir2", "2"), "2"));
+  ASSERT_SOME(os::write(path::join(layer2, "file"), "test2"));
+
+  string rootfs = path::join(os::getcwd(), "rootfs");
+
+  hashmap<string, Owned<Backend>> backends = Backend::create(slave::Flags());
+  ASSERT_TRUE(backends.contains("aufs"));
+
+  AWAIT_READY(backends["aufs"]->provision(
+      {layer1, layer2},
+      rootfs,
+      sandbox.get()));
+
+  EXPECT_TRUE(os::exists(path::join(rootfs, "dir1", "1")));
+  EXPECT_SOME_EQ("1", os::read(path::join(rootfs, "dir1", "1")));
+
+  EXPECT_TRUE(os::exists(path::join(rootfs, "dir2", "2")));
+  EXPECT_SOME_EQ("2", os::read(path::join(rootfs, "dir2", "2")));
+
+  // Last layer should overwrite existing file of earlier layers.
+  EXPECT_TRUE(os::exists(path::join(rootfs, "file")));
+  EXPECT_SOME_EQ("test2", os::read(path::join(rootfs, "file")));
+
+  // Rootfs should be writable.
+  ASSERT_SOME(os::write(path::join(rootfs, "file"), "test3"));
+
+  // Files created in rootfs should shadow the files of lower dirs.
+  EXPECT_SOME_EQ("test3", os::read(path::join(rootfs, "file")));
+  EXPECT_SOME_EQ("test2", os::read(path::join(layer2, "file")));
+
+  AWAIT_READY(backends["aufs"]->destroy(rootfs));
+
+  EXPECT_FALSE(os::exists(rootfs));
 }
 #endif // __linux__
 
@@ -170,24 +231,20 @@ TEST_F(CopyBackendTest, ROOT_CopyBackend)
   hashmap<string, Owned<Backend>> backends = Backend::create(slave::Flags());
   ASSERT_TRUE(backends.contains("copy"));
 
-  AWAIT_READY(backends["copy"]->provision({layer1, layer2}, rootfs));
+  AWAIT_READY(backends["copy"]->provision(
+      {layer1, layer2},
+      rootfs,
+      sandbox.get()));
 
   EXPECT_TRUE(os::exists(path::join(rootfs, "dir1", "1")));
-  Try<string> read = os::read(path::join(rootfs, "dir1", "1"));
-  ASSERT_SOME(read);
-  EXPECT_EQ("1", read.get());
+  EXPECT_SOME_EQ("1", os::read(path::join(rootfs, "dir1", "1")));
 
   EXPECT_TRUE(os::exists(path::join(rootfs, "dir2", "2")));
-  read = os::read(path::join(rootfs, "dir2", "2"));
-  ASSERT_SOME(read);
-  EXPECT_EQ("2", read.get());
-
-  EXPECT_TRUE(os::exists(path::join(rootfs, "file")));
-  read = os::read(path::join(rootfs, "file"));
-  ASSERT_SOME(read);
+  EXPECT_SOME_EQ("2", os::read(path::join(rootfs, "dir2", "2")));
 
   // Last layer should overwrite existing file.
-  EXPECT_EQ("test2", read.get());
+  EXPECT_TRUE(os::exists(path::join(rootfs, "file")));
+  EXPECT_SOME_EQ("test2", os::read(path::join(rootfs, "file")));
 
   AWAIT_READY(backends["copy"]->destroy(rootfs));
 

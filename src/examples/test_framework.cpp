@@ -216,19 +216,24 @@ int main(int argc, char** argv)
             "master",
             "ip:port of master to connect");
 
-  Try<Nothing> load = flags.load(None(), argc, argv);
+  Try<flags::Warnings> load = flags.load(None(), argc, argv);
 
   if (load.isError()) {
     cerr << load.error() << endl;
     usage(argv[0], flags);
-    exit(1);
+    exit(EXIT_FAILURE);
   } else if (master.isNone()) {
     cerr << "Missing --master" << endl;
     usage(argv[0], flags);
-    exit(1);
+    exit(EXIT_FAILURE);
   }
 
   internal::logging::initialize(argv[0], flags, true); // Catch signals.
+
+  // Log any flag warnings (after logging is initialized).
+  foreach (const flags::Warning& warning, load->warnings) {
+    LOG(WARNING) << warning.message;
+  }
 
   ExecutorInfo executor;
   executor.mutable_executor_id()->set_value("default");
@@ -257,12 +262,13 @@ int main(int argc, char** argv)
   MesosSchedulerDriver* driver;
   TestScheduler scheduler(implicitAcknowledgements, executor, role);
 
-  if (os::getenv("MESOS_AUTHENTICATE").isSome()) {
+  if (os::getenv("MESOS_AUTHENTICATE_FRAMEWORKS").isSome()) {
     cout << "Enabling authentication for the framework" << endl;
 
     value = os::getenv("DEFAULT_PRINCIPAL");
     if (value.isNone()) {
-      EXIT(1) << "Expecting authentication principal in the environment";
+      EXIT(EXIT_FAILURE)
+        << "Expecting authentication principal in the environment";
     }
 
     Credential credential;
@@ -272,7 +278,8 @@ int main(int argc, char** argv)
 
     value = os::getenv("DEFAULT_SECRET");
     if (value.isNone()) {
-      EXIT(1) << "Expecting authentication secret in the environment";
+      EXIT(EXIT_FAILURE)
+        << "Expecting authentication secret in the environment";
     }
 
     credential.set_secret(value.get());

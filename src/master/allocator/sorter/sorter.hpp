@@ -17,11 +17,14 @@
 #ifndef __MASTER_ALLOCATOR_SORTER_SORTER_HPP__
 #define __MASTER_ALLOCATOR_SORTER_SORTER_HPP__
 
+#include <functional>
 #include <list>
 #include <string>
 
 #include <mesos/resources.hpp>
 #include <mesos/type_utils.hpp>
+
+#include <process/pid.hpp>
 
 namespace mesos {
 namespace internal {
@@ -38,7 +41,16 @@ namespace allocator {
 class Sorter
 {
 public:
-  virtual ~Sorter() {}
+  Sorter() = default;
+
+  // Provides the allocator's execution context (via a UPID)
+  // and a name prefix in order to support metrics within the
+  // sorter implementation.
+  explicit Sorter(
+      const process::UPID& allocator,
+      const std::string& metricsPrefix) {}
+
+  virtual ~Sorter() = default;
 
   // Adds a client to allocate resources to. A client
   // may be a user or a framework.
@@ -51,9 +63,11 @@ public:
   virtual void remove(const std::string& client) = 0;
 
   // Readds a client to the sort after deactivate.
+  // It is a no-op if the client is already in the sort.
   virtual void activate(const std::string& client) = 0;
 
   // Removes a client from the sort, so it won't get allocated to.
+  // It is a no-op if the client is already not in the sort.
   virtual void deactivate(const std::string& client) = 0;
 
   // Specify that resources have been allocated to the given client.

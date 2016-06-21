@@ -28,6 +28,11 @@ values in JSON format can be found below. By default (if `--resources` is not
 specified), the Mesos agent will only make the root disk available to the
 cluster.
 
+**NOTE:** Once you specify any `Disk` resource manually (i.e., via the
+`--resources` flag), Mesos will stop auto-detecting the `Root` disk resource.
+Hence if you want to use the `Root` disk you will need to manually specify it
+using the format described below.
+
 ### `Root` disk
 
 A `Root` disk is the basic disk resource in Mesos. It usually maps to the
@@ -105,7 +110,7 @@ and provide the mount point as the `root` of the `Mount` in `DiskInfo`'s
 Aside from the performance advantages of `Mount` disks, applications running on
 them should be able to rely on disk errors when they attempt to exceed the
 capacity of the volume. This holds true as long as the file system in use
-correctly propagates these errors. Due to this expectation, the `posix/disk`
+correctly propagates these errors. Due to this expectation, the `disk/du`
 isolation is disabled for `Mount` disks.
 
 An example resources value for a `Mount` disk is shown below. Note that the
@@ -134,25 +139,21 @@ Mesos currently does not allow operators to expose raw block devices. It may do
 so in the future, but there are security and flexibility concerns that need to
 be addressed in a design document first.
 
-### Storage Management
-
-Mesos currently does not clean up or destroy data when persistent volumes are
-destroyed. It may do so in the future; however, the expectation is currently
-upon the framework, executor, and application to delete their data before
-destroying their persistent volumes. This is strongly encouraged for both
-security and ensuring that future users of the underlying disk resource are not
-penalized due to prior consumption of the disk capacity.
-
 ### Implementation
 
 A `Path` disk will have sub-directories created within the `root` which will be
-used to differentiate the different volumes that are created on it.
+used to differentiate the different volumes that are created on it. When a
+persistent volume on a `Path` disk is destroyed, Mesos will remove all the files
+and directories stored in the volume, as well as the sub-directory within `root`
+that was created by Mesos for the volume.
 
 A `Mount` disk will __not__ have sub-directories created, allowing applications
 to use the full file system mounted on the device. This construct allows Mesos
 tasks to access volumes that contain pre-existing directory structures. This can
 be useful to simplify ingesting data such as a pre-existing Postgres database or
-HDFS data directory.
+HDFS data directory. Note that when a persistent volume on a `Mount` disk is
+destroyed, Mesos will remove all the files and directories stored in the volume,
+but will __not__ remove the root directory (i.e., the mount point).
 
 Operators should be aware of these distinctions when inspecting or cleaning up
 remnant data.

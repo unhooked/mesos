@@ -15,6 +15,7 @@
 // limitations under the License.
 
 #include <map>
+#include <set>
 #include <vector>
 
 #include <process/dispatch.hpp>
@@ -22,6 +23,7 @@
 
 #include <stout/fs.hpp>
 #include <stout/hashmap.hpp>
+#include <stout/numify.hpp>
 #include <stout/os.hpp>
 #include <stout/stringify.hpp>
 #include <stout/strings.hpp>
@@ -43,7 +45,12 @@
 #include "slave/containerizer/mesos/linux_launcher.hpp"
 #endif // __linux__
 
+#ifdef __linux__
+#include "slave/containerizer/mesos/isolators/gpu/nvml.hpp"
+#endif // __linux__
+
 using std::map;
+using std::set;
 using std::string;
 using std::vector;
 
@@ -91,6 +98,108 @@ Try<Resources> Containerizer::resources(const Flags& flags)
         stringify(cpus),
         flags.default_role).get();
   }
+
+#ifdef __linux__
+  // GPU resource.
+  // To determine the proper number of GPU resources to return, we
+  // need to check both the --resources and --nvidia_gpu_devices.
+  // There are two cases to consider:
+  //
+  //   (1) --resources includes "gpus" and --nvidia_gpu_devices is set.
+  //       The number of GPUs in --resources must equal the number of
+  //       GPUs within --nvidia_gpu_resources.
+  //
+  //   (2) --resources does not include "gpus" and --nvidia_gpu_devices
+  //       is not specified. Here we auto-discover GPUs using the
+  //       NVIDIA management Library (NVML). We special case specifying
+  //       `gpus:0` explicitly to not perform auto-discovery.
+  //
+  // NOTE: We also check to make sure the `gpu/nvidia` isolation flag
+  // is set before enumerating GPUs. We do this because we decided it
+  // makes sense to only do autodiscovery of GPUs when this isolator
+  // is turned on (unlike for CPUs, memory, and disk where
+  // autodiscovery happens by default). We decided to take this
+  // approach, because GPU support is still experimental, and is only
+  // known to work well if this isolator is enabled. We didn't want to
+  // start advertising GPUs in our resource offer and have people
+  // attempt to use them in scenarious we haven't considered yet. In
+  // the future we may support other use cases, but for now we are
+  // being cautious.
+  const vector<string> tokens = strings::tokenize(flags.isolation, ",");
+  const set<string> isolators = set<string>(tokens.begin(), tokens.end());
+
+  if (flags.nvidia_gpu_devices.isSome() && isolators.count("gpu/nvidia") == 0) {
+    return Error("'--nvidia_gpus_devices' can only be specified if the"
+                 " `--isolation` flag contains `gpu/nvidia`");
+  }
+
+  if (isolators.count("gpu/nvidia") > 0 && nvml::isAvailable()) {
+    Try<Nothing> initialized = nvml::initialize();
+    if (initialized.isError()) {
+      return Error("Failed to nvml::initialize: " + initialized.error());
+    }
+
+    Try<unsigned int> available = nvml::deviceGetCount();
+    if (available.isError()) {
+      return Error("Failed to nvml::deviceGetCount: " + available.error());
+    }
+
+    if (strings::contains(flags.resources.getOrElse(""), "gpus")) {
+      if (flags.nvidia_gpu_devices.isSome() && !resources.gpus().isSome()) {
+        return Error("'--nvidia_gpus_devices' cannot be specified"
+                     " when --resources specifies 0 gpus");
+      }
+
+      if (!flags.nvidia_gpu_devices.isSome() && resources.gpus().isSome()) {
+        return Error("The 'gpus' resource can not be specified without also"
+                     " setting '--nvidia_gpu_devices'");
+      }
+
+      if (resources.gpus().isSome()) {
+        // Make sure that the value of "gpus" is an integer and not a
+        // fractional amount. We take advantage of the fact that we know
+        // the value of "gpus" is only precise up to 3 decimals.
+        long long milli = static_cast<long long>(resources.gpus().get() * 1000);
+        if ((milli % 1000) != 0) {
+          return Error("The 'gpus' resource must be an non-negative integer");
+        }
+
+        // Make sure the `nvidia_gpu_devices` flag
+        // contains a list of unique GPU identifiers.
+        vector<unsigned int> unique = flags.nvidia_gpu_devices.get();
+        std::sort(unique.begin(), unique.end());
+        auto last = std::unique(unique.begin(), unique.end());
+        unique.erase(last, unique.end());
+
+        if (unique.size() != flags.nvidia_gpu_devices->size()) {
+          return Error("'--nvidia_gpu_devices' contains duplicates");
+        }
+
+        if (flags.nvidia_gpu_devices->size() != resources.gpus().get()) {
+          return Error("'--resources' and '--nvidia_gpu_devices' specify"
+                       " different numbers of GPU devices");
+        }
+
+        if (resources.gpus().get() > available.get()) {
+          return Error("The number of GPUs requested is greater than"
+                       " the number of GPUs available on the machine");
+        }
+      }
+    } else {
+      if (flags.nvidia_gpu_devices.isSome()) {
+        return Error("'--nvidia_gpus_devices'cannot be set without"
+                     " also setting the 'gpus' in --resources");
+      }
+
+      // When doing auto-discovery, we use the NVML device
+      // count to set the number of available GPU resources.
+      resources += Resources::parse(
+          "gpus",
+          stringify(available.get()),
+          flags.default_role).get();
+    }
+  }
+#endif
 
   // Memory resource.
   if (!strings::contains(flags.resources.getOrElse(""), "mem")) {
@@ -257,8 +366,7 @@ map<string, string> executorEnvironment(
     const SlaveID& slaveId,
     const PID<Slave>& slavePid,
     bool checkpoint,
-    const Flags& flags,
-    bool includeOsEnvironment)
+    const Flags& flags)
 {
   map<string, string> environment;
 
@@ -281,8 +389,12 @@ map<string, string> executorEnvironment(
       CHECK(value.is<JSON::String>());
       environment[key] = value.as<JSON::String>().value;
     }
-  } else if (includeOsEnvironment) {
-    environment = os::environment();
+  }
+
+  // Include a default $PATH if there isn't.
+  if (environment.count("PATH") == 0) {
+    environment["PATH"] =
+      "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
   }
 
   // Set LIBPROCESS_PORT so that we bind to a random free port (since
@@ -329,8 +441,19 @@ map<string, string> executorEnvironment(
   environment["MESOS_SLAVE_PID"] = stringify(slavePid);
   environment["MESOS_AGENT_ENDPOINT"] = stringify(slavePid.address);
   environment["MESOS_CHECKPOINT"] = checkpoint ? "1" : "0";
+  environment["MESOS_HTTP_COMMAND_EXECUTOR"] =
+    flags.http_command_executor ? "1" : "0";
+
+  // Set executor's shutdown grace period. If set, the customized value
+  // from `ExecutorInfo` overrides the default from agent flags.
+  Duration executorShutdownGracePeriod = flags.executor_shutdown_grace_period;
+  if (executorInfo.has_shutdown_grace_period()) {
+    executorShutdownGracePeriod =
+      Nanoseconds(executorInfo.shutdown_grace_period().nanoseconds());
+  }
+
   environment["MESOS_EXECUTOR_SHUTDOWN_GRACE_PERIOD"] =
-    stringify(flags.executor_shutdown_grace_period);
+    stringify(executorShutdownGracePeriod);
 
   if (checkpoint) {
     environment["MESOS_RECOVERY_TIMEOUT"] = stringify(flags.recovery_timeout);

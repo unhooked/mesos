@@ -36,12 +36,13 @@
 
 #include "master/master.hpp"
 
+#include "master/detector/standalone.hpp"
+
 #include "messages/messages.hpp"
 
 #include "module/manager.hpp"
 
 #include "slave/flags.hpp"
-#include "slave/monitor.hpp"
 #include "slave/slave.hpp"
 #include "slave/qos_controllers/load.hpp"
 
@@ -54,9 +55,13 @@ using namespace process;
 
 using mesos::internal::master::Master;
 
+using mesos::internal::protobuf::createLabel;
+
 using mesos::internal::slave::LoadQoSController;
-using mesos::internal::slave::ResourceMonitor;
 using mesos::internal::slave::Slave;
+
+using mesos::master::detector::MasterDetector;
+using mesos::master::detector::StandaloneMasterDetector;
 
 using mesos::slave::QoSCorrection;
 
@@ -173,9 +178,8 @@ private:
 
 
 // This test verifies that the ResourceEstimator is able to fetch
-// ResourceUsage statistics about running executor from
-// the ResourceMonitor.
-TEST_F(OversubscriptionTest, FetchResourceUsageFromMonitor)
+// ResourceUsage statistics about running executor.
+TEST_F(OversubscriptionTest, FetchResourceUsage)
 {
   Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
@@ -223,6 +227,10 @@ TEST_F(OversubscriptionTest, FetchResourceUsageFromMonitor)
   EXPECT_NE(0u, offers.get().size());
 
   TaskInfo task = createTask(offers.get()[0], "sleep 10", DEFAULT_EXECUTOR_ID);
+  task.mutable_labels()->add_labels()->CopyFrom(
+      createLabel("key1", "value1"));
+  task.mutable_executor()->mutable_labels()->add_labels()->CopyFrom(
+      createLabel("key2", "value2"));
 
   Future<TaskStatus> status;
   EXPECT_CALL(sched, statusUpdate(&driver, _))
@@ -249,6 +257,17 @@ TEST_F(OversubscriptionTest, FetchResourceUsageFromMonitor)
   EXPECT_EQ(usage.get().executors(0).executor_info().executor_id(),
             DEFAULT_EXECUTOR_ID);
   ASSERT_EQ(usage.get().executors(0).statistics(), statistics);
+  ASSERT_EQ(task.executor().labels(),
+            usage.get().executors(0).executor_info().labels());
+  ASSERT_EQ(1, usage.get().executors(0).tasks().size());
+  ASSERT_EQ(task.name(),
+            usage.get().executors(0).tasks(0).name());
+  ASSERT_EQ(task.task_id(),
+            usage.get().executors(0).tasks(0).id());
+  ASSERT_EQ(task.resources(),
+            usage.get().executors(0).tasks(0).resources());
+  ASSERT_EQ(task.labels(),
+            usage.get().executors(0).tasks(0).labels());
 
   EXPECT_CALL(exec, shutdown(_))
     .Times(AtMost(1));
@@ -490,7 +509,7 @@ TEST_F(OversubscriptionTest, RescindRevocableOffer)
     .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   // Inject another estimation of oversubscribable resources while the
-  // previous revocable offer is oustanding.
+  // previous revocable offer is outstanding.
   Resources resources2 = createRevocableResources("cpus", "2");
   estimations.put(resources2);
 
@@ -618,9 +637,8 @@ TEST_F(OversubscriptionTest, FixedResourceEstimator)
 
 
 // This test verifies that the QoS Controller is able to fetch
-// ResourceUsage statistics about running executor from
-// the ResourceMonitor.
-TEST_F(OversubscriptionTest, QoSFetchResourceUsageFromMonitor)
+// ResourceUsage statistics about running executor.
+TEST_F(OversubscriptionTest, QoSFetchResourceUsage)
 {
   Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
@@ -668,6 +686,8 @@ TEST_F(OversubscriptionTest, QoSFetchResourceUsageFromMonitor)
   EXPECT_NE(0u, offers.get().size());
 
   TaskInfo task = createTask(offers.get()[0], "sleep 10", DEFAULT_EXECUTOR_ID);
+  task.mutable_executor()->mutable_labels()->add_labels()->CopyFrom(
+      createLabel("key", "value"));
 
   Future<TaskStatus> status;
   EXPECT_CALL(sched, statusUpdate(&driver, _))
@@ -694,6 +714,8 @@ TEST_F(OversubscriptionTest, QoSFetchResourceUsageFromMonitor)
   EXPECT_EQ(usage.get().executors(0).executor_info().executor_id(),
             DEFAULT_EXECUTOR_ID);
   ASSERT_EQ(usage.get().executors(0).statistics(), statistics);
+  ASSERT_EQ(task.executor().labels(),
+            usage.get().executors(0).executor_info().labels());
 
   EXPECT_CALL(exec, shutdown(_))
     .Times(AtMost(1));
@@ -911,7 +933,8 @@ TEST_F(OversubscriptionTest, QoSCorrectionKill)
 //   5. Check if revocable offers are being sent to the framework.
 TEST_F(OversubscriptionTest, UpdateAllocatorOnSchedulerFailover)
 {
-  Try<Owned<cluster::Master>> master = StartMaster();
+  master::Flags masterFlags = MesosTest::CreateMasterFlags();
+  Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
   ASSERT_SOME(master);
 
   MockExecutor exec(DEFAULT_EXECUTOR_ID);
@@ -995,13 +1018,18 @@ TEST_F(OversubscriptionTest, UpdateAllocatorOnSchedulerFailover)
 
   driver2.start();
 
-  AWAIT_READY(offers1);
-  EXPECT_NE(0u, offers1.get().size());
-  EXPECT_TRUE(Resources(offers1.get()[0].resources()).revocable().empty());
-
   AWAIT_READY(sched2Registered);
 
   AWAIT_READY(sched1Error);
+
+  // Advance the clock and trigger a batch allocation.
+  Clock::pause();
+  Clock::advance(masterFlags.allocation_interval);
+  Clock::resume();
+
+  AWAIT_READY(offers1);
+  EXPECT_NE(0u, offers1.get().size());
+  EXPECT_TRUE(Resources(offers1.get()[0].resources()).revocable().empty());
 
   // Check if framework receives revocable offers.
   Future<vector<Offer>> offers2;
@@ -1027,7 +1055,8 @@ TEST_F(OversubscriptionTest, UpdateAllocatorOnSchedulerFailover)
 TEST_F(OversubscriptionTest, RemoveCapabilitiesOnSchedulerFailover)
 {
   // Start the master.
-  Try<Owned<cluster::Master>> master = StartMaster();
+  master::Flags masterFlags = MesosTest::CreateMasterFlags();
+  Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
   ASSERT_SOME(master);
 
   // Start the slave with mock executor and test resource estimator.
@@ -1116,6 +1145,12 @@ TEST_F(OversubscriptionTest, RemoveCapabilitiesOnSchedulerFailover)
     .WillRepeatedly(Return());
 
   driver2.start();
+
+  // Ensure resources are be recovered before a batch allocation is triggered.
+  Clock::pause();
+  Clock::settle();
+  Clock::advance(masterFlags.allocation_interval);
+  Clock::resume();
 
   AWAIT_READY(offers3);
   EXPECT_NE(0u, offers3.get().size());

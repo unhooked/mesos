@@ -36,8 +36,6 @@ constexpr Duration EXECUTOR_REREGISTER_TIMEOUT = Seconds(2);
 // shut down before destroying the container.
 constexpr Duration DEFAULT_EXECUTOR_SHUTDOWN_GRACE_PERIOD = Seconds(5);
 
-constexpr Duration EXECUTOR_SIGNAL_ESCALATION_TIMEOUT = Seconds(3);
-
 constexpr Duration RECOVERY_TIMEOUT = Minutes(15);
 
 constexpr Duration STATUS_UPDATE_RETRY_INTERVAL_MIN = Seconds(10);
@@ -108,8 +106,22 @@ constexpr size_t DOCKER_PS_MAX_INSPECT_CALLS = 100;
 // TODO(tnachen): Make this a flag.
 constexpr Duration DOCKER_VERSION_WAIT_TIMEOUT = Seconds(5);
 
+// Additional duration that docker containerizer will wait beyond the
+// configured `docker_stop_timeout` for docker stop to succeed, before
+// trying to kill the process by itself.
+constexpr Duration DOCKER_FORCE_KILL_TIMEOUT = Seconds(1);
+
 // Name of the default, CRAM-MD5 authenticatee.
 constexpr char DEFAULT_AUTHENTICATEE[] = "crammd5";
+
+// Name of the default, local authorizer.
+constexpr char DEFAULT_AUTHORIZER[] = "local";
+
+// Name of the default HTTP authenticator.
+constexpr char DEFAULT_HTTP_AUTHENTICATOR[] = "basic";
+
+// Name of the default agent HTTP authentication realm.
+constexpr char DEFAULT_HTTP_AUTHENTICATION_REALM[] = "mesos-agent";
 
 // Default maximum storage space to be used by the fetcher cache.
 constexpr Bytes DEFAULT_FETCHER_CACHE_SIZE = Gigabytes(2);
@@ -117,9 +129,6 @@ constexpr Bytes DEFAULT_FETCHER_CACHE_SIZE = Gigabytes(2);
 // If no pings received within this timeout, then the slave will
 // trigger a re-detection of the master to cause a re-registration.
 Duration DEFAULT_MASTER_PING_TIMEOUT();
-
-// Container path that the slave sets to mount the command executor rootfs to.
-constexpr char COMMAND_EXECUTOR_ROOTFS_CONTAINER_PATH[] = ".rootfs";
 
 } // namespace slave {
 } // namespace internal {

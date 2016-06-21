@@ -74,7 +74,7 @@ static Try<bool> extract(
     string filename = Path(pathWithoutExtension).basename();
     command = "gzip -dc > '" + destinationDirectory + "/" + filename + "' <";
   } else if (strings::endsWith(sourcePath, ".zip")) {
-    command = "unzip -d '" + destinationDirectory + "'";
+    command = "unzip -o -d '" + destinationDirectory + "'";
   } else {
     return false;
   }
@@ -249,13 +249,30 @@ static Try<string> fetchBypassingCache(
 {
   LOG(INFO) << "Fetching directly into the sandbox directory";
 
-  Try<string> basename = Fetcher::basename(uri.value());
-  if (basename.isError()) {
-    return Error("Failed to determine the basename of the URI '" +
-                 uri.value() + "' with error: " + basename.error());
+  // TODO(mrbrowning): Factor out duplicated processing of "output_file" field
+  // here and in fetchFromCache into a separate helper function.
+  if (uri.has_output_file()) {
+    string dirname = Path(uri.output_file()).dirname();
+    if (dirname != ".") {
+      Try<Nothing> result =
+        os::mkdir(path::join(sandboxDirectory, dirname), true);
+
+      if (result.isError()) {
+        return Error(
+            "Unable to create subdirectory " + dirname + " in sandbox");
+      }
+    }
   }
 
-  string path = path::join(sandboxDirectory, basename.get());
+  Try<string> outputFile = uri.has_output_file()
+    ? uri.output_file()
+    : Fetcher::basename(uri.value());
+
+  if (outputFile.isError()) {
+    return Error(outputFile.error());
+  }
+
+  string path = path::join(sandboxDirectory, outputFile.get());
 
   Try<string> downloaded = download(uri.value(), path, frameworksHome);
   if (downloaded.isError()) {
@@ -288,12 +305,28 @@ static Try<string> fetchFromCache(
 {
   LOG(INFO) << "Fetching from cache";
 
-  Try<string> basename = Fetcher::basename(item.uri().value());
-  if (basename.isError()) {
-    return Error(basename.error());
+  if (item.uri().has_output_file()) {
+    string dirname = Path(item.uri().output_file()).dirname();
+    if (dirname != ".") {
+      Try<Nothing> result =
+        os::mkdir(path::join(sandboxDirectory, dirname), true);
+
+      if (result.isError()) {
+        return Error(
+          "Unable to create subdirectory " + dirname + "in sandbox");
+      }
+    }
   }
 
-  string destinationPath = path::join(sandboxDirectory, basename.get());
+  Try<string> outputFile = item.uri().has_output_file()
+    ? item.uri().output_file()
+    : Fetcher::basename(item.uri().value());
+
+  if (outputFile.isError()) {
+    return Error(outputFile.error());
+  }
+
+  string destinationPath = path::join(sandboxDirectory, outputFile.get());
 
   // Non-empty cache filename is guaranteed by the callers of this function.
   CHECK(!item.cache_filename().empty());
@@ -411,11 +444,16 @@ int main(int argc, char* argv[])
 
   mesos::internal::logging::Flags flags;
 
-  Try<Nothing> load = flags.load("MESOS_", argc, argv);
+  Try<flags::Warnings> load = flags.load("MESOS_", argc, argv);
 
   CHECK_SOME(load) << "Could not load flags: " << load.error();
 
   logging::initialize(argv[0], flags, true); // Catch signals.
+
+  // Log any flag warnings (after logging is initialized).
+  foreach (const flags::Warning& warning, load->warnings) {
+    LOG(WARNING) << warning.message;
+  }
 
   const Option<string> jsonFetcherInfo = os::getenv("MESOS_FETCHER_INFO");
   CHECK_SOME(jsonFetcherInfo)
@@ -450,8 +488,8 @@ int main(int argc, char* argv[])
     Try<string> fetched =
       fetch(item, cacheDirectory, sandboxDirectory, frameworksHome);
     if (fetched.isError()) {
-      EXIT(1) << "Failed to fetch '" << item.uri().value()
-              << "': " + fetched.error();
+      EXIT(EXIT_FAILURE)
+        << "Failed to fetch '" << item.uri().value() << "': " + fetched.error();
     } else {
       LOG(INFO) << "Fetched '" << item.uri().value()
                 << "' to '" << fetched.get() << "'";
@@ -464,8 +502,8 @@ int main(int argc, char* argv[])
         fetcherInfo.get().user(),
         sandboxDirectory);
     if (chowned.isError()) {
-      EXIT(1) << "Failed to chown " << sandboxDirectory
-              << ": " << chowned.error();
+      EXIT(EXIT_FAILURE)
+        << "Failed to chown " << sandboxDirectory << ": " << chowned.error();
     }
   }
 

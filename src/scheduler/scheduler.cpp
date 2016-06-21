@@ -28,11 +28,15 @@
 #include <queue>
 #include <string>
 #include <sstream>
+#include <tuple>
 
 #include <mesos/v1/mesos.hpp>
 #include <mesos/v1/scheduler.hpp>
 
+#include <mesos/master/detector.hpp>
+
 #include <process/async.hpp>
+#include <process/collect.hpp>
 #include <process/defer.hpp>
 #include <process/delay.hpp>
 #include <process/dispatch.hpp>
@@ -66,13 +70,13 @@
 
 #include "local/local.hpp"
 
-#include "logging/flags.hpp"
 #include "logging/logging.hpp"
 
-#include "master/detector.hpp"
 #include "master/validation.hpp"
 
 #include "messages/messages.hpp"
+
+#include "scheduler/flags.hpp"
 
 using namespace mesos;
 using namespace mesos::internal;
@@ -80,14 +84,19 @@ using namespace mesos::internal::master;
 
 using namespace process;
 
+using std::get;
 using std::ostream;
 using std::queue;
 using std::shared_ptr;
 using std::string;
+using std::tuple;
 using std::vector;
 
 using mesos::internal::recordio::Reader;
 
+using mesos::master::detector::MasterDetector;
+
+using process::collect;
 using process::Owned;
 using process::wait; // Necessary on some OS's to disambiguate.
 
@@ -127,27 +136,18 @@ public:
       const lambda::function<void()>& connected,
       const lambda::function<void()>& disconnected,
       const lambda::function<void(const queue<Event>&)>& received,
-      const Option<shared_ptr<MasterDetector>>& _detector)
+      const Option<Credential>& _credential,
+      const Option<shared_ptr<MasterDetector>>& _detector,
+      const Flags& _flags)
     : ProcessBase(ID::generate("scheduler")),
       state(DISCONNECTED),
       contentType(_contentType),
       callbacks {connected, disconnected, received},
-      local(false)
+      credential(_credential),
+      local(false),
+      flags(_flags)
   {
     GOOGLE_PROTOBUF_VERIFY_VERSION;
-
-    // Load any flags from the environment (we use local::Flags in the
-    // event we run in 'local' mode, since it inherits
-    // logging::Flags). In the future, just as the TODO in
-    // local/main.cpp discusses, we'll probably want a way to load
-    // master::Flags and slave::Flags as well.
-    local::Flags flags;
-
-    Try<Nothing> load = flags.load("MESOS_");
-
-    if (load.isError()) {
-      EXIT(1) << "Failed to load flags: " << load.error();
-    }
 
     // Initialize libprocess (done here since at some point we might
     // want to use flags to initialize libprocess).
@@ -183,7 +183,8 @@ public:
         MasterDetector::create(pid.isSome() ? string(pid.get()) : master);
 
       if (create.isError()) {
-        EXIT(1) << "Failed to create a master detector: " << create.error();
+        EXIT(EXIT_FAILURE)
+          << "Failed to create a master detector: " << create.error();
       }
 
       detector.reset(create.get());
@@ -241,6 +242,14 @@ public:
     request.headers = {{"Accept", stringify(contentType)},
                        {"Content-Type", stringify(contentType)}};
 
+    // TODO(anand): Add support for other authentication schemes.
+
+    if (credential.isSome()) {
+      request.headers["Authorization"] =
+        "Basic " +
+        base64::encode(credential->principal() + ":" + credential->secret());
+    }
+
     CHECK_SOME(connections);
 
     Future<Response> response;
@@ -266,6 +275,23 @@ public:
                          lambda::_1));
   }
 
+  void reconnect()
+  {
+    // Ignore the reconnection request if we are currently disconnected
+    // from the master.
+    if (state == DISCONNECTED) {
+      VLOG(1) << "Ignoring reconnect request from scheduler since we are"
+              << " disconnected";
+
+      return;
+    }
+
+    CHECK_SOME(connectionId);
+
+    disconnected(connectionId.get(),
+                 "Received reconnect request from scheduler");
+  }
+
 protected:
   virtual void initialize()
   {
@@ -274,39 +300,33 @@ protected:
       .onAny(defer(self(), &MesosProcess::detected, lambda::_1));
   }
 
-  void connect()
+  void connect(const UUID& _connectionId)
   {
+    // It is possible that a new master was detected while we were waiting
+    // to establish a connection with the old master.
+    if (connectionId != _connectionId) {
+      VLOG(1) << "Ignoring connection attempt from stale connection";
+      return;
+    }
+
     CHECK_EQ(DISCONNECTED, state);
     CHECK_SOME(master);
 
-    connectionId = UUID::random();
-
     state = CONNECTING;
 
-    // These automatic variables are needed for lambda capture. We need to
-    // create a copy here because `master` or `connectionId` values might change
-    // by the time the second `http::connect` gets called.
-    ::URL master_ = master.get();
-    UUID connectionId_ = connectionId.get();
+    auto connector = [this]() -> Future<Connection> {
+      return process::http::connect(master.get());
+    };
 
     // We create two persistent connections here, one for subscribe
     // call/streaming response and another for non-subscribe calls/responses.
-    process::http::connect(master_)
-      .onAny(defer(self(), [this, master_, connectionId_](
-                               const Future<Connection>& connection) {
-        process::http::connect(master_)
-          .onAny(defer(self(),
-                       &Self::connected,
-                       connectionId_,
-                       connection,
-                       lambda::_1));
-      }));
+    collect(connector(), connector())
+      .onAny(defer(self(), &Self::connected, connectionId.get(), lambda::_1));
   }
 
   void connected(
       const UUID& _connectionId,
-      const Future<Connection>& connection1,
-      const Future<Connection>& connection2)
+      const Future<tuple<Connection, Connection>>& _connections)
   {
     // It is possible that a new master was detected while we had an ongoing
     // (re-)connection attempt with the old master.
@@ -318,19 +338,11 @@ protected:
     CHECK_EQ(CONNECTING, state);
     CHECK_SOME(connectionId);
 
-    if (!connection1.isReady()) {
+    if (!_connections.isReady()) {
       disconnected(connectionId.get(),
-                   connection1.isFailed()
-                     ? connection1.failure()
-                     : "Subscribe future discarded");
-      return;
-    }
-
-    if (!connection2.isReady()) {
-      disconnected(connectionId.get(),
-                   connection2.isFailed()
-                     ? connection2.failure()
-                     : "Non-subscribe future discarded");
+                   _connections.isFailed()
+                     ? _connections.failure()
+                     : "Connection future discarded");
       return;
     }
 
@@ -338,7 +350,8 @@ protected:
 
     state = CONNECTED;
 
-    connections = Connections {connection1.get(), connection2.get()};
+    connections =
+      Connections {get<0>(_connections.get()), get<1>(_connections.get())};
 
     connections->subscribe.disconnected()
       .onAny(defer(self(),
@@ -416,27 +429,48 @@ protected:
 
     Option<mesos::MasterInfo> latest;
     if (future.isDiscarded()) {
-      VLOG(1) << "Re-detecting master";
+      LOG(INFO) << "Re-detecting master";
       master = None();
       latest = None();
     } else if (future->isNone()) {
-      VLOG(1) << "Lost leading master";
+      LOG(INFO) << "Lost leading master";
       master = None();
       latest = None();
     } else {
       const UPID& upid = future.get().get().pid();
       latest = future.get();
 
+      string scheme = "http";
+
+#ifdef USE_SSL_SOCKET
+      Option<string> value;
+
+      value = os::getenv("SSL_ENABLED");
+      if (value.isSome() && (value.get() == "1" || value.get() == "true")) {
+        scheme = "https";
+      }
+#endif
+
       master = ::URL(
-        "http",
+        scheme,
         upid.address.ip,
         upid.address.port,
         upid.id +
         "/api/v1/scheduler");
 
-      VLOG(1) << "New master detected at " << upid;
+      LOG(INFO) << "New master detected at " << upid;
 
-      connect();
+      connectionId = UUID::random();
+
+      // Wait for a random duration between 0 and `flags.connectionDelayMax`
+      // before (re-)connecting with the master.
+      Duration delay = flags.connectionDelayMax * ((double) os::random()
+                       / RAND_MAX);
+
+      VLOG(1) << "Waiting for " << delay << " before initiating a "
+              << "re-(connection) attempt with the master";
+
+      process::delay(delay, self(), &MesosProcess::connect, connectionId.get());
     }
 
     // Keep detecting masters.
@@ -537,6 +571,22 @@ protected:
     if (response->code == process::http::Status::SERVICE_UNAVAILABLE) {
       // This could happen if the master hasn't realized it is the leader yet
       // or is still in the process of recovery.
+      LOG(WARNING) << "Received '" << response->status << "' ("
+                   << response->body << ") for " << call.type();
+      return;
+    }
+
+    if (response->code == process::http::Status::NOT_FOUND) {
+      // This could happen if the master libprocess process has not yet set up
+      // HTTP routes.
+      LOG(WARNING) << "Received '" << response->status << "' ("
+                   << response->body << ") for " << call.type();
+      return;
+    }
+
+    if (response->code == process::http::Status::TEMPORARY_REDIRECT) {
+      // This could happen if the detector detects a new leading master before
+      // master itself realizes it (e.g., ZK watch delay).
       LOG(WARNING) << "Received '" << response->status << "' ("
                    << response->body << ") for " << call.type();
       return;
@@ -671,12 +721,14 @@ private:
   Option<SubscribedResponse> subscribed;
   ContentType contentType;
   Callbacks callbacks;
+  const Option<Credential> credential;
   Mutex mutex; // Used to serialize the callback invocations.
   bool local; // Whether or not we launched a local cluster.
   shared_ptr<MasterDetector> detector;
   queue<Event> events;
   Option<::URL> master;
   Option<UUID> streamId;
+  const Flags flags;
 
   // Master detection future.
   process::Future<Option<mesos::MasterInfo>> detection;
@@ -689,15 +741,31 @@ Mesos::Mesos(
     const lambda::function<void()>& connected,
     const lambda::function<void()>& disconnected,
     const lambda::function<void(const queue<Event>&)>& received,
+    const Option<Credential>& credential,
     const Option<shared_ptr<MasterDetector>>& detector)
 {
+  Flags flags;
+
+  Try<flags::Warnings> load = flags.load("MESOS_");
+
+  if (load.isError()) {
+    EXIT(EXIT_FAILURE) << "Failed to load flags: " << load.error();
+  }
+
+  // Log any flag warnings (after logging is initialized).
+  foreach (const flags::Warning& warning, load->warnings) {
+    LOG(WARNING) << warning.message;
+  }
+
   process = new MesosProcess(
       master,
       contentType,
       connected,
       disconnected,
       received,
-      detector);
+      credential,
+      detector,
+      flags);
 
   spawn(process);
 }
@@ -708,13 +776,20 @@ Mesos::Mesos(
     ContentType contentType,
     const lambda::function<void()>& connected,
     const lambda::function<void()>& disconnected,
-    const lambda::function<void(const queue<Event>&)>& received)
-  : Mesos(master, contentType, connected, disconnected, received, None()) {}
+    const lambda::function<void(const queue<Event>&)>& received,
+    const Option<Credential>& credential)
+  : Mesos(master,
+          contentType,
+          connected,
+          disconnected,
+          received,
+          credential,
+          None()) {}
 
 
 Mesos::~Mesos()
 {
-  if (process != NULL) {
+  if (process != nullptr) {
     stop();
   }
 }
@@ -726,14 +801,20 @@ void Mesos::send(const Call& call)
 }
 
 
+void Mesos::reconnect()
+{
+  dispatch(process, &MesosProcess::reconnect);
+}
+
+
 void Mesos::stop()
 {
-  if (process != NULL) {
+  if (process != nullptr) {
     terminate(process);
     wait(process);
 
     delete process;
-    process = NULL;
+    process = nullptr;
   }
 }
 

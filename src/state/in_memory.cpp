@@ -17,6 +17,9 @@
 #include <set>
 #include <string>
 
+#include <mesos/state/in_memory.hpp>
+#include <mesos/state/storage.hpp>
+
 #include <process/dispatch.hpp>
 #include <process/future.hpp>
 #include <process/process.hpp>
@@ -25,19 +28,15 @@
 #include <stout/option.hpp>
 #include <stout/uuid.hpp>
 
-#include "messages/state.hpp"
-
-#include "state/in_memory.hpp"
-#include "state/storage.hpp"
-
 using namespace process;
 
 // Note that we don't add 'using std::set' here because we need
 // 'std::' to disambiguate the 'set' member.
 using std::string;
 
+using mesos::internal::state::Entry;
+
 namespace mesos {
-namespace internal {
 namespace state {
 
 
@@ -53,7 +52,8 @@ public:
   {
     const Option<Entry>& option = entries.get(entry.name());
 
-    if (option.isSome() && UUID::fromBytes(option.get().uuid()) != uuid) {
+    if (option.isSome() &&
+        UUID::fromBytes(option.get().uuid()).get() != uuid) {
       return false;
     }
 
@@ -69,7 +69,8 @@ public:
       return false;
     }
 
-    if (UUID::fromBytes(option.get().uuid()) != UUID::fromBytes(entry.uuid())) {
+    if (UUID::fromBytes(option.get().uuid()).get() !=
+        UUID::fromBytes(entry.uuid()).get()) {
       return false;
     }
 
@@ -104,7 +105,7 @@ InMemoryStorage::~InMemoryStorage()
 }
 
 
-Future<Option<Entry> > InMemoryStorage::get(const string& name)
+Future<Option<Entry>> InMemoryStorage::get(const string& name)
 {
   return dispatch(process, &InMemoryStorageProcess::get, name);
 }
@@ -122,11 +123,10 @@ Future<bool> InMemoryStorage::expunge(const Entry& entry)
 }
 
 
-Future<std::set<string> > InMemoryStorage::names()
+Future<std::set<string>> InMemoryStorage::names()
 {
   return dispatch(process, &InMemoryStorageProcess::names);
 }
 
 } // namespace state {
-} // namespace internal {
 } // namespace mesos {

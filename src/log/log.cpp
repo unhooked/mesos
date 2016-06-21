@@ -14,7 +14,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "log/log.hpp"
+
 #include <stdint.h>
+
+#include <mesos/log/log.hpp>
 
 #include <process/defer.hpp>
 #include <process/dispatch.hpp>
@@ -24,15 +28,15 @@
 #include <process/process.hpp>
 #include <process/shared.hpp>
 
+#include <process/metrics/metrics.hpp>
+
 #include <stout/check.hpp>
-#include <stout/error.hpp>
 #include <stout/foreach.hpp>
 #include <stout/lambda.hpp>
 #include <stout/nothing.hpp>
 #include <stout/set.hpp>
 
 #include "log/coordinator.hpp"
-#include "log/log.hpp"
 #include "log/network.hpp"
 #include "log/recover.hpp"
 #include "log/replica.hpp"
@@ -43,152 +47,15 @@ using std::list;
 using std::set;
 using std::string;
 
+using mesos::log::Log;
+
+using mesos::internal::log::LogProcess;
+using mesos::internal::log::LogReaderProcess;
+using mesos::internal::log::LogWriterProcess;
+
 namespace mesos {
 namespace internal {
 namespace log {
-
-class LogProcess : public Process<LogProcess>
-{
-public:
-  LogProcess(
-      size_t _quorum,
-      const string& path,
-      const set<UPID>& pids,
-      bool _autoInitialize);
-
-  LogProcess(
-      size_t _quorum,
-      const string& path,
-      const string& servers,
-      const Duration& timeout,
-      const string& znode,
-      const Option<zookeeper::Authentication>& auth,
-      bool _autoInitialize);
-
-  // Recovers the log by catching up if needed. Returns a shared
-  // pointer to the local replica if the recovery succeeds.
-  Future<Shared<Replica> > recover();
-
-protected:
-  virtual void initialize();
-  virtual void finalize();
-
-private:
-  friend class LogReaderProcess;
-  friend class LogWriterProcess;
-
-  // Continuations.
-  void _recover();
-
-  // TODO(benh): Factor this out into "membership renewer".
-  void watch(
-      const UPID& pid,
-      const set<zookeeper::Group::Membership>& memberships);
-
-  void failed(const string& message);
-  void discarded();
-
-  const size_t quorum;
-  Shared<Replica> replica;
-  Shared<Network> network;
-  const bool autoInitialize;
-
-  // For replica recovery.
-  Option<Future<Owned<Replica> > > recovering;
-  process::Promise<Nothing> recovered;
-  list<process::Promise<Shared<Replica> >*> promises;
-
-  // For renewing membership. We store a Group instance in order to
-  // continually renew the replicas membership (when using ZooKeeper).
-  zookeeper::Group* group;
-  Future<zookeeper::Group::Membership> membership;
-};
-
-
-class LogReaderProcess : public Process<LogReaderProcess>
-{
-public:
-  explicit LogReaderProcess(Log* log);
-
-  Future<Log::Position> beginning();
-  Future<Log::Position> ending();
-
-  Future<list<Log::Entry> > read(
-      const Log::Position& from,
-      const Log::Position& to);
-
-protected:
-  virtual void initialize();
-  virtual void finalize();
-
-private:
-  // Returns a position from a raw value.
-  static Log::Position position(uint64_t value);
-
-  // Returns a future which gets set when the log recovery has
-  // finished (either succeeded or failed).
-  Future<Nothing> recover();
-
-  // Continuations.
-  void _recover();
-
-  Future<Log::Position> _beginning();
-  Future<Log::Position> _ending();
-
-  Future<list<Log::Entry> > _read(
-      const Log::Position& from,
-      const Log::Position& to);
-
-  Future<list<Log::Entry> > __read(
-      const Log::Position& from,
-      const Log::Position& to,
-      const list<Action>& actions);
-
-  Future<Shared<Replica> > recovering;
-  list<process::Promise<Nothing>*> promises;
-};
-
-
-class LogWriterProcess : public Process<LogWriterProcess>
-{
-public:
-  explicit LogWriterProcess(Log* log);
-
-  Future<Option<Log::Position> > start();
-  Future<Option<Log::Position> > append(const string& bytes);
-  Future<Option<Log::Position> > truncate(const Log::Position& to);
-
-protected:
-  virtual void initialize();
-  virtual void finalize();
-
-private:
-  // Helper for converting an optional position returned from the
-  // coordinator into a Log::Position.
-  static Option<Log::Position> position(const Option<uint64_t>& position);
-
-  // Returns a future which gets set when the log recovery has
-  // finished (either succeeded or failed).
-  Future<Nothing> recover();
-
-  // Continuations.
-  void _recover();
-
-  Future<Option<Log::Position> > _start();
-  Option<Log::Position> __start(const Option<uint64_t>& position);
-
-  void failed(const string& message, const string& reason);
-
-  const size_t quorum;
-  const Shared<Network> network;
-
-  Future<Shared<Replica> > recovering;
-  list<process::Promise<Nothing>*> promises;
-
-  Coordinator* coordinator;
-  Option<string> error;
-};
-
 
 /////////////////////////////////////////////////
 // Implementation of LogProcess.
@@ -199,13 +66,15 @@ LogProcess::LogProcess(
     size_t _quorum,
     const string& path,
     const set<UPID>& pids,
-    bool _autoInitialize)
+    bool _autoInitialize,
+    const Option<string>& metricsPrefix)
   : ProcessBase(ID::generate("log")),
     quorum(_quorum),
     replica(new Replica(path)),
     network(new Network(pids + (UPID) replica->pid())),
     autoInitialize(_autoInitialize),
-    group(NULL) {}
+    group(nullptr),
+    metrics(*this, metricsPrefix) {}
 
 
 LogProcess::LogProcess(
@@ -215,7 +84,8 @@ LogProcess::LogProcess(
     const Duration& timeout,
     const string& znode,
     const Option<zookeeper::Authentication>& auth,
-    bool _autoInitialize)
+    bool _autoInitialize,
+    const Option<string>& metricsPrefix)
   : ProcessBase(ID::generate("log")),
     quorum(_quorum),
     replica(new Replica(path)),
@@ -226,12 +96,13 @@ LogProcess::LogProcess(
         auth,
         Set<UPID>((UPID) replica->pid()))),
     autoInitialize(_autoInitialize),
-    group(new zookeeper::Group(servers, timeout, znode, auth)) {}
+    group(new zookeeper::Group(servers, timeout, znode, auth)),
+    metrics(*this, metricsPrefix) {}
 
 
 void LogProcess::initialize()
 {
-  if (group != NULL) {
+  if (group != nullptr) {
     // Need to add our replica to the ZooKeeper group!
     LOG(INFO) << "Attempting to join replica to ZooKeeper group";
 
@@ -371,6 +242,12 @@ void LogProcess::_recover()
 }
 
 
+double LogProcess::_recovered()
+{
+  return recovered.future().isReady() ? 1 : 0;
+}
+
+
 void LogProcess::watch(
     const UPID& pid,
     const set<zookeeper::Group::Membership>& memberships)
@@ -400,6 +277,23 @@ void LogProcess::failed(const string& message)
 void LogProcess::discarded()
 {
   LOG(FATAL) << "Not expecting future to get discarded!";
+}
+
+
+LogProcess::Metrics::Metrics(
+    const LogProcess& process,
+    const Option<string>& prefix)
+  : recovered(
+        prefix.getOrElse("") + "log/recovered",
+        defer(process, &LogProcess::_recovered))
+{
+  process::metrics::add(recovered);
+}
+
+
+LogProcess::Metrics::~Metrics()
+{
+  process::metrics::remove(recovered);
 }
 
 
@@ -570,7 +464,7 @@ LogWriterProcess::LogWriterProcess(Log* log)
     quorum(log->process->quorum),
     network(log->process->network),
     recovering(dispatch(log->process, &LogProcess::recover)),
-    coordinator(NULL),
+    coordinator(nullptr),
     error(None()) {}
 
 
@@ -682,7 +576,7 @@ Future<Option<Log::Position> > LogWriterProcess::append(const string& bytes)
 {
   LOG(INFO) << "Attempting to append " << bytes.size() << " bytes to the log";
 
-  if (coordinator == NULL) {
+  if (coordinator == nullptr) {
     return Failure("No election has been performed");
   }
 
@@ -701,7 +595,7 @@ Future<Option<Log::Position> > LogWriterProcess::truncate(
 {
   LOG(INFO) << "Attempting to truncate the log to " << to.value;
 
-  if (coordinator == NULL) {
+  if (coordinator == nullptr) {
     return Failure("No election has been performed");
   }
 
@@ -731,6 +625,10 @@ void LogWriterProcess::failed(const string& message, const string& reason)
   error = message + ": " + reason;
 }
 
+} // namespace log {
+} // namespace internal {
+
+namespace log {
 
 /////////////////////////////////////////////////
 // Public interfaces for Log.
@@ -741,7 +639,8 @@ Log::Log(
     int quorum,
     const string& path,
     const set<UPID>& pids,
-    bool autoInitialize)
+    bool autoInitialize,
+    const Option<string>& metricsPrefix)
 {
   GOOGLE_PROTOBUF_VERIFY_VERSION;
 
@@ -750,10 +649,12 @@ Log::Log(
         quorum,
         path,
         pids,
-        autoInitialize);
+        autoInitialize,
+        metricsPrefix);
 
   spawn(process);
 }
+
 
 Log::Log(
     int quorum,
@@ -762,7 +663,8 @@ Log::Log(
     const Duration& timeout,
     const string& znode,
     const Option<zookeeper::Authentication>& auth,
-    bool autoInitialize)
+    bool autoInitialize,
+    const Option<string>& metricsPrefix)
 {
   GOOGLE_PROTOBUF_VERIFY_VERSION;
 
@@ -774,7 +676,8 @@ Log::Log(
         timeout,
         znode,
         auth,
-        autoInitialize);
+        autoInitialize,
+        metricsPrefix);
 
   spawn(process);
 }
@@ -866,5 +769,4 @@ Future<Option<Log::Position> > Log::Writer::truncate(const Log::Position& to)
 }
 
 } // namespace log {
-} // namespace internal {
 } // namespace mesos {

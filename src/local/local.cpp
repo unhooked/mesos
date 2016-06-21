@@ -27,8 +27,15 @@
 
 #include <mesos/module/anonymous.hpp>
 #include <mesos/module/authorizer.hpp>
+#include <mesos/module/contender.hpp>
+#include <mesos/module/detector.hpp>
 
 #include <mesos/slave/resource_estimator.hpp>
+
+#include <mesos/state/in_memory.hpp>
+#include <mesos/state/log.hpp>
+#include <mesos/state/protobuf.hpp>
+#include <mesos/state/storage.hpp>
 
 #include <process/limiter.hpp>
 #include <process/owned.hpp>
@@ -49,14 +56,15 @@
 #include "logging/flags.hpp"
 #include "logging/logging.hpp"
 
-#include "master/contender.hpp"
-#include "master/detector.hpp"
 #include "master/master.hpp"
 #include "master/registrar.hpp"
-#include "master/repairer.hpp"
 
 #include "master/allocator/mesos/hierarchical.hpp"
 #include "master/allocator/sorter/drf/sorter.hpp"
+
+#include "master/contender/standalone.hpp"
+
+#include "master/detector/standalone.hpp"
 
 #include "module/manager.hpp"
 
@@ -67,21 +75,23 @@
 #include "slave/containerizer/containerizer.hpp"
 #include "slave/containerizer/fetcher.hpp"
 
-#include "state/in_memory.hpp"
-#include "state/log.hpp"
-#include "state/protobuf.hpp"
-#include "state/storage.hpp"
-
 using namespace mesos::internal;
 using namespace mesos::internal::log;
 
+using mesos::log::Log;
+
 using mesos::master::allocator::Allocator;
+
+using mesos::master::contender::MasterContender;
+using mesos::master::contender::StandaloneMasterContender;
+
+using mesos::master::detector::MasterDetector;
+using mesos::master::detector::StandaloneMasterDetector;
 
 using mesos::internal::master::allocator::HierarchicalDRFAllocator;
 
 using mesos::internal::master::Master;
 using mesos::internal::master::Registrar;
-using mesos::internal::master::Repairer;
 
 using mesos::internal::slave::Containerizer;
 using mesos::internal::slave::Fetcher;
@@ -112,37 +122,37 @@ namespace mesos {
 namespace internal {
 namespace local {
 
-static Allocator* allocator = NULL;
-static Log* log = NULL;
-static state::Storage* storage = NULL;
-static state::protobuf::State* state = NULL;
-static Registrar* registrar = NULL;
-static Repairer* repairer = NULL;
-static Master* master = NULL;
+static Allocator* allocator = nullptr;
+static Log* log = nullptr;
+static mesos::state::Storage* storage = nullptr;
+static mesos::state::protobuf::State* state = nullptr;
+static Registrar* registrar = nullptr;
+static Master* master = nullptr;
 static map<Containerizer*, Slave*> slaves;
-static StandaloneMasterDetector* detector = NULL;
-static MasterContender* contender = NULL;
+static StandaloneMasterDetector* detector = nullptr;
+static MasterContender* contender = nullptr;
 static Option<Authorizer*> authorizer_ = None();
-static Files* files = NULL;
-static vector<GarbageCollector*>* garbageCollectors = NULL;
-static vector<StatusUpdateManager*>* statusUpdateManagers = NULL;
-static vector<Fetcher*>* fetchers = NULL;
-static vector<ResourceEstimator*>* resourceEstimators = NULL;
-static vector<QoSController*>* qosControllers = NULL;
+static Files* files = nullptr;
+static vector<GarbageCollector*>* garbageCollectors = nullptr;
+static vector<StatusUpdateManager*>* statusUpdateManagers = nullptr;
+static vector<Fetcher*>* fetchers = nullptr;
+static vector<ResourceEstimator*>* resourceEstimators = nullptr;
+static vector<QoSController*>* qosControllers = nullptr;
 
 
 PID<Master> launch(const Flags& flags, Allocator* _allocator)
 {
-  if (master != NULL) {
+  if (master != nullptr) {
     LOG(FATAL) << "Can only launch one local cluster at a time (for now)";
   }
 
-  if (_allocator == NULL) {
+  if (_allocator == nullptr) {
     // Create a default allocator.
     Try<Allocator*> defaultAllocator = HierarchicalDRFAllocator::create();
     if (defaultAllocator.isError()) {
-      EXIT(1) << "Failed to create an instance of HierarchicalDRFAllocator: "
-              << defaultAllocator.error();
+      EXIT(EXIT_FAILURE)
+        << "Failed to create an instance of HierarchicalDRFAllocator: "
+        << defaultAllocator.error();
     }
 
     // Update caller's instance.
@@ -153,17 +163,23 @@ PID<Master> launch(const Flags& flags, Allocator* _allocator)
   } else {
     // TODO(benh): Figure out the behavior of allocator pointer and remove the
     // else block.
-    allocator = NULL;
+    allocator = nullptr;
   }
 
   files = new Files();
 
   {
     master::Flags flags;
-    Try<Nothing> load = flags.load("MESOS_");
+    Try<flags::Warnings> load = flags.load("MESOS_");
     if (load.isError()) {
-      EXIT(1) << "Failed to start a local cluster while loading "
-              << "master flags from the environment: " << load.error();
+      EXIT(EXIT_FAILURE)
+        << "Failed to start a local cluster while loading"
+        << " master flags from the environment: " << load.error();
+    }
+
+    // Log any flag warnings.
+    foreach (const flags::Warning& warning, load->warnings) {
+      LOG(WARNING) << warning.message;
     }
 
     // Load modules. Note that this covers both, master and slave
@@ -171,16 +187,17 @@ PID<Master> launch(const Flags& flags, Allocator* _allocator)
     if (flags.modules.isSome()) {
       Try<Nothing> result = ModuleManager::load(flags.modules.get());
       if (result.isError()) {
-        EXIT(1) << "Error loading modules: " << result.error();
+        EXIT(EXIT_FAILURE) << "Error loading modules: " << result.error();
       }
     }
 
     if (flags.registry == "in_memory") {
       if (flags.registry_strict) {
-        EXIT(1) << "Cannot use '--registry_strict' when using in-memory storage"
-                << " based registry";
+        EXIT(EXIT_FAILURE)
+          << "Cannot use '--registry_strict' when using in-memory storage"
+          << " based registry";
       }
-      storage = new state::InMemoryStorage();
+      storage = new mesos::state::InMemoryStorage();
     } else if (flags.registry == "replicated_log") {
       // For local runs, we use a temporary work directory.
       if (flags.work_dir.isNone()) {
@@ -196,18 +213,20 @@ PID<Master> launch(const Flags& flags, Allocator* _allocator)
           1,
           path::join(flags.work_dir.get(), "replicated_log"),
           set<UPID>(),
-          flags.log_auto_initialize);
-      storage = new state::LogStorage(log);
+          flags.log_auto_initialize,
+          "registrar/");
+      storage = new mesos::state::LogStorage(log);
     } else {
-      EXIT(1) << "'" << flags.registry << "' is not a supported"
-              << " option for registry persistence";
+      EXIT(EXIT_FAILURE)
+        << "'" << flags.registry << "' is not a supported"
+        << " option for registry persistence";
     }
 
     CHECK_NOTNULL(storage);
 
-    state = new state::protobuf::State(storage);
-    registrar = new Registrar(flags, state);
-    repairer = new Repairer();
+    state = new mesos::state::protobuf::State(storage);
+    registrar =
+      new Registrar(flags, state, master::DEFAULT_HTTP_AUTHENTICATION_REALM);
 
     contender = new StandaloneMasterContender();
     detector = new StandaloneMasterDetector();
@@ -247,33 +266,36 @@ PID<Master> launch(const Flags& flags, Allocator* _allocator)
     }
 
     Option<shared_ptr<RateLimiter>> slaveRemovalLimiter = None();
-    if (flags.slave_removal_rate_limit.isSome()) {
+    if (flags.agent_removal_rate_limit.isSome()) {
       // Parse the flag value.
       // TODO(vinod): Move this parsing logic to flags once we have a
       // 'Rate' abstraction in stout.
       vector<string> tokens =
-        strings::tokenize(flags.slave_removal_rate_limit.get(), "/");
+        strings::tokenize(flags.agent_removal_rate_limit.get(), "/");
 
       if (tokens.size() != 2) {
-        EXIT(1) << "Invalid slave_removal_rate_limit: "
-                << flags.slave_removal_rate_limit.get()
-                << ". Format is <Number of slaves>/<Duration>";
+        EXIT(EXIT_FAILURE)
+          << "Invalid agent_removal_rate_limit: "
+          << flags.agent_removal_rate_limit.get()
+          << ". Format is <Number of agents>/<Duration>";
       }
 
       Try<int> permits = numify<int>(tokens[0]);
       if (permits.isError()) {
-        EXIT(1) << "Invalid slave_removal_rate_limit: "
-                << flags.slave_removal_rate_limit.get()
-                << ". Format is <Number of slaves>/<Duration>"
-                << ": " << permits.error();
+        EXIT(EXIT_FAILURE)
+          << "Invalid agent_removal_rate_limit: "
+          << flags.agent_removal_rate_limit.get()
+          << ". Format is <Number of agents>/<Duration>"
+          << ": " << permits.error();
       }
 
       Try<Duration> duration = Duration::parse(tokens[1]);
       if (duration.isError()) {
-        EXIT(1) << "Invalid slave_removal_rate_limit: "
-                << flags.slave_removal_rate_limit.get()
-                << ". Format is <Number of slaves>/<Duration>"
-                << ": " << duration.error();
+        EXIT(EXIT_FAILURE)
+          << "Invalid agent_removal_rate_limit: "
+          << flags.agent_removal_rate_limit.get()
+          << ". Format is <Number of agents>/<Duration>"
+          << ": " << duration.error();
       }
 
       slaveRemovalLimiter = new RateLimiter(permits.get(), duration.get());
@@ -283,7 +305,8 @@ PID<Master> launch(const Flags& flags, Allocator* _allocator)
     foreach (const string& name, ModuleManager::find<Anonymous>()) {
       Try<Anonymous*> create = ModuleManager::create<Anonymous>(name);
       if (create.isError()) {
-        EXIT(1) << "Failed to create anonymous module named '" << name << "'";
+        EXIT(EXIT_FAILURE)
+          << "Failed to create anonymous module named '" << name << "'";
       }
 
       // We don't bother keeping around the pointer to this anonymous
@@ -298,7 +321,6 @@ PID<Master> launch(const Flags& flags, Allocator* _allocator)
     master = new Master(
         _allocator,
         registrar,
-        repairer,
         files,
         contender,
         detector,
@@ -321,11 +343,36 @@ PID<Master> launch(const Flags& flags, Allocator* _allocator)
 
   for (int i = 0; i < flags.num_slaves; i++) {
     slave::Flags flags;
-    Try<Nothing> load = flags.load("MESOS_");
+
+    if (os::getenv("MESOS_WORK_DIR").isNone()) {
+      const string workDir = "/tmp/mesos/local/agents";
+      Try<Nothing> mkdir = os::mkdir(workDir);
+      if (mkdir.isError()) {
+        EXIT(EXIT_FAILURE)
+          << "Failed to create the root work directory for local agents '"
+          << workDir << "': " << mkdir.error();
+      }
+
+      flags.work_dir = path::join(workDir, stringify(i));
+      Try<Nothing> directory = os::mkdir(flags.work_dir);
+      if (directory.isError()) {
+        EXIT(EXIT_FAILURE)
+          << "Failed to create work directory for local agent '"
+          << flags.work_dir << "': " << directory.error();
+      }
+    }
+
+    Try<flags::Warnings> load = flags.load("MESOS_");
 
     if (load.isError()) {
-      EXIT(1) << "Failed to start a local cluster while loading "
-              << "slave flags from the environment: " << load.error();
+      EXIT(EXIT_FAILURE)
+        << "Failed to start a local cluster while loading"
+        << " agent flags from the environment: " << load.error();
+    }
+
+    // Log any flag warnings (after logging is initialized).
+    foreach (const flags::Warning& warning, load->warnings) {
+      LOG(WARNING) << warning.message;
     }
 
     // Use a different work directory for each slave.
@@ -339,8 +386,8 @@ PID<Master> launch(const Flags& flags, Allocator* _allocator)
       ResourceEstimator::create(flags.resource_estimator);
 
     if (resourceEstimator.isError()) {
-      EXIT(1) << "Failed to create resource estimator: "
-              << resourceEstimator.error();
+      EXIT(EXIT_FAILURE)
+        << "Failed to create resource estimator: " << resourceEstimator.error();
     }
 
     resourceEstimators->push_back(resourceEstimator.get());
@@ -349,8 +396,8 @@ PID<Master> launch(const Flags& flags, Allocator* _allocator)
       QoSController::create(flags.qos_controller);
 
     if (qosController.isError()) {
-      EXIT(1) << "Failed to create QoS Controller: "
-              << qosController.error();
+      EXIT(EXIT_FAILURE)
+        << "Failed to create QoS Controller: " << qosController.error();
     }
 
     qosControllers->push_back(qosController.get());
@@ -364,7 +411,8 @@ PID<Master> launch(const Flags& flags, Allocator* _allocator)
       Containerizer::create(flags, true, fetchers->back());
 
     if (containerizer.isError()) {
-      EXIT(1) << "Failed to create a containerizer: " << containerizer.error();
+      EXIT(EXIT_FAILURE)
+        << "Failed to create a containerizer: " << containerizer.error();
     }
 
     // NOTE: At this point detector is already initialized by the
@@ -378,7 +426,8 @@ PID<Master> launch(const Flags& flags, Allocator* _allocator)
         garbageCollectors->back(),
         statusUpdateManagers->back(),
         resourceEstimators->back(),
-        qosControllers->back());
+        qosControllers->back(),
+        authorizer_); // Same authorizer as master.
 
     slaves[containerizer.get()] = slave;
 
@@ -391,12 +440,12 @@ PID<Master> launch(const Flags& flags, Allocator* _allocator)
 
 void shutdown()
 {
-  if (master != NULL) {
+  if (master != nullptr) {
     process::terminate(master->self());
     process::wait(master->self());
     delete master;
     delete allocator;
-    master = NULL;
+    master = nullptr;
 
     // TODO(benh): Ugh! Because the isolator calls back into the slave
     // (not the best design) we can't delete the slave until we have
@@ -419,63 +468,60 @@ void shutdown()
     }
 
     delete detector;
-    detector = NULL;
+    detector = nullptr;
 
     delete contender;
-    contender = NULL;
+    contender = nullptr;
 
     delete files;
-    files = NULL;
+    files = nullptr;
 
     foreach (GarbageCollector* gc, *garbageCollectors) {
       delete gc;
     }
 
     delete garbageCollectors;
-    garbageCollectors = NULL;
+    garbageCollectors = nullptr;
 
     foreach (StatusUpdateManager* statusUpdateManager, *statusUpdateManagers) {
       delete statusUpdateManager;
     }
 
     delete statusUpdateManagers;
-    statusUpdateManagers = NULL;
+    statusUpdateManagers = nullptr;
 
     foreach (Fetcher* fetcher, *fetchers) {
       delete fetcher;
     }
 
     delete fetchers;
-    fetchers = NULL;
+    fetchers = nullptr;
 
     foreach (ResourceEstimator* estimator, *resourceEstimators) {
       delete estimator;
     }
 
     delete resourceEstimators;
-    resourceEstimators = NULL;
+    resourceEstimators = nullptr;
 
     foreach (QoSController* controller, *qosControllers) {
       delete controller;
     }
 
     delete qosControllers;
-    qosControllers = NULL;
+    qosControllers = nullptr;
 
     delete registrar;
-    registrar = NULL;
-
-    delete repairer;
-    repairer = NULL;
+    registrar = nullptr;
 
     delete state;
-    state = NULL;
+    state = nullptr;
 
     delete storage;
-    storage = NULL;
+    storage = nullptr;
 
     delete log;
-    log = NULL;
+    log = nullptr;
   }
 }
 

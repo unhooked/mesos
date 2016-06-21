@@ -80,11 +80,11 @@ public:
         "The UNIX socket path to be mounted into the\n"
         "docker executor container to provide docker\n"
         "CLI access to the docker daemon. This must be the\n"
-        "path used by the slave's docker image.\n",
+        "path used by the agent's docker image.\n",
         "/var/run/docker.sock");
 
     // This help message for --modules flag is the same for
-    // {master,slave,tests}/flags.hpp and should always be kept in
+    // {master,slave,sched,tests}/flags.[ch]pp and should always be kept in
     // sync.
     // TODO(karya): Remove the JSON example and add reference to the
     // doc file explaining the --modules flag.
@@ -130,6 +130,16 @@ public:
         "  ]\n"
         "}");
 
+    // This help message for --modules_dir flag is the same for
+    // {master,slave,sched,tests}/flags.[ch]pp and should always be kept in
+    // sync.
+    add(&Flags::modulesDir,
+        "modules_dir",
+        "Directory path of the module manifest files.\n"
+        "The manifest files are processed in alphabetical order.\n"
+        "(See --modules for more information on module manifest files)\n"
+        "Cannot be used in conjunction with --modules.\n");
+
     // This help message is duplicated from slave/flags.hpp and
     // should always be kept in sync with that.
     add(&Flags::isolation,
@@ -145,7 +155,7 @@ public:
     add(&Flags::authenticators,
         "authenticators",
         "Authenticator implementation to use when authenticating frameworks\n"
-        "and/or slaves. Use the default '" +
+        "and/or agents. Use the default '" +
         std::string(master::DEFAULT_AUTHENTICATOR) + "', or\n"
         "load an alternate authenticator module using --modules.",
         master::DEFAULT_AUTHENTICATOR);
@@ -158,6 +168,7 @@ public:
   std::string docker;
   std::string docker_socket;
   Option<Modules> modules;
+  Option<std::string> modulesDir;
   Option<std::string> isolation;
   std::string authenticators;
 };

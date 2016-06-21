@@ -38,8 +38,8 @@ namespace internal {
 namespace tests {
 
 ZooKeeperTestServer::ZooKeeperTestServer()
-  : zooKeeperServer(NULL),
-    connectionFactory(NULL),
+  : zooKeeperServer(nullptr),
+    connectionFactory(nullptr),
     port(0),
     started(false)
 {
@@ -112,11 +112,11 @@ std::string ZooKeeperTestServer::connectString() const
 
 void ZooKeeperTestServer::shutdownNetwork()
 {
-  if (connectionFactory != NULL && started) {
+  if (connectionFactory != nullptr && started) {
     LOG(INFO) << "Shutting down ZooKeeperTestServer on port " << port;
     connectionFactory->shutdown();
     delete connectionFactory;
-    connectionFactory = NULL;
+    connectionFactory = nullptr;
     started = false;
   }
 }
@@ -139,7 +139,7 @@ int ZooKeeperTestServer::startNetwork()
     // instance will get created and everything will work out. Until
     // ZooKeeper provides mechanisms for doing in-memory testing this
     // hack (or something like it) will need to exist. This hack is
-    // specific to ZooKeeper 3.4.5 and may need to change if up
+    // specific to ZooKeeper 3.4.8 and may need to change if up
     // upgrade ZooKeeper.
     zooKeeperServer->sessionTracker = Jvm::Null();
 

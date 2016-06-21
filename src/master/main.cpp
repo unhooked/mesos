@@ -27,9 +27,18 @@
 #include <mesos/authorizer/authorizer.hpp>
 
 #include <mesos/master/allocator.hpp>
+#include <mesos/master/contender.hpp>
+#include <mesos/master/detector.hpp>
 
 #include <mesos/module/anonymous.hpp>
 #include <mesos/module/authorizer.hpp>
+
+#include <mesos/state/in_memory.hpp>
+#include <mesos/state/log.hpp>
+#include <mesos/state/protobuf.hpp>
+#include <mesos/state/storage.hpp>
+
+#include <mesos/zookeeper/detector.hpp>
 
 #include <process/limiter.hpp>
 #include <process/owned.hpp>
@@ -48,6 +57,7 @@
 #include <stout/try.hpp>
 
 #include "common/build.hpp"
+#include "common/http.hpp"
 #include "common/protobuf_utils.hpp"
 
 #include "hook/manager.hpp"
@@ -55,24 +65,16 @@
 #include "logging/flags.hpp"
 #include "logging/logging.hpp"
 
-#include "master/contender.hpp"
-#include "master/detector.hpp"
 #include "master/master.hpp"
 #include "master/registrar.hpp"
-#include "master/repairer.hpp"
 
 #include "master/allocator/mesos/hierarchical.hpp"
 
+#include "master/detector/standalone.hpp"
+
 #include "module/manager.hpp"
 
-#include "state/in_memory.hpp"
-#include "state/log.hpp"
-#include "state/protobuf.hpp"
-#include "state/storage.hpp"
-
 #include "version/version.hpp"
-
-#include "zookeeper/detector.hpp"
 
 using namespace mesos::internal;
 using namespace mesos::internal::log;
@@ -84,10 +86,21 @@ using mesos::MasterInfo;
 using mesos::Parameter;
 using mesos::Parameters;
 
+using mesos::log::Log;
+
 using mesos::master::allocator::Allocator;
+
+using mesos::master::contender::MasterContender;
+
+using mesos::master::detector::MasterDetector;
+using mesos::master::detector::StandaloneMasterDetector;
 
 using mesos::modules::Anonymous;
 using mesos::modules::ModuleManager;
+
+using mesos::state::InMemoryStorage;
+using mesos::state::LogStorage;
+using mesos::state::Storage;
 
 using process::Owned;
 using process::RateLimiter;
@@ -107,14 +120,33 @@ using std::string;
 using std::vector;
 
 
-void version()
-{
-  cout << "mesos" << " " << MESOS_VERSION << endl;
-}
-
 
 int main(int argc, char** argv)
 {
+  // The order of initialization of various master components is as follows:
+  // * Validate flags.
+  // * Log build information.
+  // * Libprocess.
+  // * Logging.
+  // * Version process.
+  // * Firewall rules: should be initialized before initializing HTTP endpoints.
+  // * Modules: Load module libraries and manifests before they
+  //   can be instantiated.
+  // * Anonymous modules: Later components such as Allocators, and master
+  //   contender/detector might depend upon anonymous modules.
+  // * Hooks.
+  // * Allocator.
+  // * Registry storage.
+  // * State.
+  // * Master contendor.
+  // * Master detector.
+  // * Authorizer.
+  // * Slave removal rate limiter.
+  // * `Master` process.
+  //
+  // TODO(avinash): Add more comments discussing the rationale behind for this
+  // particular component ordering.
+
   GOOGLE_PROTOBUF_VERIFY_VERSION;
 
   master::Flags flags;
@@ -168,7 +200,7 @@ int main(int argc, char** argv)
             "the IP address which the master will try to bind to.\n"
             "Cannot be used in conjunction with `--ip`.");
 
-  Try<Nothing> load = flags.load("MESOS_", argc, argv);
+  Try<flags::Warnings> load = flags.load("MESOS_", argc, argv);
 
   if (load.isError()) {
     cerr << flags.usage(load.error()) << endl;
@@ -176,30 +208,13 @@ int main(int argc, char** argv)
   }
 
   if (flags.version) {
-    version();
+    cout << "mesos" << " " << MESOS_VERSION << endl;
     return EXIT_SUCCESS;
   }
 
   if (flags.help) {
     cout << flags.usage() << endl;
     return EXIT_SUCCESS;
-  }
-
-  // Initialize modules. Note that since other subsystems may depend
-  // upon modules, we should initialize modules before anything else.
-  if (flags.modules.isSome()) {
-    Try<Nothing> result = ModuleManager::load(flags.modules.get());
-    if (result.isError()) {
-      EXIT(EXIT_FAILURE) << "Error loading modules: " << result.error();
-    }
-  }
-
-  // Initialize hooks.
-  if (flags.hooks.isSome()) {
-    Try<Nothing> result = HookManager::initialize(flags.hooks.get());
-    if (result.isError()) {
-      EXIT(EXIT_FAILURE) << "Error installing hooks: " << result.error();
-    }
   }
 
   if (ip_discovery_command.isSome() && ip.isSome()) {
@@ -229,15 +244,23 @@ int main(int argc, char** argv)
     os::setenv("LIBPROCESS_ADVERTISE_PORT", advertise_port.get());
   }
 
-  // Initialize libprocess.
-  process::initialize("master");
+  if (zk.isNone()) {
+    if (flags.master_contender.isSome() ^ flags.master_detector.isSome()) {
+      EXIT(EXIT_FAILURE)
+        << flags.usage("Both --master_contender and --master_detector should "
+                       "be specified or omitted.");
+    }
+  } else {
+    if (flags.master_contender.isSome() || flags.master_detector.isSome()) {
+      EXIT(EXIT_FAILURE)
+        << flags.usage("Only one of --zk or the "
+                       "--master_contender/--master_detector "
+                       "pair should be specified.");
+    }
+  }
 
-  logging::initialize(argv[0], flags, true); // Catch signals.
-
-  spawn(new VersionProcess(), true);
-
+  // Log build information.
   LOG(INFO) << "Build: " << build::DATE << " by " << build::USER;
-
   LOG(INFO) << "Version: " << MESOS_VERSION;
 
   if (build::GIT_TAG.isSome()) {
@@ -246,6 +269,88 @@ int main(int argc, char** argv)
 
   if (build::GIT_SHA.isSome()) {
     LOG(INFO) << "Git SHA: " << build::GIT_SHA.get();
+  }
+
+  // This should be the first invocation of `process::initialize`. If it returns
+  // `false`, then it has already been called, which means that the
+  // authentication realm for libprocess-level HTTP endpoints was not set to the
+  // correct value for the master.
+  if (!process::initialize("master", DEFAULT_HTTP_AUTHENTICATION_REALM)) {
+    EXIT(EXIT_FAILURE) << "The call to `process::initialize()` in the master's "
+                       << "`main()` was not the function's first invocation";
+  }
+
+  logging::initialize(argv[0], flags, true); // Catch signals.
+
+  // Log any flag warnings (after logging is initialized).
+  foreach (const flags::Warning& warning, load->warnings) {
+    LOG(WARNING) << warning.message;
+  }
+
+  spawn(new VersionProcess(), true);
+
+  // Initialize firewall rules.
+  if (flags.firewall_rules.isSome()) {
+    vector<Owned<FirewallRule>> rules;
+
+    const Firewall firewall = flags.firewall_rules.get();
+
+    if (firewall.has_disabled_endpoints()) {
+      hashset<string> paths;
+
+      foreach (const string& path, firewall.disabled_endpoints().paths()) {
+        paths.insert(path);
+      }
+
+      rules.emplace_back(new DisabledEndpointsFirewallRule(paths));
+    }
+
+    process::firewall::install(move(rules));
+  }
+
+  // Initialize modules.
+  if (flags.modules.isSome() && flags.modulesDir.isSome()) {
+    EXIT(EXIT_FAILURE) <<
+      flags.usage("Only one of --modules or --modules_dir should be specified");
+  }
+
+  if (flags.modulesDir.isSome()) {
+    Try<Nothing> result = ModuleManager::load(flags.modulesDir.get());
+    if (result.isError()) {
+      EXIT(EXIT_FAILURE) << "Error loading modules: " << result.error();
+    }
+  }
+
+  if (flags.modules.isSome()) {
+    Try<Nothing> result = ModuleManager::load(flags.modules.get());
+    if (result.isError()) {
+      EXIT(EXIT_FAILURE) << "Error loading modules: " << result.error();
+    }
+  }
+
+  // Create anonymous modules.
+  foreach (const string& name, ModuleManager::find<Anonymous>()) {
+    Try<Anonymous*> create = ModuleManager::create<Anonymous>(name);
+    if (create.isError()) {
+      EXIT(EXIT_FAILURE)
+        << "Failed to create anonymous module named '" << name << "'";
+    }
+
+    // We don't bother keeping around the pointer to this anonymous
+    // module, when we exit that will effectively free it's memory.
+    //
+    // TODO(benh): We might want to add explicit finalization (and
+    // maybe explicit initialization too) in order to let the module
+    // do any housekeeping necessary when the master is cleanly
+    // terminating.
+  }
+
+  // Initialize hooks.
+  if (flags.hooks.isSome()) {
+    Try<Nothing> result = HookManager::initialize(flags.hooks.get());
+    if (result.isError()) {
+      EXIT(EXIT_FAILURE) << "Error installing hooks: " << result.error();
+    }
   }
 
   // Create an instance of allocator.
@@ -261,8 +366,8 @@ int main(int argc, char** argv)
   CHECK_NOTNULL(allocator.get());
   LOG(INFO) << "Using '" << allocatorName << "' allocator";
 
-  state::Storage* storage = NULL;
-  Log* log = NULL;
+  Storage* storage = nullptr;
+  Log* log = nullptr;
 
   if (flags.registry == "in_memory") {
     if (flags.registry_strict) {
@@ -270,7 +375,7 @@ int main(int argc, char** argv)
         << "Cannot use '--registry_strict' when using in-memory storage"
         << " based registry";
     }
-    storage = new state::InMemoryStorage();
+    storage = new InMemoryStorage();
   } else if (flags.registry == "replicated_log" ||
              flags.registry == "log_storage") {
     // TODO(bmahler): "log_storage" is present for backwards
@@ -307,16 +412,18 @@ int main(int argc, char** argv)
           flags.zk_session_timeout,
           path::join(url.get().path, "log_replicas"),
           url.get().authentication,
-          flags.log_auto_initialize);
+          flags.log_auto_initialize,
+          "registrar/");
     } else {
       // Use replicated log without ZooKeeper.
       log = new Log(
           1,
           path::join(flags.work_dir.get(), "replicated_log"),
           set<UPID>(),
-          flags.log_auto_initialize);
+          flags.log_auto_initialize,
+          "registrar/");
     }
-    storage = new state::LogStorage(log);
+    storage = new LogStorage(log);
   } else {
     EXIT(EXIT_FAILURE)
       << "'" << flags.registry << "' is not a supported"
@@ -325,27 +432,34 @@ int main(int argc, char** argv)
 
   CHECK_NOTNULL(storage);
 
-  state::protobuf::State* state = new state::protobuf::State(storage);
-  Registrar* registrar = new Registrar(flags, state);
-  Repairer* repairer = new Repairer();
+  mesos::state::protobuf::State* state =
+    new mesos::state::protobuf::State(storage);
+  Registrar* registrar =
+    new Registrar(flags, state, DEFAULT_HTTP_AUTHENTICATION_REALM);
 
-  Files files;
+  Files files(DEFAULT_HTTP_AUTHENTICATION_REALM);
 
   MasterContender* contender;
   MasterDetector* detector;
 
-  Try<MasterContender*> contender_ = MasterContender::create(zk);
+  Try<MasterContender*> contender_ = MasterContender::create(
+      zk, flags.master_contender);
+
   if (contender_.isError()) {
     EXIT(EXIT_FAILURE)
       << "Failed to create a master contender: " << contender_.error();
   }
+
   contender = contender_.get();
 
-  Try<MasterDetector*> detector_ = MasterDetector::create(zk);
+  Try<MasterDetector*> detector_ = MasterDetector::create(
+      zk, flags.master_detector);
+
   if (detector_.isError()) {
     EXIT(EXIT_FAILURE)
       << "Failed to create a master detector: " << detector_.error();
   }
+
   detector = detector_.get();
 
   Option<Authorizer*> authorizer_ = None();
@@ -382,77 +496,50 @@ int main(int argc, char** argv)
                        << "' authorizer: " << authorizer.error();
   } else if (authorizer.isSome()) {
     authorizer_ = authorizer.get();
+
+    // Set the authorization callbacks for libprocess HTTP endpoints.
+    // Note that these callbacks capture `authorizer_.get()`, but the master
+    // creates a copy of the authorizer during construction. Thus, if in the
+    // future it becomes possible to dynamically set the authorizer, this would
+    // break.
+    process::http::authorization::setCallbacks(
+        createAuthorizationCallbacks(authorizer_.get()));
   }
 
   Option<shared_ptr<RateLimiter>> slaveRemovalLimiter = None();
-  if (flags.slave_removal_rate_limit.isSome()) {
+  if (flags.agent_removal_rate_limit.isSome()) {
     // Parse the flag value.
     // TODO(vinod): Move this parsing logic to flags once we have a
     // 'Rate' abstraction in stout.
     vector<string> tokens =
-      strings::tokenize(flags.slave_removal_rate_limit.get(), "/");
+      strings::tokenize(flags.agent_removal_rate_limit.get(), "/");
 
     if (tokens.size() != 2) {
       EXIT(EXIT_FAILURE)
-        << "Invalid slave_removal_rate_limit: "
-        << flags.slave_removal_rate_limit.get()
-        << ". Format is <Number of slaves>/<Duration>";
+        << "Invalid agent_removal_rate_limit: "
+        << flags.agent_removal_rate_limit.get()
+        << ". Format is <Number of agents>/<Duration>";
     }
 
     Try<int> permits = numify<int>(tokens[0]);
     if (permits.isError()) {
       EXIT(EXIT_FAILURE)
-        << "Invalid slave_removal_rate_limit: "
-        << flags.slave_removal_rate_limit.get()
-        << ". Format is <Number of slaves>/<Duration>"
+        << "Invalid agent_removal_rate_limit: "
+        << flags.agent_removal_rate_limit.get()
+        << ". Format is <Number of agents>/<Duration>"
         << ": " << permits.error();
     }
 
     Try<Duration> duration = Duration::parse(tokens[1]);
     if (duration.isError()) {
       EXIT(EXIT_FAILURE)
-        << "Invalid slave_removal_rate_limit: "
-        << flags.slave_removal_rate_limit.get()
-        << ". Format is <Number of slaves>/<Duration>"
+        << "Invalid agent_removal_rate_limit: "
+        << flags.agent_removal_rate_limit.get()
+        << ". Format is <Number of agents>/<Duration>"
         << ": " << duration.error();
     }
 
     slaveRemovalLimiter = new RateLimiter(permits.get(), duration.get());
-  }
-
-  if (flags.firewall_rules.isSome()) {
-    vector<Owned<FirewallRule>> rules;
-
-    const Firewall firewall = flags.firewall_rules.get();
-
-    if (firewall.has_disabled_endpoints()) {
-      hashset<string> paths;
-
-      foreach (const string& path, firewall.disabled_endpoints().paths()) {
-        paths.insert(path);
-      }
-
-      rules.emplace_back(new DisabledEndpointsFirewallRule(paths));
-    }
-
-    process::firewall::install(move(rules));
-  }
-
-  // Create anonymous modules.
-  foreach (const string& name, ModuleManager::find<Anonymous>()) {
-    Try<Anonymous*> create = ModuleManager::create<Anonymous>(name);
-    if (create.isError()) {
-      EXIT(EXIT_FAILURE)
-        << "Failed to create anonymous module named '" << name << "'";
-    }
-
-    // We don't bother keeping around the pointer to this anonymous
-    // module, when we exit that will effectively free it's memory.
-    //
-    // TODO(benh): We might want to add explicit finalization (and
-    // maybe explicit initialization too) in order to let the module
-    // do any housekeeping necessary when the master is cleanly
-    // terminating.
   }
 
   LOG(INFO) << "Starting Mesos master";
@@ -461,7 +548,6 @@ int main(int argc, char** argv)
     new Master(
       allocator.get(),
       registrar,
-      repairer,
       &files,
       contender,
       detector,
@@ -469,7 +555,7 @@ int main(int argc, char** argv)
       slaveRemovalLimiter,
       flags);
 
-  if (zk.isNone()) {
+  if (zk.isNone() && flags.master_detector.isNone()) {
     // It means we are using the standalone detector so we need to
     // appoint this Master as the leader.
     dynamic_cast<StandaloneMasterDetector*>(detector)->appoint(master->info());
@@ -482,7 +568,6 @@ int main(int argc, char** argv)
   delete allocator.get();
 
   delete registrar;
-  delete repairer;
   delete state;
   delete storage;
   delete log;

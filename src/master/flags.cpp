@@ -14,9 +14,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <stout/flags.hpp>
 
 #include <mesos/type_utils.hpp>
+
+#include <stout/flags.hpp>
 
 #include "common/parse.hpp"
 #include "master/constants.hpp"
@@ -35,7 +36,7 @@ mesos::internal::master::Flags::Flags()
       "hostname",
       "The hostname the master should advertise in ZooKeeper.\n"
       "If left unset, the hostname is resolved from the IP address\n"
-      "that the slave binds to; unless the user explicitly prevents\n"
+      "that the agent binds to; unless the user explicitly prevents\n"
       "that, using `--no-hostname_lookup`, in which case the IP itself\n"
       "is used.");
 
@@ -54,8 +55,11 @@ mesos::internal::master::Flags::Flags()
 
   add(&Flags::work_dir,
       "work_dir",
-      "Directory path to store the persistent information stored in the \n"
-      "Registry. (example: `/var/lib/mesos/master`)");
+      "Path of the master work directory. This is where the persistent\n"
+      "information of the cluster will be stored. Note that locations like\n"
+      "`/tmp` which are cleaned automatically are not suitable for the work\n"
+      "directory when running in production, since long-running masters could\n"
+      "lose data when cleanup occurs. (Example: `/var/lib/mesos/master`)");
 
   // TODO(bmahler): Consider removing `in_memory` as it was only
   // used before `replicated_log` was implemented.
@@ -85,7 +89,7 @@ mesos::internal::master::Flags::Flags()
       "Whether the master will take actions based on the persistent\n"
       "information stored in the Registry. Setting this to false means\n"
       "that the Registrar will never reject the admission, readmission,\n"
-      "or removal of a slave. Consequently, `false` can be used to\n"
+      "or removal of an agent. Consequently, `false` can be used to\n"
       "bootstrap the persistent state on a running cluster.\n"
       "NOTE: This flag is *experimental* and should not be used in\n"
       "production yet.",
@@ -110,42 +114,45 @@ mesos::internal::master::Flags::Flags()
       "initialized when used for the very first time.",
       true);
 
-  add(&Flags::slave_reregister_timeout,
-      "slave_reregister_timeout",
-      "The timeout within which all slaves are expected to re-register\n"
-      "when a new master is elected as the leader. Slaves that do not\n"
+  add(&Flags::agent_reregister_timeout,
+      "agent_reregister_timeout",
+      flags::DeprecatedName("slave_reregister_timeout"),
+      "The timeout within which all agents are expected to re-register\n"
+      "when a new master is elected as the leader. Agents that do not\n"
       "re-register within the timeout will be removed from the registry\n"
       "and will be shutdown if they attempt to communicate with master.\n"
       "NOTE: This value has to be at least " +
-        stringify(MIN_SLAVE_REREGISTER_TIMEOUT) + ".",
-      MIN_SLAVE_REREGISTER_TIMEOUT);
+        stringify(MIN_AGENT_REREGISTER_TIMEOUT) + ".",
+      MIN_AGENT_REREGISTER_TIMEOUT);
 
   // TODO(bmahler): Add a `Percentage` abstraction for flags.
   // TODO(bmahler): Add a `--production` flag for production defaults.
-  add(&Flags::recovery_slave_removal_limit,
-      "recovery_slave_removal_limit",
-      "For failovers, limit on the percentage of slaves that can be removed\n"
+  add(&Flags::recovery_agent_removal_limit,
+      "recovery_agent_removal_limit",
+      flags::DeprecatedName("recovery_slave_removal_limit"),
+      "For failovers, limit on the percentage of agents that can be removed\n"
       "from the registry *and* shutdown after the re-registration timeout\n"
       "elapses. If the limit is exceeded, the master will fail over rather\n"
-      "than remove the slaves.\n"
+      "than remove the agents.\n"
       "This can be used to provide safety guarantees for production\n"
       "environments. Production environments may expect that across master\n"
-      "failovers, at most a certain percentage of slaves will fail\n"
+      "failovers, at most a certain percentage of agents will fail\n"
       "permanently (e.g. due to rack-level failures).\n"
       "Setting this limit would ensure that a human needs to get\n"
-      "involved should an unexpected widespread failure of slaves occur\n"
+      "involved should an unexpected widespread failure of agents occur\n"
       "in the cluster.\n"
       "Values: [0%-100%]",
-      stringify(RECOVERY_SLAVE_REMOVAL_PERCENT_LIMIT * 100.0) + "%");
+      stringify(RECOVERY_AGENT_REMOVAL_PERCENT_LIMIT * 100.0) + "%");
 
   // TODO(vinod): Add a `Rate` abstraction in stout and the
   // corresponding parser for flags.
-  add(&Flags::slave_removal_rate_limit,
-      "slave_removal_rate_limit",
-      "The maximum rate (e.g., `1/10mins`, `2/3hrs`, etc) at which slaves\n"
+  add(&Flags::agent_removal_rate_limit,
+      "agent_removal_rate_limit",
+      flags::DeprecatedName("slave_removal_rate_limit"),
+      "The maximum rate (e.g., `1/10mins`, `2/3hrs`, etc) at which agents\n"
       "will be removed from the master when they fail health checks.\n"
-      "By default, slaves will be removed as soon as they fail the health\n"
-      "checks. The value is of the form `(Number of slaves)/(Duration)`.");
+      "By default, agents will be removed as soon as they fail the health\n"
+      "checks. The value is of the form `(Number of agents)/(Duration)`.");
 
   add(&Flags::webui_dir,
       "webui_dir",
@@ -154,9 +161,9 @@ mesos::internal::master::Flags::Flags()
 
   add(&Flags::whitelist,
       "whitelist",
-      "Path to a file which contains a list of slaves (one per line) to\n"
+      "Path to a file which contains a list of agents (one per line) to\n"
       "advertise offers for. The file is watched, and periodically re-read to\n"
-      "refresh the slave whitelist. By default there is no whitelist / all\n"
+      "refresh the agent whitelist. By default there is no whitelist / all\n"
       "machines are accepted. Path could be of the form\n"
       "`file:///path/to/file` or `/path/to/file`.\n");
 
@@ -201,33 +208,39 @@ mesos::internal::master::Flags::Flags()
   // TODO(adam-mesos): Deprecate --authenticate for --authenticate_frameworks.
   // See MESOS-4386 for details.
   add(&Flags::authenticate_frameworks,
-      "authenticate",
+      "authenticate_frameworks",
+      flags::DeprecatedName("authenticate"),
       "If `true`, only authenticated frameworks are allowed to register. If\n"
-      "`false`, unauthenticated frameworks are also allowed to register.",
+      "`false`, unauthenticated frameworks are also allowed to register. For\n"
+      "HTTP based frameworks use the `--authenticate_http_frameworks` flag.",
       false);
 
-  add(&Flags::authenticate_slaves,
-      "authenticate_slaves",
-      "If `true`, only authenticated slaves are allowed to register.\n"
-      "If `false`, unauthenticated slaves are also allowed to register.",
+  add(&Flags::authenticate_agents,
+      "authenticate_agents",
+      flags::DeprecatedName("authenticate_slaves"),
+      "If `true`, only authenticated agents are allowed to register.\n"
+      "If `false`, unauthenticated agents are also allowed to register.",
       false);
 
   add(&Flags::authenticate_http,
       "authenticate_http",
       "If `true`, only authenticated requests for HTTP endpoints supporting\n"
-      "authentication are allowed.\n"
-      "If `false`, unauthenticated HTTP endpoint requests are also allowed.\n",
+      "authentication are allowed. If `false`, unauthenticated requests to\n"
+      "HTTP endpoints are also allowed.\n",
+      false);
+
+  add(&Flags::authenticate_http_frameworks,
+      "authenticate_http_frameworks",
+      "If `true`, only authenticated HTTP frameworks are allowed to register.\n"
+      "If `false`, HTTP frameworks are not authenticated.",
       false);
 
   add(&Flags::credentials,
       "credentials",
-      "Either a path to a text file with a list of credentials,\n"
-      "each line containing `principal` and `secret` separated by "
-      "whitespace,\n"
-      "or, a path to a JSON-formatted file containing credentials.\n"
+      "Path to a JSON-formatted file containing credentials.\n"
       "Path could be of the form `file:///path/to/file` or `/path/to/file`."
       "\n"
-      "JSON file Example:\n"
+      "Example:\n"
       "{\n"
       "  \"credentials\": [\n"
       "    {\n"
@@ -235,9 +248,7 @@ mesos::internal::master::Flags::Flags()
       "      \"secret\": \"kitesurf\"\n"
       "    }\n"
       "  ]\n"
-      "}\n"
-      "Text file Example:\n"
-      "username secret");
+      "}");
 
   add(&Flags::acls,
       "acls",
@@ -250,7 +261,7 @@ mesos::internal::master::Flags::Flags()
       "different than `" + string(DEFAULT_AUTHORIZER) + "`, the ACLs contents\n"
       "will be ignored.\n"
       "\n"
-      "See the ACLs protobuf in authorizer.proto for the expected format.\n"
+      "See the ACLs protobuf in acls.proto for the expected format.\n"
       "\n"
       "Example:\n"
       "{\n"
@@ -330,12 +341,13 @@ mesos::internal::master::Flags::Flags()
       "}");
 
 #ifdef WITH_NETWORK_ISOLATOR
-  add(&Flags::max_executors_per_slave,
-      "max_executors_per_slave",
-      "Maximum number of executors allowed per slave. The network\n"
+  add(&Flags::max_executors_per_agent,
+      "max_executors_per_agent",
+      flags::DeprecatedName("max_executors_per_slave"),
+      "Maximum number of executors allowed per agent. The network\n"
       "monitoring/isolation technique imposes an implicit resource\n"
       "acquisition on each executor (# ephemeral ports), as a result\n"
-      "one can only run a certain number of executors on each slave.");
+      "one can only run a certain number of executors on each agent.");
 #endif // WITH_NETWORK_ISOLATOR
 
   // TODO(karya): When we have optimistic offers, this will only
@@ -348,7 +360,7 @@ mesos::internal::master::Flags::Flags()
       "If not set, offers do not timeout.");
 
   // This help message for --modules flag is the same for
-  // {master,slave,tests}/flags.hpp and should always be kept in
+  // {master,slave,sched,tests}/flags.[ch]pp and should always be kept in
   // sync.
   // TODO(karya): Remove the JSON example and add reference to the
   // doc file explaining the --modules flag.
@@ -392,12 +404,23 @@ mesos::internal::master::Flags::Flags()
       "      ]\n"
       "    }\n"
       "  ]\n"
-      "}");
+      "}\n\n"
+      "Cannot be used in conjunction with --modules_dir.\n");
+
+  // This help message for --modules_dir flag is the same for
+  // {master,slave,sched,tests}/flags.[ch]pp and should always be kept in
+  // sync.
+  add(&Flags::modulesDir,
+      "modules_dir",
+      "Directory path of the module manifest files.\n"
+      "The manifest files are processed in alphabetical order.\n"
+      "(See --modules for more information on module manifest files)\n"
+      "Cannot be used in conjunction with --modules.\n");
 
   add(&Flags::authenticators,
       "authenticators",
       "Authenticator implementation to use when authenticating frameworks\n"
-      "and/or slaves. Use the default `" + string(DEFAULT_AUTHENTICATOR) + "`\n"
+      "and/or agents. Use the default `" + string(DEFAULT_AUTHENTICATOR) + "`\n"
       "or load an alternate authenticator module using `--modules`.",
       DEFAULT_AUTHENTICATOR);
 
@@ -413,33 +436,35 @@ mesos::internal::master::Flags::Flags()
       "A comma-separated list of hook modules to be\n"
       "installed inside master.");
 
-  add(&Flags::slave_ping_timeout,
-      "slave_ping_timeout",
-      "The timeout within which each slave is expected to respond to a\n"
-      "ping from the master. Slaves that do not respond within\n"
-      "max_slave_ping_timeouts ping retries will be asked to shutdown.\n"
-      "NOTE: The total ping timeout (`slave_ping_timeout` multiplied by\n"
-      "`max_slave_ping_timeouts`) should be greater than the ZooKeeper\n"
+  add(&Flags::agent_ping_timeout,
+      "agent_ping_timeout",
+      flags::DeprecatedName("slave_ping_timeout"),
+      "The timeout within which each agent is expected to respond to a\n"
+      "ping from the master. Agents that do not respond within\n"
+      "max_agent_ping_timeouts ping retries will be asked to shutdown.\n"
+      "NOTE: The total ping timeout (`agent_ping_timeout` multiplied by\n"
+      "`max_agent_ping_timeouts`) should be greater than the ZooKeeper\n"
       "session timeout to prevent useless re-registration attempts.\n",
-      DEFAULT_SLAVE_PING_TIMEOUT,
+      DEFAULT_AGENT_PING_TIMEOUT,
       [](const Duration& value) -> Option<Error> {
         if (value < Seconds(1) || value > Minutes(15)) {
-          return Error("Expected `--slave_ping_timeout` to be between " +
+          return Error("Expected `--agent_ping_timeout` to be between " +
                        stringify(Seconds(1)) + " and " +
                        stringify(Minutes(15)));
         }
         return None();
       });
 
-  add(&Flags::max_slave_ping_timeouts,
-      "max_slave_ping_timeouts",
-      "The number of times a slave can fail to respond to a\n"
-      "ping from the master. Slaves that do not respond within\n"
-      "`max_slave_ping_timeouts` ping retries will be asked to shutdown.\n",
-      DEFAULT_MAX_SLAVE_PING_TIMEOUTS,
+  add(&Flags::max_agent_ping_timeouts,
+      "max_agent_ping_timeouts",
+      flags::DeprecatedName("max_slave_ping_timeouts"),
+      "The number of times an agent can fail to respond to a\n"
+      "ping from the master. Agents that do not respond within\n"
+      "`max_agent_ping_timeouts` ping retries will be asked to shutdown.\n",
+      DEFAULT_MAX_AGENT_PING_TIMEOUTS,
       [](size_t value) -> Option<Error> {
         if (value < 1) {
-          return Error("Expected `--max_slave_ping_timeouts` to be at least 1");
+          return Error("Expected `--max_agent_ping_timeouts` to be at least 1");
         }
         return None();
       });
@@ -468,6 +493,17 @@ mesos::internal::master::Flags::Flags()
       "Currently there is no support for multiple HTTP authenticators.",
       DEFAULT_HTTP_AUTHENTICATOR);
 
+  add(&Flags::http_framework_authenticators,
+      "http_framework_authenticators",
+      "HTTP authenticator implementation to use when authenticating HTTP\n"
+      "frameworks. Use the \n"
+      "`" + string(DEFAULT_HTTP_AUTHENTICATOR) + "` authenticator or load an\n"
+      "alternate authenticator module using `--modules`.\n"
+      "Must be used in conjunction with `--http_authenticate_frameworks`.\n"
+      "\n"
+      "Currently there is no support for multiple HTTP framework\n"
+      "authenticators.");
+
   add(&Flags::max_completed_frameworks,
       "max_completed_frameworks",
       "Maximum number of completed frameworks to store in memory.",
@@ -477,4 +513,18 @@ mesos::internal::master::Flags::Flags()
       "max_completed_tasks_per_framework",
       "Maximum number of completed tasks per framework to store in memory.",
       DEFAULT_MAX_COMPLETED_TASKS_PER_FRAMEWORK);
+
+  add(&Flags::master_contender,
+      "master_contender",
+      "The symbol name of the master contender to use.\n"
+      "This symbol should exist in a module specified through\n"
+      "the --modules flag. Cannot be used in conjunction with --zk.\n"
+      "Must be used in conjunction with --master_detector.");
+
+  add(&Flags::master_detector,
+      "master_detector",
+      "The symbol name of the master detector to use. This symbol\n"
+      "should exist in a module specified through the --modules flag.\n"
+      "Cannot be used in conjunction with --zk.\n"
+      "Must be used in conjunction with --master_contender.");
 }

@@ -29,6 +29,8 @@
 using mesos::internal::master::Master;
 using mesos::internal::slave::Slave;
 
+using mesos::master::detector::MasterDetector;
+
 using std::string;
 using std::vector;
 
@@ -157,6 +159,8 @@ TEST_F(RoleTest, ImplicitRoleRegister)
       frameworkInfo.role(),
       "id1",
       "path1",
+      frameworkInfo.principal(),
+      None(),
       frameworkInfo.principal());
 
   // The expectation for the next offer.
@@ -288,6 +292,7 @@ TEST_F(RoleTest, EndpointEmpty)
       "      \"resources\": {"
       "        \"cpus\": 0,"
       "        \"disk\": 0,"
+      "        \"gpus\": 0,"
       "        \"mem\":  0"
       "      },"
       "      \"weight\": 1.0"
@@ -335,6 +340,7 @@ TEST_F(RoleTest, EndpointNoFrameworks)
       "      \"resources\": {"
       "        \"cpus\": 0,"
       "        \"disk\": 0,"
+      "        \"gpus\": 0,"
       "        \"mem\":  0"
       "      },"
       "      \"weight\": 1.0"
@@ -345,6 +351,7 @@ TEST_F(RoleTest, EndpointNoFrameworks)
       "      \"resources\": {"
       "        \"cpus\": 0,"
       "        \"disk\": 0,"
+      "        \"gpus\": 0,"
       "        \"mem\":  0"
       "      },"
       "      \"weight\": 5.0"
@@ -355,6 +362,7 @@ TEST_F(RoleTest, EndpointNoFrameworks)
       "      \"resources\": {"
       "        \"cpus\": 0,"
       "        \"disk\": 0,"
+      "        \"gpus\": 0,"
       "        \"mem\":  0"
       "      },"
       "      \"weight\": 1.0"
@@ -430,6 +438,7 @@ TEST_F(RoleTest, EndpointImplicitRolesWeights)
       "      \"resources\": {"
       "        \"cpus\": 0,"
       "        \"disk\": 0,"
+      "        \"gpus\": 0,"
       "        \"mem\":  0"
       "      },"
       "      \"weight\": 1.0"
@@ -440,6 +449,7 @@ TEST_F(RoleTest, EndpointImplicitRolesWeights)
       "      \"resources\": {"
       "        \"cpus\": 0,"
       "        \"disk\": 0,"
+      "        \"gpus\": 0,"
       "        \"mem\":  0"
       "      },"
       "      \"weight\": 5.0"
@@ -450,6 +460,7 @@ TEST_F(RoleTest, EndpointImplicitRolesWeights)
       "      \"resources\": {"
       "        \"cpus\": 0,"
       "        \"disk\": 0,"
+      "        \"gpus\": 0,"
       "        \"mem\":  0"
       "      },"
       "      \"weight\": 4.0"
@@ -460,6 +471,7 @@ TEST_F(RoleTest, EndpointImplicitRolesWeights)
       "      \"resources\": {"
       "        \"cpus\": 0,"
       "        \"disk\": 0,"
+      "        \"gpus\": 0,"
       "        \"mem\":  0"
       "      },"
       "      \"weight\": 1.0"
@@ -531,6 +543,7 @@ TEST_F(RoleTest, EndpointImplicitRolesQuotas)
       "      \"resources\": {"
       "        \"cpus\": 0,"
       "        \"disk\": 0,"
+      "        \"gpus\": 0,"
       "        \"mem\":  0"
       "      },"
       "      \"weight\": 1.0"
@@ -541,6 +554,7 @@ TEST_F(RoleTest, EndpointImplicitRolesQuotas)
       "      \"resources\": {"
       "        \"cpus\": 0,"
       "        \"disk\": 0,"
+      "        \"gpus\": 0,"
       "        \"mem\":  0"
       "      },"
       "      \"weight\": 1.0"
@@ -585,6 +599,7 @@ TEST_F(RoleTest, EndpointImplicitRolesQuotas)
       "      \"resources\": {"
       "        \"cpus\": 0,"
       "        \"disk\": 0,"
+      "        \"gpus\": 0,"
       "        \"mem\":  0"
       "      },"
       "      \"weight\": 1.0"

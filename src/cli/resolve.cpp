@@ -16,6 +16,8 @@
 
 #include <iostream>
 
+#include <mesos/master/detector.hpp>
+
 #include <process/future.hpp>
 
 #include <stout/duration.hpp>
@@ -25,8 +27,6 @@
 #include <stout/path.hpp>
 #include <stout/strings.hpp>
 #include <stout/try.hpp>
-
-#include "master/detector.hpp"
 
 #include "messages/messages.hpp"
 
@@ -61,7 +61,7 @@ int main(int argc, char** argv)
 
   // Load flags from environment and command line, and remove
   // them from argv.
-  Try<Nothing> load = flags.load(None(), &argc, &argv);
+  Try<flags::Warnings> load = flags.load(None(), &argc, &argv);
 
   if (load.isError()) {
     cerr << flags.usage(load.error()) << endl;
@@ -73,6 +73,11 @@ int main(int argc, char** argv)
     return EXIT_SUCCESS;
   }
 
+  // Log any flag warnings.
+  foreach (const flags::Warning& warning, load->warnings) {
+    LOG(WARNING) << warning.message;
+  }
+
   // 'master' argument must be the only argument left after parsing.
   if (argc != 2) {
     cerr << flags.usage("There must be only one argument: <master>") << endl;
@@ -80,7 +85,8 @@ int main(int argc, char** argv)
   }
 
   string master = argv[1];
-  Try<MasterDetector*> detector = MasterDetector::create(master);
+  Try<mesos::master::detector::MasterDetector*> detector =
+    mesos::master::detector::MasterDetector::create(master);
 
   if (detector.isError()) {
     cerr << "Failed to create a master detector: " << detector.error() << endl;

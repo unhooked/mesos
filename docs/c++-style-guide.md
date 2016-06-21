@@ -5,7 +5,7 @@ layout: documentation
 
 # Mesos C++ Style Guide
 
-The Mesos codebase follows the [Google C++ Style Guide](http://google-styleguide.googlecode.com/svn/trunk/cppguide.xml) with some notable differences, as described below. Note that the [clang-format](clang-format.md) tool can be helpful to ensure that some of the mechanical style rules are obeyed.
+The Mesos codebase follows the [Google C++ Style Guide](https://google.github.io/styleguide/cppguide.html) with some notable differences, as described below. Note that the [clang-format](clang-format.md) tool can be helpful to ensure that some of the mechanical style rules are obeyed.
 
 ## Scoping
 
@@ -20,7 +20,7 @@ The Mesos codebase follows the [Google C++ Style Guide](http://google-styleguide
 * We prepend constructor and function arguments with a leading underscore to avoid ambiguity and / or shadowing:
 
 ~~~{.cpp}
-Try(State _state, T* _t = NULL, const std::string& _message = "")
+Try(State _state, T* _t = nullptr, const std::string& _message = "")
   : state(_state), t(_t), message(_message) {}
 ~~~
 
@@ -84,15 +84,15 @@ driver.acceptOffers({offer.id()},
 
 ~~~{.cpp}
 // 1: OK.
-allocator->resourcesRecovered(frameworkId, slaveId, resources, filters);
+allocator->resourcesRecovered(frameworkId, agentId, resources, filters);
 
 // 2: Don't use.
-allocator->resourcesRecovered(frameworkId, slaveId,
+allocator->resourcesRecovered(frameworkId, agentId,
                               resources, filters);
 
 // 3: Don't use in this case due to "jaggedness".
 allocator->resourcesRecovered(frameworkId,
-                              slaveId,
+                              agentId,
                               resources,
                               filters);
 
@@ -104,13 +104,13 @@ foobar(someArgument,
 // 4: OK.
 allocator->resourcesRecovered(
     frameworkId,
-    slaveId,
+    agentId,
     resources,
     filters);
 
 // 5: OK.
 allocator->resourcesRecovered(
-    frameworkId, slaveId, resources, filters);
+    frameworkId, agentId, resources, filters);
 ~~~
 
 ### Continuation
@@ -294,6 +294,7 @@ Example for `src/common/foo.cpp`:
 
 We support C++11 and require GCC 4.8+ or Clang 3.5+ compilers. The whitelist of supported C++11 features is:
 
+* `nullptr`
 * Static assertions.
 * Multiple right angle brackets.
 * Type inference (`auto` and `decltype`). The main goal is to increase code readability. This is safely the case if the exact same type omitted on the left is already fully stated on the right. Here are several examples:

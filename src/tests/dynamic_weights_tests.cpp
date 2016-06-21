@@ -82,46 +82,18 @@ class DynamicWeightsTest : public MesosTest
 protected:
   DynamicWeightsTest() {}
 
-  // Create WeightInfos from the specified weights flag.
-  RepeatedPtrField<WeightInfo> createWeightInfos(const string& weightsFlag)
-  {
-    RepeatedPtrField<WeightInfo> infos;
-    vector<string> tokens = strings::tokenize(weightsFlag, ",");
-    foreach (const string& token, tokens) {
-      vector<string> pair = strings::tokenize(token, "=");
-      EXPECT_EQ(2u, pair.size());
-      double weight = atof(pair[1].c_str());
-      WeightInfo weightInfo;
-      weightInfo.set_role(pair[0]);
-      weightInfo.set_weight(weight);
-      infos.Add()->CopyFrom(weightInfo);
-    }
-
-    return infos;
-  }
-
-  // Generates a weights update request from the specified weights.
-  string createUpdateRequestBody(
-      const RepeatedPtrField<WeightInfo>& infos) const
-  {
-    const string request = strings::format(
-        "%s",
-        JSON::protobuf(infos)).get();
-
-    return request;
-  }
-
-  void checkWithRolesEndpoint(
+  void checkWithGetRequest(
       const PID<Master>& master,
-      const Option<string>& weights = None())
+      const Credential& credential,
+      const Option<string>& _weights = None())
   {
     Future<Response> response = process::http::request(
         process::http::createRequest(
             master,
             "GET",
             false,
-            "roles",
-            createBasicAuthHeaders(DEFAULT_CREDENTIAL)));
+            "weights",
+            createBasicAuthHeaders(credential)));
 
     AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
       << response.get().body;
@@ -131,109 +103,44 @@ protected:
     Try<JSON::Value> parse = JSON::parse(response.get().body);
     ASSERT_SOME(parse);
 
-    Try<JSON::Value> expected = JSON::Null();
+    // Create Protobuf representation of weights.
+    Try<RepeatedPtrField<WeightInfo>> weightInfos =
+      ::protobuf::parse<RepeatedPtrField<WeightInfo>>(parse.get());
 
-    if (weights.isNone()) {
-      expected = JSON::parse(
-          "{"
-          "  \"roles\": ["
-          "    {"
-          "      \"frameworks\": [],"
-          "      \"name\": \"*\","
-          "      \"resources\": {"
-          "        \"cpus\": 0,"
-          "        \"disk\": 0,"
-          "        \"mem\":  0"
-          "      },"
-          "      \"weight\": 1.0"
-          "    }"
-          "  ]"
-          "}");
-    } else if (weights == DEFAULT_WEIGHTS) {
-      expected = JSON::parse(
-          "{"
-          "  \"roles\": ["
-          "    {"
-          "      \"frameworks\": [],"
-          "      \"name\": \"*\","
-          "      \"resources\": {"
-          "        \"cpus\": 0,"
-          "        \"disk\": 0,"
-          "        \"mem\":  0"
-          "      },"
-          "      \"weight\": 1.0"
-          "    },"
-          "    {"
-          "      \"frameworks\": [],"
-          "      \"name\": \"role1\","
-          "      \"resources\": {"
-          "        \"cpus\": 0,"
-          "        \"disk\": 0,"
-          "        \"mem\":  0"
-          "      },"
-          "      \"weight\": 1.0"
-          "    },"
-          "    {"
-          "      \"frameworks\": [],"
-          "      \"name\": \"role2\","
-          "      \"resources\": {"
-          "        \"cpus\": 0,"
-          "        \"disk\": 0,"
-          "        \"mem\":  0"
-          "      },"
-          "      \"weight\": 1.0"
-          "    }"
-          "  ]"
-          "}");
-    } else if (weights == UPDATED_WEIGHTS) {
-      expected = JSON::parse(
-          "{"
-          "  \"roles\": ["
-          "    {"
-          "      \"frameworks\": [],"
-          "      \"name\": \"*\","
-          "      \"resources\": {"
-          "        \"cpus\": 0,"
-          "        \"disk\": 0,"
-          "        \"mem\":  0"
-          "      },"
-          "      \"weight\": 1.0"
-          "    },"
-          "    {"
-          "      \"frameworks\": [],"
-          "      \"name\": \"role1\","
-          "      \"resources\": {"
-          "        \"cpus\": 0,"
-          "        \"disk\": 0,"
-          "        \"mem\":  0"
-          "      },"
-          "      \"weight\": 2.0"
-          "    },"
-          "    {"
-          "      \"frameworks\": [],"
-          "      \"name\": \"role2\","
-          "      \"resources\": {"
-          "        \"cpus\": 0,"
-          "        \"disk\": 0,"
-          "        \"mem\":  0"
-          "      },"
-          "      \"weight\": 4.0"
-          "    }"
-          "  ]"
-          "}");
+    ASSERT_SOME(weightInfos);
+
+    hashmap<std::string, double> weights =
+      convertToHashmap(weightInfos.get());
+
+    if (_weights.isNone()) {
+      EXPECT_EQ(0u, weights.size());
+    } else if (_weights == GET_WEIGHTS1) {
+      EXPECT_EQ(1u, weights.size());
+      EXPECT_EQ(2.0, weights["role1"]);
+    } else if (_weights == GET_WEIGHTS2) {
+      EXPECT_EQ(1u, weights.size());
+      EXPECT_EQ(4.0, weights["role2"]);
+    } else if (_weights == UPDATED_WEIGHTS1) {
+      EXPECT_EQ(2u, weights.size());
+      EXPECT_EQ(2.0, weights["role1"]);
+      EXPECT_EQ(4.0, weights["role2"]);
+    } else if (_weights == UPDATED_WEIGHTS2) {
+      EXPECT_EQ(3u, weights.size());
+      EXPECT_EQ(1.0, weights["role1"]);
+      EXPECT_EQ(4.0, weights["role2"]);
+      EXPECT_EQ(2.5, weights["role3"]);
     } else {
-      expected = Error("Unexpected weights string.");
+      EXPECT_EQ(_weights.get(), "Unexpected weights string.");
     }
-
-    ASSERT_SOME(expected);
-    EXPECT_EQ(expected.get(), parse.get());
   }
 
 protected:
   const string ROLE1 = "role1";
   const string ROLE2 = "role2";
-  const string DEFAULT_WEIGHTS = "role1=1.0,role2=1.0";
-  const string UPDATED_WEIGHTS = "role1=2.0,role2=4.0";
+  const string GET_WEIGHTS1 = "role1=2.0";
+  const string GET_WEIGHTS2 = "role2=4.0";
+  const string UPDATED_WEIGHTS1 = "role1=2.0,role2=4.0";
+  const string UPDATED_WEIGHTS2 = "role1=1.0,role3=2.5";
 };
 
 
@@ -263,7 +170,7 @@ TEST_F(DynamicWeightsTest, PutInvalidRequest)
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(BadRequest().status, response)
     << response.get().body;
 
-  checkWithRolesEndpoint(master.get()->pid);
+  checkWithGetRequest(master.get()->pid, DEFAULT_CREDENTIAL);
 
   // Tests whether an update weights request with an invalid field fails.
   // In this case, the correct field name should be 'role'.
@@ -285,7 +192,7 @@ TEST_F(DynamicWeightsTest, PutInvalidRequest)
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(BadRequest().status, response)
     << response.get().body;
 
-  checkWithRolesEndpoint(master.get()->pid);
+  checkWithGetRequest(master.get()->pid, DEFAULT_CREDENTIAL);
 }
 
 
@@ -297,6 +204,7 @@ TEST_F(DynamicWeightsTest, ZeroWeight)
   ASSERT_SOME(master);
 
   // Send a weight update request to update the weight of 'role1' to 0.
+  RepeatedPtrField<WeightInfo> infos = createWeightInfos("role1=0");
   Future<Response> response = process::http::request(
       process::http::createRequest(
           master.get()->pid,
@@ -304,12 +212,12 @@ TEST_F(DynamicWeightsTest, ZeroWeight)
           false,
           "weights",
           createBasicAuthHeaders(DEFAULT_CREDENTIAL),
-          createUpdateRequestBody(createWeightInfos("role1=0"))));
+          strings::format("%s", JSON::protobuf(infos)).get()));
 
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(BadRequest().status, response)
     << response.get().body;
 
-  checkWithRolesEndpoint(master.get()->pid);
+  checkWithGetRequest(master.get()->pid, DEFAULT_CREDENTIAL);
 }
 
 
@@ -321,6 +229,7 @@ TEST_F(DynamicWeightsTest, NegativeWeight)
   ASSERT_SOME(master);
 
   // Send a weight update request to update the weight of 'role1' to -2.0.
+  RepeatedPtrField<WeightInfo> infos = createWeightInfos("role1=-2.0");
   Future<Response> response = process::http::request(
       process::http::createRequest(
           master.get()->pid,
@@ -328,12 +237,12 @@ TEST_F(DynamicWeightsTest, NegativeWeight)
           false,
           "weights",
           createBasicAuthHeaders(DEFAULT_CREDENTIAL),
-          createUpdateRequestBody(createWeightInfos("role1=-2.0"))));
+          strings::format("%s", JSON::protobuf(infos)).get()));
 
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(BadRequest().status, response)
     << response.get().body;
 
-  checkWithRolesEndpoint(master.get()->pid);
+  checkWithGetRequest(master.get()->pid, DEFAULT_CREDENTIAL);
 }
 
 
@@ -344,7 +253,8 @@ TEST_F(DynamicWeightsTest, NonNumericWeight)
   Try<Owned<cluster::Master>> master = StartMaster();
   ASSERT_SOME(master);
 
-  // Send a weight update request to update the weight of 'role1' to 'two'
+  // Send a weight update request to update the weight of 'role1' to 'two'.
+  RepeatedPtrField<WeightInfo> infos = createWeightInfos("role1=two");
   Future<Response> response = process::http::request(
       process::http::createRequest(
           master.get()->pid,
@@ -352,12 +262,12 @@ TEST_F(DynamicWeightsTest, NonNumericWeight)
           false,
           "weights",
           createBasicAuthHeaders(DEFAULT_CREDENTIAL),
-          createUpdateRequestBody(createWeightInfos("role1=two"))));
+          strings::format("%s", JSON::protobuf(infos)).get()));
 
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(BadRequest().status, response)
     << response.get().body;
 
-  checkWithRolesEndpoint(master.get()->pid);
+  checkWithGetRequest(master.get()->pid, DEFAULT_CREDENTIAL);
 }
 
 
@@ -381,9 +291,10 @@ TEST_F(DynamicWeightsTest, MissingRole)
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(BadRequest().status, response1)
     << response1.get().body;
 
-  checkWithRolesEndpoint(master.get()->pid);
+  checkWithGetRequest(master.get()->pid, DEFAULT_CREDENTIAL);
 
   // Send an empty role (only a space) update request.
+  RepeatedPtrField<WeightInfo> infos = createWeightInfos(" =2.0");
   Future<Response> response2 = process::http::request(
       process::http::createRequest(
           master.get()->pid,
@@ -391,12 +302,12 @@ TEST_F(DynamicWeightsTest, MissingRole)
           false,
           "weights",
           createBasicAuthHeaders(DEFAULT_CREDENTIAL),
-          createUpdateRequestBody(createWeightInfos(" =2.0"))));
+          strings::format("%s", JSON::protobuf(infos)).get()));
 
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(BadRequest().status, response2)
     << response2.get().body;
 
-  checkWithRolesEndpoint(master.get()->pid);
+  checkWithGetRequest(master.get()->pid, DEFAULT_CREDENTIAL);
 }
 
 
@@ -412,6 +323,7 @@ TEST_F(DynamicWeightsTest, UnknownRole)
   ASSERT_SOME(master);
 
   // Send a weight update request for 'unknown' role.
+  RepeatedPtrField<WeightInfo> infos = createWeightInfos("unknown=3.0");
   Future<Response> response = process::http::request(
       process::http::createRequest(
           master.get()->pid,
@@ -419,12 +331,12 @@ TEST_F(DynamicWeightsTest, UnknownRole)
           false,
           "weights",
           createBasicAuthHeaders(DEFAULT_CREDENTIAL),
-          createUpdateRequestBody(createWeightInfos("unknown=3.0"))));
+          strings::format("%s", JSON::protobuf(infos)).get()));
 
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(BadRequest().status, response)
     << response.get().body;
 
-  checkWithRolesEndpoint(master.get()->pid, DEFAULT_WEIGHTS);
+  checkWithGetRequest(master.get()->pid, DEFAULT_CREDENTIAL);
 }
 
 
@@ -439,9 +351,10 @@ TEST_F(DynamicWeightsTest, UpdateWeightsWithExplictRoles)
   Try<Owned<cluster::Master>> master = StartMaster(flags);
   ASSERT_SOME(master);
 
-  checkWithRolesEndpoint(master.get()->pid, DEFAULT_WEIGHTS);
+  checkWithGetRequest(master.get()->pid, DEFAULT_CREDENTIAL);
 
-  // Send a weight update request for the specified roles in UPDATED_WEIGHTS.
+  // Send a weight update request for the specified roles in UPDATED_WEIGHTS1.
+  RepeatedPtrField<WeightInfo> infos = createWeightInfos(UPDATED_WEIGHTS1);
   Future<Response> response = process::http::request(
       process::http::createRequest(
           master.get()->pid,
@@ -449,12 +362,12 @@ TEST_F(DynamicWeightsTest, UpdateWeightsWithExplictRoles)
           false,
           "weights",
           createBasicAuthHeaders(DEFAULT_CREDENTIAL),
-          createUpdateRequestBody(createWeightInfos(UPDATED_WEIGHTS))));
+          strings::format("%s", JSON::protobuf(infos)).get()));
 
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
     << response.get().body;
 
-  checkWithRolesEndpoint(master.get()->pid, UPDATED_WEIGHTS);
+  checkWithGetRequest(master.get()->pid, DEFAULT_CREDENTIAL, UPDATED_WEIGHTS1);
 }
 
 
@@ -471,7 +384,8 @@ TEST_F(DynamicWeightsTest, UnauthenticatedUpdateWeightRequest)
   credential.set_principal("unknown-principal");
   credential.set_secret("test-secret");
 
-  // Send a weight update request for the specified roles in UPDATED_WEIGHTS.
+  // Send a weight update request for the specified roles in UPDATED_WEIGHTS1.
+  RepeatedPtrField<WeightInfo> infos = createWeightInfos(UPDATED_WEIGHTS1);
   Future<Response> response1 = process::http::request(
       process::http::createRequest(
           master.get()->pid,
@@ -479,14 +393,15 @@ TEST_F(DynamicWeightsTest, UnauthenticatedUpdateWeightRequest)
           false,
           "weights",
           createBasicAuthHeaders(credential),
-          createUpdateRequestBody(createWeightInfos(UPDATED_WEIGHTS))));
+          strings::format("%s", JSON::protobuf(infos)).get()));
 
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(Unauthorized({}).status, response1)
     << response1.get().body;
 
-  checkWithRolesEndpoint(master.get()->pid);
+  checkWithGetRequest(master.get()->pid, DEFAULT_CREDENTIAL);
 
   // The absence of credentials leads to authentication failure as well.
+  infos = createWeightInfos(UPDATED_WEIGHTS1);
   Future<Response> response2 = process::http::request(
       process::http::createRequest(
           master.get()->pid,
@@ -494,12 +409,87 @@ TEST_F(DynamicWeightsTest, UnauthenticatedUpdateWeightRequest)
           false,
           "weights",
           None(),
-          createUpdateRequestBody(createWeightInfos(UPDATED_WEIGHTS))));
+          strings::format("%s", JSON::protobuf(infos)).get()));
 
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(Unauthorized({}).status, response2)
     << response2.get().body;
 
-  checkWithRolesEndpoint(master.get()->pid);
+  checkWithGetRequest(master.get()->pid, DEFAULT_CREDENTIAL);
+}
+
+
+// Checks that a weight query request is rejected for unauthenticated
+// principals.
+TEST_F(DynamicWeightsTest, UnauthenticatedQueryWeightRequest)
+{
+  // The master is configured so that only requests from `DEFAULT_CREDENTIAL`
+  // are authenticated.
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  Credential credential;
+  credential.set_principal("unknown-principal");
+  credential.set_secret("test-secret");
+
+  // Send a weight query request.
+  Future<Response> response = process::http::request(
+      process::http::createRequest(
+          master.get()->pid,
+          "GET",
+          false,
+          "weights",
+          createBasicAuthHeaders(credential)));
+
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(Unauthorized({}).status, response)
+    << response.get().body;
+}
+
+
+// Checks that an authorized principal can get weights.
+TEST_F(DynamicWeightsTest, AuthorizedGetWeightsRequest)
+{
+  // Setup ACLs so that the default principal (DEFAULT_CREDENTIAL.principal())
+  // can update weight for `ROLE1` and `ROLE2`.
+  ACLs acls;
+  acls.set_permissive(false); // Restrictive.
+  mesos::ACL::UpdateWeight* acl = acls.add_update_weights();
+  acl->mutable_principals()->add_values(DEFAULT_CREDENTIAL.principal());
+  acl->mutable_roles()->add_values(ROLE1);
+  acl->mutable_roles()->add_values(ROLE2);
+
+  // Setup ACLs so that default principal can only see ROLE1's weights and
+  // default principal 2 can only see ROLE2's weights.
+  mesos::ACL::GetWeight* getACL1 = acls.add_get_weights();
+  getACL1->mutable_principals()->add_values(DEFAULT_CREDENTIAL.principal());
+  getACL1->mutable_roles()->add_values(ROLE1);
+
+  mesos::ACL::GetWeight* getACL2 = acls.add_get_weights();
+  getACL2->mutable_principals()->add_values(DEFAULT_CREDENTIAL_2.principal());
+  getACL2->mutable_roles()->add_values(ROLE2);
+
+  master::Flags masterFlags = CreateMasterFlags();
+  masterFlags.acls = acls;
+
+  Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
+  ASSERT_SOME(master);
+
+  // Send a weight update request for the specified roles in UPDATED_WEIGHTS1.
+  RepeatedPtrField<WeightInfo> infos = createWeightInfos(UPDATED_WEIGHTS1);
+  Future<Response> response = process::http::request(
+      process::http::createRequest(
+          master.get()->pid,
+          "PUT",
+          false,
+          "weights",
+          createBasicAuthHeaders(DEFAULT_CREDENTIAL),
+          strings::format("%s", JSON::protobuf(infos)).get()));
+
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
+    << response.get().body;
+
+  checkWithGetRequest(master.get()->pid, DEFAULT_CREDENTIAL, GET_WEIGHTS1);
+
+  checkWithGetRequest(master.get()->pid, DEFAULT_CREDENTIAL_2, GET_WEIGHTS2);
 }
 
 
@@ -510,10 +500,16 @@ TEST_F(DynamicWeightsTest, AuthorizedWeightUpdateRequest)
   // can update weight for `ROLE1` and `ROLE2`.
   ACLs acls;
   acls.set_permissive(false); // Restrictive.
-  mesos::ACL::UpdateWeights* acl = acls.add_update_weights();
+  mesos::ACL::UpdateWeight* acl = acls.add_update_weights();
   acl->mutable_principals()->add_values(DEFAULT_CREDENTIAL.principal());
   acl->mutable_roles()->add_values(ROLE1);
   acl->mutable_roles()->add_values(ROLE2);
+
+  // Ensure the get weights check pass under restrictive mode.
+  mesos::ACL::GetWeight* getAcl = acls.add_get_weights();
+  getAcl->mutable_principals()->add_values(DEFAULT_CREDENTIAL.principal());
+  getAcl->mutable_roles()->add_values(ROLE1);
+  getAcl->mutable_roles()->add_values(ROLE2);
 
   master::Flags masterFlags = CreateMasterFlags();
   masterFlags.acls = acls;
@@ -521,7 +517,8 @@ TEST_F(DynamicWeightsTest, AuthorizedWeightUpdateRequest)
   Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
   ASSERT_SOME(master);
 
-  // Send a weight update request for the specified roles in UPDATED_WEIGHTS.
+  // Send a weight update request for the specified roles in UPDATED_WEIGHTS1.
+  RepeatedPtrField<WeightInfo> infos = createWeightInfos(UPDATED_WEIGHTS1);
   Future<Response> response = process::http::request(
       process::http::createRequest(
           master.get()->pid,
@@ -529,12 +526,12 @@ TEST_F(DynamicWeightsTest, AuthorizedWeightUpdateRequest)
           false,
           "weights",
           createBasicAuthHeaders(DEFAULT_CREDENTIAL),
-          createUpdateRequestBody(createWeightInfos(UPDATED_WEIGHTS))));
+          strings::format("%s", JSON::protobuf(infos)).get()));
 
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
     << response.get().body;
 
-  checkWithRolesEndpoint(master.get()->pid, UPDATED_WEIGHTS);
+  checkWithGetRequest(master.get()->pid, DEFAULT_CREDENTIAL, UPDATED_WEIGHTS1);
 }
 
 
@@ -547,10 +544,15 @@ TEST_F(DynamicWeightsTest, AuthorizedUpdateWeightRequestWithoutPrincipal)
   // for `ROLE1` and `ROLE2`.
   ACLs acls;
   acls.set_permissive(false); // Restrictive.
-  mesos::ACL::UpdateWeights* acl = acls.add_update_weights();
+  mesos::ACL::UpdateWeight* acl = acls.add_update_weights();
   acl->mutable_principals()->set_type(mesos::ACL::Entity::ANY);
   acl->mutable_roles()->add_values(ROLE1);
   acl->mutable_roles()->add_values(ROLE2);
+
+  // Ensure the get weights pass under restrictive mode.
+  mesos::ACL::GetWeight* getAcl = acls.add_get_weights();
+  getAcl->mutable_principals()->set_type(mesos::ACL::Entity::ANY);
+  getAcl->mutable_roles()->set_type(mesos::ACL::Entity::ANY);
 
   // Disable authentication and set acls.
   master::Flags masterFlags = CreateMasterFlags();
@@ -560,7 +562,8 @@ TEST_F(DynamicWeightsTest, AuthorizedUpdateWeightRequestWithoutPrincipal)
   Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
   ASSERT_SOME(master);
 
-  // Send a weight update request for the specified roles in UPDATED_WEIGHTS.
+  // Send a weight update request for the specified roles in UPDATED_WEIGHTS1.
+  RepeatedPtrField<WeightInfo> infos = createWeightInfos(UPDATED_WEIGHTS1);
   Future<Response> response = process::http::request(
       process::http::createRequest(
           master.get()->pid,
@@ -568,12 +571,12 @@ TEST_F(DynamicWeightsTest, AuthorizedUpdateWeightRequestWithoutPrincipal)
           false,
           "weights",
           None(),
-          createUpdateRequestBody(createWeightInfos(UPDATED_WEIGHTS))));
+          strings::format("%s", JSON::protobuf(infos)).get()));
 
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
     << response.get().body;
 
-  checkWithRolesEndpoint(master.get()->pid, UPDATED_WEIGHTS);
+  checkWithGetRequest(master.get()->pid, DEFAULT_CREDENTIAL, UPDATED_WEIGHTS1);
 }
 
 
@@ -591,7 +594,8 @@ TEST_F(DynamicWeightsTest, UnauthorizedWeightUpdateRequest)
   Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
   ASSERT_SOME(master);
 
-  // Send a weight update request for the specified roles in UPDATED_WEIGHTS.
+  // Send a weight update request for the specified roles in UPDATED_WEIGHTS1.
+  RepeatedPtrField<WeightInfo> infos = createWeightInfos(UPDATED_WEIGHTS1);
   Future<Response> response = process::http::request(
       process::http::createRequest(
           master.get()->pid,
@@ -599,12 +603,99 @@ TEST_F(DynamicWeightsTest, UnauthorizedWeightUpdateRequest)
           false,
           "weights",
           createBasicAuthHeaders(DEFAULT_CREDENTIAL),
-          createUpdateRequestBody(createWeightInfos(UPDATED_WEIGHTS))));
+          strings::format("%s", JSON::protobuf(infos)).get()));
 
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(Forbidden().status, response)
     << response.get().body;
 
-  checkWithRolesEndpoint(master.get()->pid);
+  checkWithGetRequest(master.get()->pid, DEFAULT_CREDENTIAL);
+}
+
+
+// Checks that the weights information can be recovered from the registry.
+TEST_F(DynamicWeightsTest, RecoveredWeightsFromRegistry)
+{
+  // Start a master with `--weights` flag.
+  master::Flags masterFlags = CreateMasterFlags();
+  masterFlags.weights = UPDATED_WEIGHTS1;
+  Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
+  ASSERT_SOME(master);
+
+  // Tests whether the weights replicated log is initialized with the
+  // `--weights` flag when bootstrapping the cluster.
+  {
+    checkWithGetRequest(
+        master.get()->pid,
+        DEFAULT_CREDENTIAL,
+        UPDATED_WEIGHTS1);
+
+    // Stop the master
+    master->reset();
+
+    // Restart the master.
+    masterFlags.weights = None();
+    master = StartMaster(masterFlags);
+    ASSERT_SOME(master);
+
+    checkWithGetRequest(
+        master.get()->pid,
+        DEFAULT_CREDENTIAL,
+        UPDATED_WEIGHTS1);
+  }
+
+  // Tests whether the weights replicated log can be updated with
+  // `/weights` endpoint.
+  {
+    // Send a weights update request for the specified roles.
+    RepeatedPtrField<WeightInfo> infos = createWeightInfos(UPDATED_WEIGHTS2);
+    Future<Response> response = process::http::request(
+        process::http::createRequest(
+            master.get()->pid,
+            "PUT",
+            false,
+            "weights",
+            createBasicAuthHeaders(DEFAULT_CREDENTIAL),
+            strings::format("%s", JSON::protobuf(infos)).get()));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
+      << response.get().body;
+
+    checkWithGetRequest(
+        master.get()->pid,
+        DEFAULT_CREDENTIAL,
+        UPDATED_WEIGHTS2);
+
+    // Stop the master
+    master->reset();
+
+    // Restart the master without `--weights` flag.
+    masterFlags.weights = None();
+    master = StartMaster(masterFlags);
+    ASSERT_SOME(master);
+
+    checkWithGetRequest(
+        master.get()->pid,
+        DEFAULT_CREDENTIAL,
+        UPDATED_WEIGHTS2);
+  }
+
+  // Tests whether the `--weights` flag is ignored and use the registry value
+  // instead when Mesos master subsequently starts with `--weights` flag
+  // still specified.
+  {
+    // Stop the master
+    master->reset();
+
+    // Restart the master with `--weights` flag.
+    masterFlags.weights = UPDATED_WEIGHTS1;
+    master = StartMaster(masterFlags);
+    ASSERT_SOME(master);
+
+    checkWithGetRequest(
+        master.get()->pid,
+        DEFAULT_CREDENTIAL,
+        UPDATED_WEIGHTS2);
+  }
 }
 
 } // namespace tests {

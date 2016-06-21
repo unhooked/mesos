@@ -30,9 +30,6 @@
 #include <stout/try.hpp>
 
 
-// TODO(bmahler): Switch to joyent/http-parser now that it is no
-// longer being hosted under ry/http-parser.
-
 namespace process {
 
 // TODO(benh): Make DataDecoder abstract and make RequestDecoder a
@@ -41,7 +38,7 @@ class DataDecoder
 {
 public:
   explicit DataDecoder(const network::Socket& _s)
-    : s(_s), failure(false), request(NULL)
+    : s(_s), failure(false), request(nullptr)
   {
     settings.on_message_begin = &DataDecoder::on_message_begin;
 
@@ -57,6 +54,8 @@ public:
     settings.on_headers_complete = &DataDecoder::on_headers_complete;
     settings.on_body = &DataDecoder::on_body;
     settings.on_message_complete = &DataDecoder::on_message_complete;
+    settings.on_chunk_complete = &DataDecoder::on_chunk_complete;
+    settings.on_chunk_header = &DataDecoder::on_chunk_header;
 
     http_parser_init(&parser, HTTP_REQUEST);
 
@@ -103,10 +102,20 @@ private:
     decoder->value.clear();
     decoder->query.clear();
 
-    CHECK(decoder->request == NULL);
+    CHECK(decoder->request == nullptr);
 
     decoder->request = new http::Request();
 
+    return 0;
+  }
+
+  static int on_chunk_complete(http_parser* p)
+  {
+    return 0;
+  }
+
+  static int on_chunk_header(http_parser* p)
+  {
     return 0;
   }
 
@@ -160,6 +169,9 @@ private:
       }
 
       if (url.field_set & (1 << UF_FRAGMENT)) {
+        if (decoder->request->url.fragment.isNone()) {
+          decoder->request->url.fragment = "";
+        }
         decoder->request->url.fragment->append(
             data + url.field_data[UF_FRAGMENT].off,
             url.field_data[UF_FRAGMENT].len);
@@ -259,7 +271,7 @@ private:
     }
 
     decoder->requests.push_back(decoder->request);
-    decoder->request = NULL;
+    decoder->request = nullptr;
     return 0;
   }
 
@@ -290,7 +302,7 @@ class ResponseDecoder
 {
 public:
   ResponseDecoder()
-    : failure(false), header(HEADER_FIELD), response(NULL)
+    : failure(false), header(HEADER_FIELD), response(nullptr)
   {
     settings.on_message_begin = &ResponseDecoder::on_message_begin;
 
@@ -306,6 +318,9 @@ public:
     settings.on_headers_complete = &ResponseDecoder::on_headers_complete;
     settings.on_body = &ResponseDecoder::on_body;
     settings.on_message_complete = &ResponseDecoder::on_message_complete;
+    settings.on_status = &ResponseDecoder::on_status;
+    settings.on_chunk_complete = &ResponseDecoder::on_chunk_complete;
+    settings.on_chunk_header = &ResponseDecoder::on_chunk_header;
 
     http_parser_init(&parser, HTTP_RESPONSE);
 
@@ -346,7 +361,7 @@ private:
     decoder->field.clear();
     decoder->value.clear();
 
-    CHECK(decoder->response == NULL);
+    CHECK(decoder->response == nullptr);
 
     decoder->response = new http::Response();
     decoder->response->status.clear();
@@ -355,6 +370,16 @@ private:
     decoder->response->body.clear();
     decoder->response->path.clear();
 
+    return 0;
+  }
+
+  static int on_chunk_complete(http_parser* p)
+  {
+    return 0;
+  }
+
+  static int on_chunk_header(http_parser* p)
+  {
     return 0;
   }
 
@@ -460,7 +485,12 @@ private:
     }
 
     decoder->responses.push_back(decoder->response);
-    decoder->response = NULL;
+    decoder->response = nullptr;
+    return 0;
+  }
+
+  static int on_status(http_parser* p, const char* data, size_t length)
+  {
     return 0;
   }
 
@@ -495,7 +525,7 @@ class StreamingResponseDecoder
 {
 public:
   StreamingResponseDecoder()
-    : failure(false), header(HEADER_FIELD), response(NULL)
+    : failure(false), header(HEADER_FIELD), response(nullptr)
   {
     settings.on_message_begin =
       &StreamingResponseDecoder::on_message_begin;
@@ -521,6 +551,12 @@ public:
       &StreamingResponseDecoder::on_body;
     settings.on_message_complete =
       &StreamingResponseDecoder::on_message_complete;
+    settings.on_status =
+      &StreamingResponseDecoder::on_status;
+    settings.on_chunk_complete =
+      &StreamingResponseDecoder::on_chunk_complete;
+    settings.on_chunk_header =
+      &StreamingResponseDecoder::on_chunk_header;
 
     http_parser_init(&parser, HTTP_RESPONSE);
 
@@ -575,13 +611,23 @@ private:
     decoder->field.clear();
     decoder->value.clear();
 
-    CHECK(decoder->response == NULL);
+    CHECK(decoder->response == nullptr);
     CHECK_NONE(decoder->writer);
 
     decoder->response = new http::Response();
     decoder->response->type = http::Response::PIPE;
     decoder->writer = None();
 
+    return 0;
+  }
+
+  static int on_chunk_complete(http_parser* p)
+  {
+    return 0;
+  }
+
+  static int on_chunk_header(http_parser* p)
+  {
     return 0;
   }
 
@@ -601,6 +647,11 @@ private:
     return 0;
   }
 #endif // !(HTTP_PARSER_VERSION_MAJOR >= 2)
+
+  static int on_status(http_parser* p, const char* data, size_t length)
+  {
+    return 0;
+  }
 
   static int on_url(http_parser* p, const char* data, size_t length)
   {
@@ -675,7 +726,7 @@ private:
     // Send the response to the caller, but keep a Pipe::Writer for
     // streaming the body content into the response.
     decoder->responses.push_back(decoder->response);
-    decoder->response = NULL;
+    decoder->response = nullptr;
 
     return 0;
   }

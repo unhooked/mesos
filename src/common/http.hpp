@@ -22,6 +22,11 @@
 #include <mesos/http.hpp>
 #include <mesos/mesos.hpp>
 
+#include <mesos/authorizer/authorizer.hpp>
+
+#include <process/future.hpp>
+#include <process/http.hpp>
+
 #include <stout/hashmap.hpp>
 #include <stout/json.hpp>
 #include <stout/jsonify.hpp>
@@ -29,13 +34,11 @@
 
 namespace mesos {
 
-class Resources;
 class Attributes;
-
-namespace internal {
-
+class Resources;
 class Task;
 
+namespace internal {
 
 // Serializes a protobuf message for transmission
 // based on the HTTP content type.
@@ -86,10 +89,16 @@ void json(JSON::ObjectWriter* writer, const Task& task);
 } // namespace internal {
 
 void json(JSON::ObjectWriter* writer, const Attributes& attributes);
+void json(JSON::ObjectWriter* writer, const CommandInfo& command);
 void json(JSON::ObjectWriter* writer, const ExecutorInfo& executorInfo);
 void json(JSON::ArrayWriter* writer, const Labels& labels);
 void json(JSON::ObjectWriter* writer, const Resources& resources);
+void json(JSON::ObjectWriter* writer, const Task& task);
 void json(JSON::ObjectWriter* writer, const TaskStatus& status);
+
+
+const process::http::authorization::AuthorizationCallbacks
+  createAuthorizationCallbacks(Authorizer* authorizer);
 
 } // namespace mesos {
 

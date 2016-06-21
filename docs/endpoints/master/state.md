@@ -12,8 +12,13 @@ layout: documentation
 Information about state of master.
 
 ### DESCRIPTION ###
+Returns 200 OK when the state of the master was queried successfully.
+Returns 307 TEMPORARY_REDIRECT redirect to the leading master when
+current master is not the leader.
+Returns 503 SERVICE_UNAVAILABLE if the leading master cannot be
+found.
 This endpoint shows information about the frameworks, tasks,
-executors and slaves running in the cluster as a JSON object.
+executors and agents running in the cluster as a JSON object.
 
 Example (**Note**: this is not exhaustive):
 
@@ -45,15 +50,15 @@ Example (**Note**: this is not exhaustive):
          "work_dir" : "/var/lib/mesos",
          "http_authenticators" : "basic",
          "authorizers" : "local",
-         "slave_reregister_timeout" : "10mins",
+         "agent_reregister_timeout" : "10mins",
          "logging_level" : "INFO",
          "help" : "false",
          "root_submissions" : "true",
          "ip" : "127.0.0.1",
          "user_sorter" : "drf",
          "version" : "false",
-         "max_slave_ping_timeouts" : "5",
-         "slave_ping_timeout" : "15secs",
+         "max_agent_ping_timeouts" : "5",
+         "agent_ping_timeout" : "15secs",
          "registry_store_timeout" : "20secs",
          "max_completed_frameworks" : "50",
          "quiet" : "false",
@@ -64,13 +69,13 @@ Example (**Note**: this is not exhaustive):
          "registry" : "replicated_log",
          "registry_strict" : "false",
          "log_auto_initialize" : "true",
-         "authenticate_slaves" : "false",
+         "authenticate_agents" : "false",
          "registry_fetch_timeout" : "1mins",
          "allocation_interval" : "1secs",
          "authenticate_http" : "false",
          "port" : "5050",
          "zk_session_timeout" : "10secs",
-         "recovery_slave_removal_limit" : "100%",
+         "recovery_agent_removal_limit" : "100%",
          "webui_dir" : "/path/to/mesos/build/../src/webui",
          "cluster" : "mycluster",
          "leader" : "master@127.0.0.1:5050",
@@ -84,3 +89,8 @@ Example (**Note**: this is not exhaustive):
     "unregistered_frameworks" : []
 }
 ```
+
+
+### AUTHENTICATION ###
+This endpoint requires authentication iff HTTP authentication is
+enabled.

@@ -21,10 +21,12 @@
 #include <vector>
 
 #include <stout/option.hpp>
-#include <stout/os.hpp>
 #include <stout/path.hpp>
 #include <stout/protobuf.hpp>
 #include <stout/try.hpp>
+
+#include <stout/os/permissions.hpp>
+#include <stout/os/read.hpp>
 
 namespace mesos {
 namespace internal {
@@ -52,7 +54,8 @@ inline Result<Credentials> read(const Path& path)
                  << "credentials file is NOT accessible by others.";
   }
 
-  // TODO(ijimenez): Deprecate text and support only JSON like ACLs.
+  // TODO(nfnt): Remove text format support at the end of the deprecation cycle
+  // which started with version 1.0.
   Try<JSON::Object> json = JSON::parse<JSON::Object>(read.get());
   if (!json.isError()) {
     Try<Credentials> credentials = ::protobuf::parse<Credentials>(json.get());
@@ -100,7 +103,6 @@ inline Result<Credential> readCredential(const Path& path)
                  << "credential file is NOT accessible by others.";
   }
 
-  // TODO(ijimenez): Deprecate text support for only JSON ACLs.
   Try<JSON::Object> json = JSON::parse<JSON::Object>(read.get());
   if (!json.isError()) {
     Try<Credential> credential = ::protobuf::parse<Credential>(json.get());
@@ -109,6 +111,8 @@ inline Result<Credential> readCredential(const Path& path)
     }
   }
 
+  // TODO(nfnt): Remove text format support at the end of the deprecation cycle
+  // which started with version 1.0.
   Credential credential;
   const std::vector<std::string>& line = strings::tokenize(read.get(), "\n");
   if (line.size() != 1) {

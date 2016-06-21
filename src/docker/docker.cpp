@@ -22,6 +22,7 @@
 #include <stout/result.hpp>
 #include <stout/strings.hpp>
 
+#include <stout/os/killtree.hpp>
 #include <stout/os/read.hpp>
 
 #include <process/check.hpp>
@@ -53,8 +54,6 @@ using std::string;
 using std::vector;
 
 
-Nothing _nothing() { return Nothing(); }
-
 template <typename T>
 static Future<T> failure(
     const string& cmd,
@@ -62,8 +61,8 @@ static Future<T> failure(
     const string& err)
 {
   return Failure(
-      "Failed to '" + cmd + "': exit status = " +
-      WSTRINGIFY(status) + " stderr = " + err);
+      "Failed to run '" + cmd + "': " + WSTRINGIFY(status) +
+      "; stderr='" + err + "'");
 }
 
 
@@ -97,13 +96,14 @@ static Future<Nothing> checkError(const string& cmd, const Subprocess& s)
 Try<Owned<Docker>> Docker::create(
     const string& path,
     const string& socket,
-    bool validate)
+    bool validate,
+    const Option<JSON::Object>& config)
 {
   if (!strings::startsWith(socket, "/")) {
     return Error("Invalid Docker socket path: " + socket);
   }
 
-  Owned<Docker> docker(new Docker(path, socket));
+  Owned<Docker> docker(new Docker(path, socket, config));
   if (!validate) {
     return docker;
   }
@@ -147,7 +147,7 @@ Future<Version> Docker::version() const
       Subprocess::PIPE());
 
   if (s.isError()) {
-    return Failure(s.error());
+    return Failure("Failed to create subprocess '" + cmd + "': " + s.error());
   }
 
   return s.get().status()
@@ -438,7 +438,7 @@ Try<Docker::Image> Docker::Image::create(const JSON::Object& json)
 }
 
 
-Future<Nothing> Docker::run(
+Future<Option<int>> Docker::run(
     const ContainerInfo& containerInfo,
     const CommandInfo& commandInfo,
     const string& name,
@@ -446,8 +446,8 @@ Future<Nothing> Docker::run(
     const string& mappedDirectory,
     const Option<Resources>& resources,
     const Option<map<string, string>>& env,
-    const process::Subprocess::IO& stdout,
-    const process::Subprocess::IO& stderr) const
+    const process::Subprocess::IO& _stdout,
+    const process::Subprocess::IO& _stderr) const
 {
   if (!containerInfo.has_docker()) {
     return Failure("No docker info found in container info");
@@ -508,6 +508,8 @@ Future<Nothing> Docker::run(
 
   foreach (const Volume& volume, containerInfo.volumes()) {
     string volumeConfig = volume.container_path();
+
+    // TODO(gyliu513): Set `host_path` as source.
     if (volume.has_host_path()) {
       if (!strings::startsWith(volume.host_path(), "/") &&
           !dockerInfo.has_volume_driver()) {
@@ -519,15 +521,34 @@ Future<Nothing> Docker::run(
         volumeConfig = volume.host_path() + ":" + volumeConfig;
       }
 
-      if (volume.has_mode()) {
-        switch (volume.mode()) {
-          case Volume::RW: volumeConfig += ":rw"; break;
-          case Volume::RO: volumeConfig += ":ro"; break;
-          default: return Failure("Unsupported volume mode");
-        }
+      switch (volume.mode()) {
+        case Volume::RW: volumeConfig += ":rw"; break;
+        case Volume::RO: volumeConfig += ":ro"; break;
+        default: return Failure("Unsupported volume mode");
       }
-    } else if (volume.has_mode() && !volume.has_host_path()) {
-      return Failure("Host path is required with mode");
+    } else if (volume.has_source()) {
+      if (volume.source().type() != Volume::Source::DOCKER_VOLUME) {
+        VLOG(1) << "Ignored volume type '" << volume.source().type()
+                << "' for container '" << name << "' as only "
+                << "'DOCKER_VOLUME' was supported by docker";
+        continue;
+      }
+
+      volumeConfig = volume.source().docker_volume().name() +
+                     ":" + volumeConfig;
+
+      if (volume.source().docker_volume().has_driver()) {
+        argv.push_back("--volume-driver=" +
+                       volume.source().docker_volume().driver());
+      }
+
+      switch (volume.mode()) {
+        case Volume::RW: volumeConfig += ":rw"; break;
+        case Volume::RO: volumeConfig += ":ro"; break;
+        default: return Failure("Unsupported volume mode");
+      }
+    } else {
+      return Failure("Host path or volume source is required");
     }
 
     argv.push_back("-v");
@@ -538,6 +559,8 @@ Future<Nothing> Docker::run(
   argv.push_back("-v");
   argv.push_back(sandboxDirectory + ":" + mappedDirectory);
 
+  // TODO(gyliu513): Deprecate this after the release cycle of 1.0.
+  // It will be replaced by Volume.Source.DockerVolume.driver.
   if (dockerInfo.has_volume_driver()) {
     argv.push_back("--volume-driver=" + dockerInfo.volume_driver());
   }
@@ -550,6 +573,31 @@ Future<Nothing> Docker::run(
     case ContainerInfo::DockerInfo::HOST: network = "host"; break;
     case ContainerInfo::DockerInfo::BRIDGE: network = "bridge"; break;
     case ContainerInfo::DockerInfo::NONE: network = "none"; break;
+    case ContainerInfo::DockerInfo::USER: {
+      // User defined networks require docker version >= 1.9.0.
+      Try<Nothing> validateVer = validateVersion(Version(1, 9, 0));
+
+      if (validateVer.isError()) {
+        return Failure("User defined networks require Docker "
+                       "version 1.9.0 or higher");
+      }
+
+      if (containerInfo.network_infos_size() == 0) {
+        return Failure("No network info found in container info");
+      }
+
+      if (containerInfo.network_infos_size() > 1) {
+        return Failure("Only a single network can be defined in Docker run");
+      }
+
+      const NetworkInfo& networkInfo = containerInfo.network_infos(0);
+      if(!networkInfo.has_name()){
+        return Failure("No network name found in network info");
+      }
+
+      network = networkInfo.name();
+      break;
+    }
     default: return Failure("Unsupported Network mode: " +
                             stringify(dockerInfo.network()));
   }
@@ -570,8 +618,9 @@ Future<Nothing> Docker::run(
   }
 
   if (dockerInfo.port_mappings().size() > 0) {
-    if (network != "bridge") {
-      return Failure("Port mappings are only supported for bridge network");
+    if (network == "host" || network == "none"  ) {
+      return Failure("Port mappings are only supported for bridge and "
+                     "user-defined networks");
     }
 
     if (!resources.isSome()) {
@@ -647,50 +696,40 @@ Future<Nothing> Docker::run(
 
   string cmd = strings::join(" ", argv);
 
-  VLOG(1) << "Running " << cmd;
+  LOG(INFO) << "Running " << cmd;
 
   map<string, string> environment = os::environment();
 
-  // Currently the Docker CLI picks up dockerconfig by looking for
-  // the config file in the $HOME directory. If one of the URIs
-  // provided is a docker config file we want docker to be able to
-  // pick it up from the sandbox directory where we store all the
-  // URI downloads.
+  // NOTE: This is non-relevant to pick up a docker config file,
+  // which is necessary for private registry.
   environment["HOME"] = sandboxDirectory;
 
   Try<Subprocess> s = subprocess(
       path,
       argv,
       Subprocess::PATH("/dev/null"),
-      stdout,
-      stderr,
+      _stdout,
+      _stderr,
+      NO_SETSID,
       None(),
       environment);
 
   if (s.isError()) {
-    return Failure(s.error());
+    return Failure("Failed to create subprocess '" + cmd + "': " + s.error());
   }
 
-  // We don't call checkError here to avoid printing the stderr
-  // of the docker container task as docker run with attach forwards
-  // the container's stderr to the client's stderr.
-  return s.get().status()
-    .then(lambda::bind(
-        &Docker::_run,
-        lambda::_1))
+  s->status()
     .onDiscard(lambda::bind(&commandDiscarded, s.get(), cmd));
-}
 
-
-Future<Nothing> Docker::_run(const Option<int>& status)
-{
-  if (status.isNone()) {
-    return Failure("Failed to get exit status");
-  } else if (status.get() != 0) {
-    return Failure("Container exited on error: " + WSTRINGIFY(status.get()));
-  }
-
-  return Nothing();
+  // Ideally we could capture the stderr when docker itself fails,
+  // however due to the stderr redirection used here we cannot.
+  //
+  // TODO(bmahler): Determine a way to redirect stderr while still
+  // capturing the stderr when 'docker run' itself fails. E.g. we
+  // could use 'docker logs' in conjuction with a "detached" form
+  // of 'docker run' to isolate 'docker run' failure messages from
+  // the container stderr.
+  return s->status();
 }
 
 
@@ -717,7 +756,7 @@ Future<Nothing> Docker::stop(
       Subprocess::PIPE());
 
   if (s.isError()) {
-    return Failure(s.error());
+    return Failure("Failed to create subprocess '" + cmd + "': " + s.error());
   }
 
   return s.get().status()
@@ -748,6 +787,30 @@ Future<Nothing> Docker::_stop(
 }
 
 
+Future<Nothing> Docker::kill(
+    const string& containerName,
+    int signal) const
+{
+  const string cmd =
+    path + " -H " + socket +
+    " kill --signal=" + stringify(signal) + " " + containerName;
+
+  VLOG(1) << "Running " << cmd;
+
+  Try<Subprocess> s = subprocess(
+      cmd,
+      Subprocess::PATH("/dev/null"),
+      Subprocess::PATH("/dev/null"),
+      Subprocess::PIPE());
+
+  if (s.isError()) {
+    return Failure("Failed to create subprocess '" + cmd + "': " + s.error());
+  }
+
+  return checkError(cmd, s.get());
+}
+
+
 Future<Nothing> Docker::rm(
     const string& containerName,
     bool force) const
@@ -766,7 +829,7 @@ Future<Nothing> Docker::rm(
       Subprocess::PIPE());
 
   if (s.isError()) {
-    return Failure(s.error());
+    return Failure("Failed to create subprocess '" + cmd + "': " + s.error());
   }
 
   return checkError(cmd, s.get());
@@ -805,7 +868,7 @@ void Docker::_inspect(
       Subprocess::PIPE());
 
   if (s.isError()) {
-    promise->fail(s.error());
+    promise->fail("Failed to create subprocess '" + cmd + "': " + s.error());
     return;
   }
 
@@ -924,7 +987,7 @@ Future<list<Docker::Container>> Docker::ps(
       Subprocess::PIPE());
 
   if (s.isError()) {
-    return Failure(s.error());
+    return Failure("Failed to create subprocess '" + cmd + "': " + s.error());
   }
 
   // Start reading from stdout so writing to the pipe won't block
@@ -1072,7 +1135,7 @@ Future<Docker::Image> Docker::pull(
 
   if (force) {
     // Skip inspect and docker pull the image.
-    return Docker::__pull(*this, directory, image, path, socket);
+    return Docker::__pull(*this, directory, image, path, socket, config);
   }
 
   argv.push_back(path);
@@ -1091,10 +1154,11 @@ Future<Docker::Image> Docker::pull(
       Subprocess::PATH("/dev/null"),
       Subprocess::PIPE(),
       Subprocess::PIPE(),
+      NO_SETSID,
       None());
 
   if (s.isError()) {
-    return Failure("Failed to execute '" + cmd + "': " + s.error());
+    return Failure("Failed to create subprocess '" + cmd + "': " + s.error());
   }
 
   // Start reading from stdout so writing to the pipe won't block
@@ -1113,6 +1177,7 @@ Future<Docker::Image> Docker::pull(
         dockerImage,
         path,
         socket,
+        config,
         output));
 }
 
@@ -1124,6 +1189,7 @@ Future<Docker::Image> Docker::_pull(
     const string& image,
     const string& path,
     const string& socket,
+    const Option<JSON::Object>& config,
     Future<string> output)
 {
   Option<int> status = s.status().get();
@@ -1134,7 +1200,7 @@ Future<Docker::Image> Docker::_pull(
 
   output.discard();
 
-  return Docker::__pull(docker, directory, image, path, socket);
+  return Docker::__pull(docker, directory, image, path, socket, config);
 }
 
 
@@ -1143,7 +1209,8 @@ Future<Docker::Image> Docker::__pull(
     const string& directory,
     const string& image,
     const string& path,
-    const string& socket)
+    const string& socket,
+    const Option<JSON::Object>& config)
 {
   vector<string> argv;
   argv.push_back(path);
@@ -1156,10 +1223,57 @@ Future<Docker::Image> Docker::__pull(
 
   VLOG(1) << "Running " << cmd;
 
-  // Set HOME variable to pick up .dockercfg.
-  map<string, string> environment = os::environment();
+  // Set the HOME path where docker config file locates.
+  Option<string> home;
+  if (config.isSome()) {
+    Try<string> _home = os::mkdtemp();
 
-  environment["HOME"] = directory;
+    if (_home.isError()) {
+      return Failure("Failed to create temporary directory for docker config"
+                     "file: " + _home.error());
+    }
+
+    home = _home.get();
+
+    Result<JSON::Object> auths = config->find<JSON::Object>("auths");
+    if (auths.isError()) {
+      return Failure("Failed to find 'auths' in docker config file: " +
+                     auths.error());
+    }
+
+    const string path = auths.isSome()
+      ? path::join(home.get(), ".docker")
+      : home.get();
+
+    Try<Nothing> mkdir = os::mkdir(path);
+    if (mkdir.isError()) {
+      return Failure("Failed to create path '" + path + "': " + mkdir.error());
+    }
+
+    const string file = path::join(path, auths.isSome()
+        ? "config.json"
+        : ".dockercfg");
+
+    Try<Nothing> write = os::write(file, stringify(config.get()));
+    if (write.isError()) {
+      return Failure("Failed to write docker config file to '" +
+                     file + "': " + write.error());
+    }
+  }
+
+  // Currently the Docker CLI picks up .docker/config.json (old
+  // .dockercfg by looking for the config file in the $HOME
+  // directory. The docker config file can either be specified by
+  // the agent flag '--docker_config', or by one of the URIs
+  // provided which is a docker config file we want docker to be
+  // able to pick it up from the sandbox directory where we store
+  // all the URI downloads.
+  // TODO(gilbert): Deprecate the fetching docker config file
+  // specified as URI method on 0.30.0 release.
+  map<string, string> environment = os::environment();
+  environment["HOME"] = home.isSome()
+    ? home.get()
+    : directory;
 
   Try<Subprocess> s_ = subprocess(
       path,
@@ -1167,6 +1281,7 @@ Future<Docker::Image> Docker::__pull(
       Subprocess::PATH("/dev/null"),
       Subprocess::PIPE(),
       Subprocess::PIPE(),
+      NO_SETSID,
       None(),
       environment);
 
@@ -1185,7 +1300,18 @@ Future<Docker::Image> Docker::__pull(
         cmd,
         directory,
         image))
-    .onDiscard(lambda::bind(&commandDiscarded, s_.get(), cmd));
+    .onDiscard(lambda::bind(&commandDiscarded, s_.get(), cmd))
+    .onAny([home]() {
+      if (home.isSome()) {
+        Try<Nothing> rmdir = os::rmdir(home.get());
+
+        if (rmdir.isError()) {
+          LOG(WARNING) << "Failed to remove docker config file temporary"
+                       << "'HOME' directory '" << home.get() << "': "
+                       << rmdir.error();
+        }
+      }
+    });
 }
 
 

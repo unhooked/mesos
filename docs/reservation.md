@@ -14,6 +14,7 @@ and authorized __frameworks__ to dynamically reserve resources in the cluster.
 In both types of reservations, resources are reserved for a [__role__](roles.md).
 
 
+<a name="static-reservation"></a>
 ## Static Reservation
 
 An operator can configure a slave with resources reserved for a role.
@@ -40,7 +41,7 @@ __NOTE:__ This feature is supported for backwards compatibility.
 
 ## Dynamic Reservation
 
-As mentioned in [Static Reservation](#static-reservation-since-0140), specifying
+As mentioned in [Static Reservation](#static-reservation), specifying
 the reserved resources via the `--resources` flag makes the reservation static.
 That is, statically reserved resources cannot be reserved for another role nor
 be unreserved. Dynamic reservation enables operators and authorized frameworks
@@ -73,6 +74,10 @@ a slave that have been reserved for a role. In this case, the unreserved
 resources will be subtracted from the previous reservation and any remaining
 resources will still be reserved.
 
+Dynamic reservations cannot be unreserved if they are still being used by a
+running task or if a [persistent volume](persistent-volume.md) has been created
+using the reserved resources. In the latter case, the volume should be destroyed
+before unreserving the resources.
 
 ### Labeled Reservations
 
@@ -87,6 +92,7 @@ same slave and use the same role.
 
 ### Framework Scheduler API
 
+<a name="offer-operation-reserve"></a>
 #### `Offer::Operation::Reserve`
 
 A framework can reserve resources through the resource offer cycle.  Suppose we
@@ -115,8 +121,15 @@ receive a resource offer with 12 CPUs and 6144 MB of RAM unreserved.
 
 We can reserve 8 CPUs and 4096 MB of RAM by sending the following
 `Offer::Operation` message. `Offer::Operation::Reserve` has a `resources` field
-which we specify with the resources to be reserved. We need to explicitly set
-the `role` and `principal` fields with the framework's role and principal.
+which we specify with the resources to be reserved. We must explicitly set the
+resources' `role` field with the framework's role. The required value of the
+`principal` field depends on whether or not the framework provided a principal
+when it registered with the master. If a principal was provided, then the
+resources' `principal` field must be equal to the framework's principal. If no
+principal was provided during registration, then the resources' `principal`
+field can take any value, or can be left unset. Note that the `principal` field
+determines the "reserver principal" when [authorization](authorization.md) is
+enabled, even if authentication is disabled.
 
         {
           "type": Offer::Operation::RESERVE,
@@ -178,7 +191,7 @@ following reserved resources:
 #### `Offer::Operation::Unreserve`
 
 A framework can unreserve resources through the resource offer cycle.
-In [Offer::Operation::Reserve](#offeroperationreserve), we reserved 8 CPUs
+In [Offer::Operation::Reserve](#offer-operation-reserve), we reserved 8 CPUs
 and 4096 MB of RAM on a particular slave for our `role`. The master will
 continue to only offer these resources to our `role`. Suppose we would like to
 unreserve these resources. First, we receive a resource offer (copy/pasted
@@ -257,10 +270,17 @@ Suppose we want to reserve 8 CPUs and 4096 MB of RAM for the `ads` role on a
 slave with id=`<slave_id>` (note that it is up to the user to find the ID of the
 slave that hosts the desired resources; the request will fail if sufficient
 unreserved resources cannot be found on the slave). In this case, the principal
-included in the request will be the principal of an authorized operator rather
-than the principal of a framework registered under the `ads` role. We send an
-HTTP POST request to the master's [/reserve](endpoints/master/reserve.md)
-endpoint like so:
+that must be included in the `reservation` field of the reserved resources
+depends on the status of HTTP authentication on the master. If HTTP
+authentication is enabled, then the principal in the reservation should match
+the authenticated principal provided in the request's HTTP headers. If HTTP
+authentication is disabled, then the principal in the reservation can take any
+value, or can be left unset. Note that the `principal` field determines the
+"reserver principal" when [authorization](authorization.md) is enabled, even if
+HTTP authentication is disabled.
+
+We send an HTTP POST request to the master's
+[/reserve](endpoints/master/reserve.md) endpoint like so:
 
         $ curl -i \
           -u <operator_principal>:<password> \
@@ -289,20 +309,20 @@ endpoint like so:
 
 The user receives one of the following HTTP responses:
 
-* `200 OK`: Request accepted (see below).
+* `202 Accepted`: Request accepted (see below).
 * `400 BadRequest`: Invalid arguments (e.g., missing parameters).
 * `401 Unauthorized`: Unauthenticated request.
 * `403 Forbidden`: Unauthorized request.
 * `409 Conflict`: Insufficient resources to satisfy the reserve operation.
 
-Note that when `200 OK` is returned by this endpoint, it does __not__ mean that
-the requested resources have been reserved. Instead, this return code indicates
-that the reservation request has been validated successfully by the master. The
-reservation request is then forwarded asynchronously to the Mesos slave where
-the resources are located. That asynchronous message may not be delivered, in
-which case no resources will be reserved. To determine if a reserve operation
-has succeeded, the user can examine the state of the appropriate Mesos slave
-(e.g., via the slave's [/state](endpoints/slave/state.md) HTTP endpoint).
+This endpoint returns the 202 ACCEPTED HTTP status code, which indicates that
+the reserve operation has been validated successfully by the master. The
+request is then forwarded asynchronously to the Mesos slave where the reserved
+resources are located. That asynchronous message may not be delivered or
+reserving resources at the slave might fail, in which case no resources will be
+reserved. To determine if a reserve operation has succeeded, the user can
+examine the state of the appropriate Mesos slave (e.g., via the slave's
+[/state](endpoints/slave/state.md) HTTP endpoint).
 
 #### `/unreserve` (since 0.25.0)
 
@@ -343,20 +363,20 @@ unreserve reservations made by `reserver_principal`.
 
 The user receives one of the following HTTP responses:
 
-* `200 OK`: Request accepted (see below).
+* `202 Accepted`: Request accepted (see below).
 * `400 BadRequest`: Invalid arguments (e.g., missing parameters).
 * `401 Unauthorized`: Unauthenticated request.
 * `403 Forbidden`: Unauthorized request.
 * `409 Conflict`: Insufficient resources to satisfy the unreserve operation.
 
-Note that when `200 OK` is returned by this endpoint, it does __not__ mean that
-the requested resources have been unreserved. Instead, this return code
-indicates that the unreserve request has been validated successfully by the
-master. The request is then forwarded asynchronously to the Mesos slave where
-the resources are located. That asynchronous message may not be delivered, in
-which case no resources will be unreserved. To determine if an unreserve
-operation has succeeded, the user can examine the state of the appropriate Mesos
-slave (e.g., via the slave's [/state](endpoints/slave/state.md) HTTP endpoint).
+This endpoint returns the 202 ACCEPTED HTTP status code, which indicates that
+the unreserve operation has been validated successfully by the master. The
+request is then forwarded asynchronously to the Mesos slave where the reserved
+resources are located. That asynchronous message may not be delivered or
+unreserving resources at the slave might fail, in which case no resources will
+be unreserved. To determine if an unreserve operation has succeeded, the user
+can examine the state of the appropriate Mesos slave (e.g., via the slave's
+[/state](endpoints/slave/state.md) HTTP endpoint).
 
 ### Listing Reservations
 

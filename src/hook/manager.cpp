@@ -14,6 +14,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <list>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -21,6 +22,9 @@
 #include <mesos/hook.hpp>
 
 #include <mesos/module/hook.hpp>
+
+#include <process/collect.hpp>
+#include <process/future.hpp>
 
 #include <stout/check.hpp>
 #include <stout/foreach.hpp>
@@ -32,9 +36,13 @@
 #include "hook/manager.hpp"
 #include "module/manager.hpp"
 
+using std::list;
 using std::map;
 using std::string;
 using std::vector;
+
+using process::collect;
+using process::Future;
 
 using mesos::modules::ModuleManager;
 
@@ -139,7 +147,7 @@ void HookManager::masterSlaveLostHook(const SlaveInfo& slaveInfo)
     Hook* hook = availableHooks[name];
     Try<Nothing> result = hook->masterSlaveLostHook(slaveInfo);
     if (result.isError()) {
-      LOG(WARNING) << "Master slave-lost hook failed for module '"
+      LOG(WARNING) << "Master agent-lost hook failed for module '"
                    << name << "': " << result.error();
     }
   }
@@ -165,7 +173,7 @@ Labels HookManager::slaveRunTaskLabelDecorator(
       if (result.isSome()) {
         taskInfo_.mutable_labels()->CopyFrom(result.get());
       } else if (result.isError()) {
-        LOG(WARNING) << "Slave label decorator hook failed for module '"
+        LOG(WARNING) << "Agent label decorator hook failed for module '"
                     << name << "': " << result.error();
       }
     }
@@ -190,13 +198,62 @@ Environment HookManager::slaveExecutorEnvironmentDecorator(
         executorInfo.mutable_command()->mutable_environment()->CopyFrom(
             result.get());
       } else if (result.isError()) {
-        LOG(WARNING) << "Slave environment decorator hook failed for module '"
+        LOG(WARNING) << "Agent environment decorator hook failed for module '"
                     << name << "': " << result.error();
       }
     }
 
     return executorInfo.command().environment();
   }
+}
+
+
+Future<map<string, string>>
+  HookManager::slavePreLaunchDockerEnvironmentDecorator(
+      const Option<TaskInfo>& taskInfo,
+      const ExecutorInfo& executorInfo,
+      const string& containerName,
+      const string& sandboxDirectory,
+      const string& mappedDirectory,
+      const Option<map<string, string>>& env)
+{
+  // We execute these hooks according to their ordering so any conflicting
+  // environment variables can be deterministically resolved
+  // (the last hook takes priority).
+  list<Future<Option<Environment>>> futures;
+
+  foreach (const string& name, availableHooks.keys()) {
+    Hook* hook = availableHooks[name];
+
+    // Chain together each hook.
+    futures.push_back(
+        hook->slavePreLaunchDockerEnvironmentDecorator(
+            taskInfo,
+            executorInfo,
+            containerName,
+            sandboxDirectory,
+            mappedDirectory,
+            env));
+  }
+
+  return collect(futures)
+    .then([](const list<Option<Environment>>& results)
+        -> Future<map<string, string>> {
+      // Combine all the Environments.
+      map<string, string> environment;
+
+      foreach (const Option<Environment>& result, results) {
+        if (result.isNone()) {
+          continue;
+        }
+
+        foreach (const Environment::Variable& variable, result->variables()) {
+          environment[variable.name()] = variable.value();
+        }
+      }
+
+      return environment;
+    });
 }
 
 
@@ -225,8 +282,23 @@ void HookManager::slavePreLaunchDockerHook(
           resources,
           env);
     if (result.isError()) {
-      LOG(WARNING) << "Slave pre launch docker hook failed for module '"
+      LOG(WARNING) << "Agent pre launch docker hook failed for module '"
                    << name << "': " << result.error();
+    }
+  }
+}
+
+
+void HookManager::slavePostFetchHook(
+    const ContainerID& containerId,
+    const string& directory)
+{
+  foreach (const string& name, availableHooks.keys()) {
+    Hook* hook = availableHooks[name];
+    Try<Nothing> result = hook->slavePostFetchHook(containerId, directory);
+    if (result.isError()) {
+      LOG(WARNING) << "Agent post fetch hook failed for module "
+                   << "'" << name << "': " << result.error();
     }
   }
 }
@@ -241,7 +313,7 @@ void HookManager::slaveRemoveExecutorHook(
     const Try<Nothing> result =
       hook->slaveRemoveExecutorHook(frameworkInfo, executorInfo);
     if (result.isError()) {
-      LOG(WARNING) << "Slave remove executor hook failed for module '"
+      LOG(WARNING) << "Agent remove executor hook failed for module '"
                    << name << "': " << result.error();
     }
   }
@@ -270,7 +342,7 @@ TaskStatus HookManager::slaveTaskStatusDecorator(
               result.get().container_status());
         }
       } else if (result.isError()) {
-        LOG(WARNING) << "Slave TaskStatus decorator hook failed for "
+        LOG(WARNING) << "Agent TaskStatus decorator hook failed for "
                      << "module '" << name << "': " << result.error();
       }
     }
@@ -298,7 +370,7 @@ Resources HookManager::slaveResourcesDecorator(
       if (result.isSome()) {
         slaveInfo_.mutable_resources()->CopyFrom(result.get());
       } else if (result.isError()) {
-        LOG(WARNING) << "Slave Resources decorator hook failed for "
+        LOG(WARNING) << "Agent Resources decorator hook failed for "
                      << "module '" << name << "': " << result.error();
       }
     }
@@ -326,7 +398,7 @@ Attributes HookManager::slaveAttributesDecorator(
       if (result.isSome()) {
         slaveInfo_.mutable_attributes()->CopyFrom(result.get());
       } else if (result.isError()) {
-        LOG(WARNING) << "Slave Attributes decorator hook failed for "
+        LOG(WARNING) << "Agent Attributes decorator hook failed for "
                      << "module '" << name << "': " << result.error();
       }
     }

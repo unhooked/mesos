@@ -10,13 +10,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License
 
-#include <errno.h>
+#ifndef __WINDOWS__
+#include <arpa/inet.h>
 #include <netdb.h>
+#endif // __WINDOWS__
+
+#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-
-#include <arpa/inet.h>
 
 #include <glog/logging.h>
 
@@ -90,7 +92,7 @@ istream& operator>>(istream& stream, UPID& pid)
     return stream;
   }
 
-  VLOG(2) << "Attempting to parse '" << str << "' into a PID";
+  VLOG(3) << "Attempting to parse '" << str << "' into a PID";
 
   if (str.size() == 0) {
     stream.setstate(ios_base::badbit);

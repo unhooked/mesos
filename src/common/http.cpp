@@ -25,6 +25,13 @@
 #include <mesos/http.hpp>
 #include <mesos/resources.hpp>
 
+#include <mesos/authorizer/authorizer.hpp>
+
+#include <process/dispatch.hpp>
+#include <process/future.hpp>
+#include <process/http.hpp>
+#include <process/pid.hpp>
+
 #include <stout/foreach.hpp>
 #include <stout/protobuf.hpp>
 #include <stout/stringify.hpp>
@@ -39,6 +46,8 @@ using std::ostream;
 using std::set;
 using std::string;
 using std::vector;
+
+using process::http::authorization::AuthorizationCallbacks;
 
 namespace mesos {
 
@@ -105,6 +114,7 @@ JSON::Object model(const Resources& resources)
 {
   JSON::Object object;
   object.values["cpus"] = 0;
+  object.values["gpus"] = 0;
   object.values["mem"] = 0;
   object.values["disk"] = 0;
 
@@ -177,10 +187,6 @@ JSON::Object model(const NetworkInfo& info)
 {
   JSON::Object object;
 
-  if (info.has_ip_address()) {
-    object.values["ip_address"] = info.ip_address();
-  }
-
   if (info.groups().size() > 0) {
     JSON::Array array;
     array.values.reserve(info.groups().size()); // MESOS-2353.
@@ -191,7 +197,7 @@ JSON::Object model(const NetworkInfo& info)
   }
 
   if (info.has_labels()) {
-    object.values["labels"] = std::move(model(info.labels()));
+    object.values["labels"] = model(info.labels());
   }
 
   if (info.ip_addresses().size() > 0) {
@@ -240,7 +246,7 @@ JSON::Object model(const TaskStatus& status)
   object.values["timestamp"] = status.timestamp();
 
   if (status.has_labels()) {
-    object.values["labels"] = std::move(model(status.labels()));
+    object.values["labels"] = model(status.labels());
   }
 
   if (status.has_container_status()) {
@@ -273,6 +279,10 @@ JSON::Object model(const Task& task)
   object.values["state"] = TaskState_Name(task.state());
   object.values["resources"] = model(task.resources());
 
+  if (task.has_user()) {
+    object.values["user"] = task.user();
+  }
+
   {
     JSON::Array array;
     array.values.reserve(task.statuses().size()); // MESOS-2353.
@@ -284,7 +294,7 @@ JSON::Object model(const Task& task)
   }
 
   if (task.has_labels()) {
-    object.values["labels"] = std::move(model(task.labels()));
+    object.values["labels"] = model(task.labels());
   }
 
   if (task.has_discovery()) {
@@ -353,33 +363,14 @@ JSON::Object model(const ExecutorInfo& executorInfo)
   object.values["framework_id"] = executorInfo.framework_id().value();
   object.values["command"] = model(executorInfo.command());
   object.values["resources"] = model(executorInfo.resources());
+
+  if (executorInfo.has_labels()) {
+    object.values["labels"] = model(executorInfo.labels());
+  }
+
   return object;
 }
 
-
-void json(JSON::ObjectWriter* writer, const Task& task)
-{
-  writer->field("id", task.task_id().value());
-  writer->field("name", task.name());
-  writer->field("framework_id", task.framework_id().value());
-  writer->field("executor_id", task.executor_id().value());
-  writer->field("slave_id", task.slave_id().value());
-  writer->field("state", TaskState_Name(task.state()));
-  writer->field("resources", Resources(task.resources()));
-  writer->field("statuses", task.statuses());
-
-  if (task.has_labels()) {
-    writer->field("labels", task.labels());
-  }
-
-  if (task.has_discovery()) {
-    writer->field("discovery", JSON::Protobuf(task.discovery()));
-  }
-
-  if (task.has_container()) {
-    writer->field("container", JSON::Protobuf(task.container()));
-  }
-}
 
 }  // namespace internal {
 
@@ -406,7 +397,7 @@ void json(JSON::ObjectWriter* writer, const Attributes& attributes)
 }
 
 
-static void json(JSON::ObjectWriter* writer, const CommandInfo& command)
+void json(JSON::ObjectWriter* writer, const CommandInfo& command)
 {
   if (command.has_shell()) {
     writer->field("shell", command.shell());
@@ -452,6 +443,10 @@ void json(JSON::ObjectWriter* writer, const ExecutorInfo& executorInfo)
   writer->field("framework_id", executorInfo.framework_id().value());
   writer->field("command", executorInfo.command());
   writer->field("resources", Resources(executorInfo.resources()));
+
+  if (executorInfo.has_labels()) {
+    writer->field("labels", executorInfo.labels());
+  }
 }
 
 
@@ -465,10 +460,6 @@ void json(JSON::ArrayWriter* writer, const Labels& labels)
 
 static void json(JSON::ObjectWriter* writer, const NetworkInfo& info)
 {
-  if (info.has_ip_address()) {
-    writer->field("ip_address", info.ip_address());
-  }
-
   if (info.groups().size() > 0) {
     writer->field("groups", info.groups());
   }
@@ -493,7 +484,8 @@ static void json(JSON::ObjectWriter* writer, const NetworkInfo& info)
 
 void json(JSON::ObjectWriter* writer, const Resources& resources)
 {
-  hashmap<string, double> scalars = {{"cpus", 0}, {"mem", 0}, {"disk", 0}};
+  hashmap<string, double> scalars =
+    {{"cpus", 0}, {"gpus", 0}, {"mem", 0}, {"disk", 0}};
   hashmap<string, Value::Ranges> ranges;
   hashmap<string, Value::Set> sets;
 
@@ -518,6 +510,35 @@ void json(JSON::ObjectWriter* writer, const Resources& resources)
   json(writer, scalars);
   json(writer, ranges);
   json(writer, sets);
+}
+
+
+void json(JSON::ObjectWriter* writer, const Task& task)
+{
+  writer->field("id", task.task_id().value());
+  writer->field("name", task.name());
+  writer->field("framework_id", task.framework_id().value());
+  writer->field("executor_id", task.executor_id().value());
+  writer->field("slave_id", task.slave_id().value());
+  writer->field("state", TaskState_Name(task.state()));
+  writer->field("resources", Resources(task.resources()));
+  writer->field("statuses", task.statuses());
+
+  if (task.has_user()) {
+    writer->field("user", task.user());
+  }
+
+  if (task.has_labels()) {
+    writer->field("labels", task.labels());
+  }
+
+  if (task.has_discovery()) {
+    writer->field("discovery", JSON::Protobuf(task.discovery()));
+  }
+
+  if (task.has_container()) {
+    writer->field("container", JSON::Protobuf(task.container()));
+  }
 }
 
 
@@ -561,6 +582,42 @@ static void json(JSON::StringWriter* writer, const Value::Set& set)
 static void json(JSON::StringWriter* writer, const Value::Text& text)
 {
   writer->append(text.value());
+}
+
+
+const AuthorizationCallbacks createAuthorizationCallbacks(
+    Authorizer* authorizer)
+{
+  typedef lambda::function<process::Future<bool>(
+      const process::http::Request& httpRequest,
+      const Option<string>& principal)> Callback;
+
+  AuthorizationCallbacks callbacks;
+
+  Callback getEndpoint = [authorizer](
+      const process::http::Request& httpRequest,
+      const Option<string>& principal) -> process::Future<bool> {
+        authorization::Request authRequest;
+        authRequest.set_action(mesos::authorization::GET_ENDPOINT_WITH_PATH);
+
+        if (principal.isSome()) {
+          authRequest.mutable_subject()->set_value(principal.get());
+        }
+
+        const string path = httpRequest.url.path;
+        authRequest.mutable_object()->set_value(path);
+
+        LOG(INFO) << "Authorizing principal '"
+                  << (principal.isSome() ? principal.get() : "ANY")
+                  << "' to GET the endpoint '" << path << "'";
+
+        return authorizer->authorized(authRequest);
+      };
+
+  callbacks.insert(std::make_pair("/logging/toggle", getEndpoint));
+  callbacks.insert(std::make_pair("/metrics/snapshot", getEndpoint));
+
+  return callbacks;
 }
 
 }  // namespace mesos {

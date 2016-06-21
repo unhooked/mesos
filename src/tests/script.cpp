@@ -24,7 +24,6 @@
 #include <stout/check.hpp>
 #include <stout/os.hpp>
 #include <stout/path.hpp>
-#include <stout/protobuf.hpp>
 #include <stout/stringify.hpp>
 #include <stout/strings.hpp>
 
@@ -93,8 +92,8 @@ void execute(const string& script)
 
     // Redirect output to /dev/null unless the test is verbose.
     if (!flags.verbose) {
-      if (freopen("/dev/null", "w", stdout) == NULL ||
-          freopen("/dev/null", "w", stderr) == NULL) {
+      if (freopen("/dev/null", "w", stdout) == nullptr ||
+          freopen("/dev/null", "w", stderr) == nullptr) {
         std::cerr << "Failed to redirect stdout/stderr to /dev/null:"
                   << os::strerror(errno) << std::endl;
         abort();
@@ -118,7 +117,7 @@ void execute(const string& script)
     os::setenv("MESOS_REGISTRY", "replicated_log");
 
     // Enable authentication.
-    os::setenv("MESOS_AUTHENTICATE", "true");
+    os::setenv("MESOS_AUTHENTICATE_FRAMEWORKS", "true");
 
     // Create test credentials.
     const string& credentials =
@@ -164,7 +163,7 @@ void execute(const string& script)
     os::setenv("MESOS_ACLS", "file://" + aclsPath);
 
     // Now execute the script.
-    execl(path.get().c_str(), path.get().c_str(), (char*) NULL);
+    execl(path.get().c_str(), path.get().c_str(), (char*) nullptr);
 
     std::cerr << "Failed to execute '" << script << "': "
               << os::strerror(errno) << std::endl;

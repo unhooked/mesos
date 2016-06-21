@@ -31,7 +31,7 @@ namespace process {
 namespace metrics {
 
 // Initializes the metrics library.
-void initialize();
+void initialize(const Option<std::string>& authenticationRealm = None());
 
 namespace internal {
 
@@ -44,39 +44,51 @@ public:
 
   Future<Nothing> remove(const std::string& name);
 
+  Future<hashmap<std::string, double>> snapshot(
+      const Option<Duration>& timeout);
+
 protected:
   virtual void initialize();
 
 private:
   static std::string help();
 
-  MetricsProcess(const Option<Owned<RateLimiter>>& _limiter)
+  MetricsProcess(
+      const Option<Owned<RateLimiter>>& _limiter,
+      const Option<std::string>& _authenticationRealm)
     : ProcessBase("metrics"),
-      limiter(_limiter)
+      limiter(_limiter),
+      authenticationRealm(_authenticationRealm)
   {}
 
   // Non-copyable, non-assignable.
   MetricsProcess(const MetricsProcess&);
   MetricsProcess& operator=(const MetricsProcess&);
 
-  Future<http::Response> snapshot(const http::Request& request);
-  Future<http::Response> _snapshot(const http::Request& request);
-  static std::list<Future<double> > _snapshotTimeout(
-      const std::list<Future<double> >& futures);
-  static Future<http::Response> __snapshot(
+  Future<http::Response> _snapshot(
       const http::Request& request,
+      const Option<std::string>& /* principal */);
+
+  static std::list<Future<double>> _snapshotTimeout(
+      const std::list<Future<double>>& futures);
+
+  static Future<hashmap<std::string, double>> __snapshot(
       const Option<Duration>& timeout,
-      const hashmap<std::string, Future<double> >& metrics,
-      const hashmap<std::string, Option<Statistics<double> > >& statistics);
+      const hashmap<std::string, Future<double>>& metrics,
+      const hashmap<std::string, Option<Statistics<double>>>& statistics);
 
   // The Owned<Metric> is an explicit copy of the Metric passed to 'add'.
-  hashmap<std::string, Owned<Metric> > metrics;
+  hashmap<std::string, Owned<Metric>> metrics;
 
   // Used to rate limit the snapshot endpoint.
   Option<Owned<RateLimiter>> limiter;
 
   // Needed for access to the private constructor.
-  friend void process::metrics::initialize();
+  friend void process::metrics::initialize(
+      const Option<std::string>& authenticationRealm);
+
+  // The authentication realm that metrics HTTP endpoints are installed into.
+  const Option<std::string> authenticationRealm;
 };
 
 }  // namespace internal {
@@ -100,6 +112,16 @@ inline Future<Nothing> remove(const Metric& metric)
       internal::MetricsProcess::instance(),
       &internal::MetricsProcess::remove,
       metric.name());
+}
+
+
+inline Future<hashmap<std::string, double>> snapshot(
+    const Option<Duration>& timeout)
+{
+  return dispatch(
+      internal::MetricsProcess::instance(),
+      &internal::MetricsProcess::snapshot,
+      timeout);
 }
 
 }  // namespace metrics {

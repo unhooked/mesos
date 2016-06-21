@@ -29,11 +29,9 @@
 #include <mesos/authorizer/acls.hpp>
 
 #include <stout/flags.hpp>
-#include <stout/format.hpp>
 #include <stout/json.hpp>
 #include <stout/option.hpp>
 #include <stout/os.hpp>
-#include <stout/path.hpp>
 #include <stout/protobuf.hpp>
 #include <stout/stringify.hpp>
 #include <stout/uuid.hpp>
@@ -65,7 +63,8 @@ static Resources SHARD_INITIAL_RESOURCES(const string& role)
 static Resource SHARD_PERSISTENT_VOLUME(
     const string& role,
     const string& persistenceId,
-    const string& containerPath)
+    const string& containerPath,
+    const string& principal)
 {
   Volume volume;
   volume.set_container_path(containerPath);
@@ -73,6 +72,7 @@ static Resource SHARD_PERSISTENT_VOLUME(
 
   Resource::DiskInfo info;
   info.mutable_persistence()->set_id(persistenceId);
+  info.mutable_persistence()->set_principal(principal);
   info.mutable_volume()->CopyFrom(volume);
 
   Resource resource = Resources::parse("disk", "8", role).get();
@@ -154,7 +154,7 @@ public:
       const vector<Offer>& offers)
   {
     foreach (const Offer& offer, offers) {
-      LOG(INFO) << "Received offer " << offer.id() << " from slave "
+      LOG(INFO) << "Received offer " << offer.id() << " from agent "
                 << offer.slave_id() << " (" << offer.hostname() << ") "
                 << "with " << offer.resources();
 
@@ -170,7 +170,8 @@ public:
               Resource volume = SHARD_PERSISTENT_VOLUME(
                   frameworkInfo.role(),
                   UUID::random().toString(),
-                  "volume");
+                  "volume",
+                  frameworkInfo.principal());
 
               Try<Resources> resources = shard.resources.apply(CREATE(volume));
               CHECK_SOME(resources);
@@ -299,14 +300,14 @@ public:
       const string& data)
   {
     LOG(INFO) << "Received framework message from executor '" << executorId
-              << "' on slave " << slaveId << ": '" << data << "'";
+              << "' on agent " << slaveId << ": '" << data << "'";
   }
 
   virtual void slaveLost(
       SchedulerDriver* driver,
       const SlaveID& slaveId)
   {
-    LOG(INFO) << "Lost slave " << slaveId;
+    LOG(INFO) << "Lost agent " << slaveId;
   }
 
   virtual void executorLost(
@@ -315,7 +316,7 @@ public:
       const SlaveID& slaveId,
       int status)
   {
-    LOG(INFO) << "Lost executor '" << executorId << "' on slave "
+    LOG(INFO) << "Lost executor '" << executorId << "' on agent "
               << slaveId << ", " << WSTRINGIFY(status);
   }
 
@@ -421,7 +422,7 @@ int main(int argc, char** argv)
 {
   Flags flags;
 
-  Try<Nothing> load = flags.load("MESOS_", argc, argv);
+  Try<flags::Warnings> load = flags.load("MESOS_", argc, argv);
 
   if (load.isError()) {
     cerr << flags.usage(load.error()) << endl;
@@ -440,6 +441,11 @@ int main(int argc, char** argv)
 
   logging::initialize(argv[0], flags, true); // Catch signals.
 
+  // Log any flag warnings (after logging is initialized).
+  foreach (const flags::Warning& warning, load->warnings) {
+    LOG(WARNING) << warning.message;
+  }
+
   FrameworkInfo framework;
   framework.set_user(""); // Have Mesos fill in the current user.
   framework.set_name("Persistent Volume Framework (C++)");
@@ -450,7 +456,7 @@ int main(int argc, char** argv)
   if (flags.master.get() == "local") {
     // Configure master.
     os::setenv("MESOS_ROLES", flags.role);
-    os::setenv("MESOS_AUTHENTICATE", "false");
+    os::setenv("MESOS_AUTHENTICATE_FRAMEWORKS", "false");
 
     ACLs acls;
     ACL::RegisterFramework* acl = acls.add_register_frameworks();

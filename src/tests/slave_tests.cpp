@@ -27,6 +27,8 @@
 #include <mesos/executor.hpp>
 #include <mesos/scheduler.hpp>
 
+#include <mesos/authentication/http/basic_authenticator_factory.hpp>
+
 #include <process/clock.hpp>
 #include <process/future.hpp>
 #include <process/gmock.hpp>
@@ -47,6 +49,8 @@
 #include "master/flags.hpp"
 #include "master/master.hpp"
 
+#include "master/detector/standalone.hpp"
+
 #include "slave/constants.hpp"
 #include "slave/gc.hpp"
 #include "slave/flags.hpp"
@@ -57,6 +61,7 @@
 #include "slave/containerizer/mesos/containerizer.hpp"
 
 #include "tests/containerizer.hpp"
+#include "tests/environment.hpp"
 #include "tests/flags.hpp"
 #include "tests/limiter.hpp"
 #include "tests/mesos.hpp"
@@ -68,6 +73,9 @@ using mesos::internal::master::Master;
 
 using mesos::internal::protobuf::createLabel;
 
+using mesos::master::detector::MasterDetector;
+using mesos::master::detector::StandaloneMasterDetector;
+
 using process::Clock;
 using process::Future;
 using process::Owned;
@@ -75,9 +83,11 @@ using process::PID;
 using process::Promise;
 using process::UPID;
 
+using process::http::InternalServerError;
 using process::http::OK;
 using process::http::Response;
 using process::http::ServiceUnavailable;
+using process::http::Unauthorized;
 
 using std::map;
 using std::shared_ptr;
@@ -425,6 +435,7 @@ TEST_F(SlaveTest, CommandExecutorWithOverride)
         Subprocess::PIPE(),
         Subprocess::PIPE(),
         Subprocess::PIPE(),
+        NO_SETSID,
         environment);
 
   ASSERT_SOME(executor);
@@ -544,6 +555,82 @@ TEST_F(SlaveTest, ComamndTaskWithArguments)
 }
 
 
+// Tests that task's kill policy grace period does not extend the time
+// a task responsive to SIGTERM needs to exit and the terminal status
+// to be delivered to the master.
+TEST_F(SlaveTest, CommandTaskWithKillPolicy)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get());
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(&driver, _, _));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers));
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  EXPECT_NE(0u, offers->size());
+  Offer offer = offers.get()[0];
+
+  TaskInfo task;
+  task.set_name("");
+  task.mutable_task_id()->set_value("1");
+  task.mutable_slave_id()->MergeFrom(offer.slave_id());
+  task.mutable_resources()->MergeFrom(offer.resources());
+
+  CommandInfo command;
+  command.set_value("sleep 1000");
+  task.mutable_command()->MergeFrom(command);
+
+  // Set task's kill policy grace period to a large value.
+  Duration gracePeriod = Seconds(100);
+  task.mutable_kill_policy()->mutable_grace_period()->set_nanoseconds(
+      gracePeriod.ns());
+
+  Future<TaskStatus> statusRunning;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusRunning));
+
+  driver.launchTasks(offer.id(), {task});
+
+  AWAIT_READY(statusRunning);
+  EXPECT_EQ(TASK_RUNNING, statusRunning->state());
+
+  // Kill the task.
+  Future<TaskStatus> statusKilled;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusKilled));
+
+  driver.killTask(statusRunning->task_id());
+
+  // Since "sleep 1000" task is responsive to SIGTERM, we should
+  // observe TASK_KILLED update sooner than after `gracePeriod`
+  // elapses. This indicates that extended grace period does not
+  // influence the time a task and its command executor need to
+  // exit. We add a small buffer for a task to clean up and the
+  // update to be processed by the master.
+  AWAIT_READY_FOR(statusKilled, Seconds(1) + process::MAX_REAP_INTERVAL());
+
+  EXPECT_EQ(TASK_KILLED, statusKilled->state());
+  EXPECT_EQ(TaskStatus::SOURCE_EXECUTOR,
+            statusKilled->source());
+
+  driver.stop();
+  driver.join();
+}
+
+
 // Don't let args from the CommandInfo struct bleed over into
 // mesos-executor forking. For more details of this see MESOS-1873.
 TEST_F(SlaveTest, GetExecutorInfo)
@@ -576,12 +663,28 @@ TEST_F(SlaveTest, GetExecutorInfo)
 
   task.mutable_command()->MergeFrom(command);
 
+  DiscoveryInfo* info = task.mutable_discovery();
+  info->set_visibility(DiscoveryInfo::EXTERNAL);
+  info->set_name("mytask");
+  info->set_environment("mytest");
+  info->set_location("mylocation");
+  info->set_version("v0.1.1");
+
+  Labels* labels = task.mutable_labels();
+  labels->add_labels()->CopyFrom(createLabel("label1", "key1"));
+  labels->add_labels()->CopyFrom(createLabel("label2", "key2"));
+
   const ExecutorInfo& executor = slave.getExecutorInfo(frameworkInfo, task);
 
   // Now assert that it actually is running mesos-executor without any
   // bleedover from the command we intend on running.
   EXPECT_TRUE(executor.command().shell());
   EXPECT_EQ(0, executor.command().arguments_size());
+  ASSERT_TRUE(executor.has_labels());
+  EXPECT_EQ(2, executor.labels().labels_size());
+  ASSERT_TRUE(executor.has_discovery());
+  ASSERT_TRUE(executor.discovery().has_name());
+  EXPECT_EQ("mytask", executor.discovery().name());
   EXPECT_NE(string::npos, executor.command().value().find("mesos-executor"));
 }
 
@@ -618,7 +721,7 @@ TEST_F(SlaveTest, GetExecutorInfoForTaskWithContainer)
   container->set_type(ContainerInfo::MESOS);
 
   NetworkInfo *network = container->add_network_infos();
-  network->set_ip_address("4.3.2.1");
+  network->add_ip_addresses()->set_ip_address("4.3.2.1");
   network->add_groups("public");
 
   FrameworkInfo frameworkInfo;
@@ -632,7 +735,13 @@ TEST_F(SlaveTest, GetExecutorInfoForTaskWithContainer)
   // must be included in Executor.container (copied from TaskInfo.container).
   EXPECT_TRUE(executor.has_container());
 
-  EXPECT_EQ("4.3.2.1", executor.container().network_infos(0).ip_address());
+  EXPECT_EQ(1, executor.container().network_infos(0).ip_addresses_size());
+
+  NetworkInfo::IPAddress ipAddress =
+    executor.container().network_infos(0).ip_addresses(0);
+
+  EXPECT_EQ("4.3.2.1", ipAddress.ip_address());
+
   EXPECT_EQ(1, executor.container().network_infos(0).groups_size());
   EXPECT_EQ("public", executor.container().network_infos(0).groups(0));
 }
@@ -642,6 +751,8 @@ TEST_F(SlaveTest, GetExecutorInfoForTaskWithContainer)
 // executor even if it contains a ContainerInfo in the TaskInfo.
 // Prior to 0.26.0, this was only used to launch Docker containers, so
 // MesosContainerizer would fail the launch.
+//
+// TODO(jieyu): Move this test to the mesos containerizer tests.
 TEST_F(SlaveTest, LaunchTaskInfoWithContainerInfo)
 {
   Try<Owned<cluster::Master>> master = StartMaster();
@@ -686,7 +797,7 @@ TEST_F(SlaveTest, LaunchTaskInfoWithContainerInfo)
   container->set_type(ContainerInfo::MESOS);
 
   NetworkInfo *network = container->add_network_infos();
-  network->set_ip_address("4.3.2.1");
+  network->add_ip_addresses()->set_ip_address("4.3.2.1");
   network->add_groups("public");
 
   FrameworkInfo frameworkInfo;
@@ -694,13 +805,16 @@ TEST_F(SlaveTest, LaunchTaskInfoWithContainerInfo)
       "20141010-221431-251662764-60288-12345-0000");
   const ExecutorInfo& executor = slave.getExecutorInfo(frameworkInfo, task);
 
+  Try<string> sandbox = environment->mkdtemp();
+  ASSERT_SOME(sandbox);
+
   SlaveID slaveID;
   slaveID.set_value(UUID::random().toString());
   Future<bool> launch = containerizer->launch(
       containerId,
       task,
       executor,
-      "/tmp",
+      sandbox.get(),
       "test",
       slaveID,
       slave.self(),
@@ -816,7 +930,7 @@ TEST_F(SlaveTest, DISABLED_ROOT_RunTaskWithCommandInfoWithUser)
   // TODO(nnielsen): Introduce STOUT abstraction for user verification
   // instead of flat getpwnam call.
   const string testUser = "nobody";
-  if (::getpwnam(testUser.c_str()) == NULL) {
+  if (::getpwnam(testUser.c_str()) == nullptr) {
     LOG(WARNING) << "Cannot run ROOT_RunTaskWithCommandInfoWithUser test:"
                  << " user '" << testUser << "' is not present";
     return;
@@ -1106,6 +1220,10 @@ TEST_F(SlaveTest, MetricsInMetricsEndpoint)
   EXPECT_EQ(1u, snapshot.values.count("slave/cpus_used"));
   EXPECT_EQ(1u, snapshot.values.count("slave/cpus_percent"));
 
+  EXPECT_EQ(1u, snapshot.values.count("slave/gpus_total"));
+  EXPECT_EQ(1u, snapshot.values.count("slave/gpus_used"));
+  EXPECT_EQ(1u, snapshot.values.count("slave/gpus_percent"));
+
   EXPECT_EQ(1u, snapshot.values.count("slave/mem_total"));
   EXPECT_EQ(1u, snapshot.values.count("slave/mem_used"));
   EXPECT_EQ(1u, snapshot.values.count("slave/mem_percent"));
@@ -1192,7 +1310,7 @@ TEST_F(SlaveTest, StateEndpoint)
   slave::Flags flags = this->CreateSlaveFlags();
 
   flags.hostname = "localhost";
-  flags.resources = "cpus:4;mem:2048;disk:512;ports:[33000-34000]";
+  flags.resources = "cpus:4;gpus:0;mem:2048;disk:512;ports:[33000-34000]";
   flags.attributes = "rack:abc;host:myhost";
 
   MockExecutor exec(DEFAULT_EXECUTOR_ID);
@@ -1213,7 +1331,11 @@ TEST_F(SlaveTest, StateEndpoint)
   AWAIT_READY(__recover);
   Clock::settle();
 
-  Future<Response> response = process::http::get(slave.get()->pid, "state");
+  Future<Response> response = process::http::get(
+      slave.get()->pid,
+      "state",
+      None(),
+      createBasicAuthHeaders(DEFAULT_CREDENTIAL));
 
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
   AWAIT_EXPECT_RESPONSE_HEADER_EQ(APPLICATION_JSON, "Content-Type", response);
@@ -1322,9 +1444,13 @@ TEST_F(SlaveTest, StateEndpoint)
   AWAIT_READY(status);
   EXPECT_EQ(TASK_RUNNING, status.get().state());
 
-  response = http::get(slave.get()->pid, "state");
+  response = process::http::get(
+      slave.get()->pid,
+      "state",
+      None(),
+      createBasicAuthHeaders(DEFAULT_CREDENTIAL));
 
-  AWAIT_EXPECT_RESPONSE_STATUS_EQ(http::OK().status, response);
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
   AWAIT_EXPECT_RESPONSE_HEADER_EQ(APPLICATION_JSON, "Content-Type", response);
 
   parse = JSON::parse<JSON::Object>(response.get().body);
@@ -1442,12 +1568,486 @@ TEST_F(SlaveTest, StateEndpointUnavailableDuringRecovery)
   // Ensure slave has setup the route for "/state".
   AWAIT_READY(_recover);
 
-  Future<Response> response = process::http::get(slave.get()->pid, "state");
+  Future<Response> response = process::http::get(
+      slave.get()->pid,
+      "state",
+      None(),
+      createBasicAuthHeaders(DEFAULT_CREDENTIAL));
 
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(ServiceUnavailable().status, response);
 
   driver.stop();
   driver.join();
+}
+
+
+// Tests that a client will receive an `Unauthorized` response when agent HTTP
+// authentication is enabled and requests for the `/state` and `/flags`
+// endpoints include invalid credentials or no credentials at all.
+TEST_F(SlaveTest, HTTPEndpointsBadAuthentication)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  // A credential that will not be accepted by the agent.
+  Credential badCredential;
+  badCredential.set_principal("bad-principal");
+  badCredential.set_secret("bad-secret");
+
+  // Capture the start time deterministically.
+  Clock::pause();
+
+  Future<Nothing> recover = FUTURE_DISPATCH(_, &Slave::__recover);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  // HTTP authentication is enabled by default in `StartSlave`.
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get());
+  ASSERT_SOME(slave);
+
+  // Ensure slave has finished recovery.
+  AWAIT_READY(recover);
+  Clock::settle();
+
+  // Requests containing invalid credentials.
+  {
+    Future<Response> response = process::http::get(
+        slave.get()->pid,
+        "state",
+        None(),
+        createBasicAuthHeaders(badCredential));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(Unauthorized({}).status, response);
+
+    response = process::http::get(
+        slave.get()->pid,
+        "flags",
+        None(),
+        createBasicAuthHeaders(badCredential));
+
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(Unauthorized({}).status, response);
+  }
+
+  // Requests containing no authentication headers.
+  {
+    Future<Response> response = process::http::get(slave.get()->pid, "state");
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(Unauthorized({}).status, response);
+
+    response = process::http::get(slave.get()->pid, "flags");
+    AWAIT_EXPECT_RESPONSE_STATUS_EQ(Unauthorized({}).status, response);
+  }
+}
+
+
+// This test verifies correct handling of statistics endpoint when
+// there is no exeuctor running.
+TEST_F(SlaveTest, StatisticsEndpointNoExecutor)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get());
+  ASSERT_SOME(slave);
+
+  Future<Response> response = process::http::get(
+      slave.get()->pid,
+      "/monitor/statistics",
+      None(),
+      createBasicAuthHeaders(DEFAULT_CREDENTIAL));
+
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
+  AWAIT_EXPECT_RESPONSE_HEADER_EQ(APPLICATION_JSON, "Content-Type", response);
+  AWAIT_EXPECT_RESPONSE_BODY_EQ("[]", response);
+}
+
+
+// This test verifies the correct handling of the statistics
+// endpoint when statistics is missing in ResourceUsage.
+TEST_F(SlaveTest, StatisticsEndpointMissingStatistics)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  MockExecutor exec(DEFAULT_EXECUTOR_ID);
+  TestContainerizer containerizer(&exec);
+  StandaloneMasterDetector detector(master.get()->pid);
+
+  MockSlave slave(CreateSlaveFlags(), &detector, &containerizer);
+  spawn(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(_, _, _));
+  EXPECT_CALL(exec, registered(_, _, _, _));
+
+  Future<vector<Offer>> offers;
+
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  EXPECT_NE(0u, offers.get().size());
+
+  const Offer& offer = offers.get()[0];
+
+  TaskInfo task = createTask(
+      offer.slave_id(),
+      Resources::parse("cpus:0.1;mem:32").get(),
+      "sleep 1000",
+      exec.id);
+
+  EXPECT_CALL(exec, launchTask(_, _))
+    .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING));
+
+  Future<TaskStatus> status;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&status));
+
+  driver.launchTasks(offer.id(), {task});
+
+  AWAIT_READY(status);
+  EXPECT_EQ(TASK_RUNNING, status.get().state());
+
+  // Set up the containerizer so the next usage() will fail.
+  EXPECT_CALL(containerizer, usage(_))
+    .WillOnce(Return(Failure("Injected failure")));
+
+  Future<Response> response = process::http::get(
+      slave.self(),
+      "monitor/statistics",
+      None(),
+      createBasicAuthHeaders(DEFAULT_CREDENTIAL));
+
+  AWAIT_READY(response);
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
+  AWAIT_EXPECT_RESPONSE_HEADER_EQ(APPLICATION_JSON, "Content-Type", response);
+  AWAIT_EXPECT_RESPONSE_BODY_EQ("[]", response);
+
+  EXPECT_CALL(exec, shutdown(_))
+    .Times(AtMost(1));
+
+  driver.stop();
+  driver.join();
+
+  terminate(slave);
+  wait(slave);
+}
+
+
+// This test verifies the correct response of /monitor/statistics endpoint
+// when ResourceUsage collection fails.
+TEST_F(SlaveTest, StatisticsEndpointGetResourceUsageFailed)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  MockExecutor exec(DEFAULT_EXECUTOR_ID);
+  TestContainerizer containerizer(&exec);
+  StandaloneMasterDetector detector(master.get()->pid);
+
+  MockSlave slave(CreateSlaveFlags(), &detector, &containerizer);
+
+  EXPECT_CALL(slave, usage())
+    .WillOnce(Return(Failure("Resource Collection Failure")));
+
+  spawn(slave);
+
+  Future<Response> response = process::http::get(
+      slave.self(),
+      "monitor/statistics",
+      None(),
+      createBasicAuthHeaders(DEFAULT_CREDENTIAL));
+
+  AWAIT_READY(response);
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(
+      ServiceUnavailable().status, response);
+
+  terminate(slave);
+  wait(slave);
+}
+
+
+// This is an end-to-end test that verifies that the slave returns the
+// correct ResourceUsage based on the currently running executors, and
+// the values returned by the /monitor/statistics endpoint are as expected.
+TEST_F(SlaveTest, StatisticsEndpointRunningExecutor)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get());
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(&driver, _, _));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return());        // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  EXPECT_FALSE(offers.get().empty());
+
+  const Offer& offer = offers.get()[0];
+
+  // Launch a task and wait until it is in RUNNING status.
+  TaskInfo task = createTask(
+      offer.slave_id(),
+      Resources::parse("cpus:1;mem:32").get(),
+      "sleep 1000");
+
+  Future<TaskStatus> status;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&status));
+
+  driver.launchTasks(offer.id(), {task});
+
+  AWAIT_READY(status);
+  EXPECT_EQ(task.task_id(), status.get().task_id());
+  EXPECT_EQ(TASK_RUNNING, status.get().state());
+
+  // Hit the statistics endpoint and expect the response contains the
+  // resource statistics for the running container.
+  Future<Response> response = process::http::get(
+      slave.get()->pid,
+      "monitor/statistics",
+      None(),
+      createBasicAuthHeaders(DEFAULT_CREDENTIAL));
+
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
+  AWAIT_EXPECT_RESPONSE_HEADER_EQ(APPLICATION_JSON, "Content-Type", response);
+
+  // Verify that the statistics in the response contains the proper
+  // resource limits for the container.
+  Try<JSON::Value> value = JSON::parse(response.get().body);
+  ASSERT_SOME(value);
+
+  Try<JSON::Value> expected = JSON::parse(strings::format(
+      "[{"
+          "\"statistics\":{"
+              "\"cpus_limit\":%g,"
+              "\"mem_limit_bytes\":%lu"
+          "}"
+      "}]",
+      1 + slave::DEFAULT_EXECUTOR_CPUS,
+      (Megabytes(32) + slave::DEFAULT_EXECUTOR_MEM).bytes()).get());
+
+  ASSERT_SOME(expected);
+  EXPECT_TRUE(value.get().contains(expected.get()));
+
+  driver.stop();
+  driver.join();
+}
+
+
+// This test confirms that an agent's statistics endpoint is
+// authenticated. We rely on the agent implicitly having HTTP
+// authentication enabled.
+TEST_F(SlaveTest, StatisticsEndpointAuthentication)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  Try<Owned<cluster::Slave>> agent = StartSlave(detector.get());
+  ASSERT_SOME(agent);
+
+  const string statisticsEndpoints[] =
+    {"monitor/statistics", "monitor/statistics.json"};
+
+  foreach (const string& statisticsEndpoint, statisticsEndpoints) {
+    // Unauthenticated requests are rejected.
+    {
+      Future<Response> response = process::http::get(
+          agent.get()->pid,
+          statisticsEndpoint);
+
+      AWAIT_EXPECT_RESPONSE_STATUS_EQ(Unauthorized({}).status, response)
+          << response.get().body;
+    }
+
+    // Incorrectly authenticated requests are rejected.
+    {
+      Credential badCredential;
+      badCredential.set_principal("badPrincipal");
+      badCredential.set_secret("badSecret");
+
+      Future<Response> response = process::http::get(
+          agent.get()->pid,
+          statisticsEndpoint,
+          None(),
+          createBasicAuthHeaders(badCredential));
+
+      AWAIT_EXPECT_RESPONSE_STATUS_EQ(Unauthorized({}).status, response)
+          << response.get().body;
+    }
+
+    // Correctly authenticated requests succeed.
+    {
+      Future<Response> response = process::http::get(
+          agent.get()->pid,
+          statisticsEndpoint,
+          None(),
+          createBasicAuthHeaders(DEFAULT_CREDENTIAL));
+
+      AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response)
+          << response.get().body;
+    }
+  }
+}
+
+
+// This test verifies correct handling of containers endpoint when
+// there is no exeuctor running.
+TEST_F(SlaveTest, ContainersEndpointNoExecutor)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get());
+  ASSERT_SOME(slave);
+
+  Future<Response> response = process::http::get(
+      slave.get()->pid,
+      "containers",
+      None(),
+      createBasicAuthHeaders(DEFAULT_CREDENTIAL));
+
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
+  AWAIT_EXPECT_RESPONSE_HEADER_EQ(APPLICATION_JSON, "Content-Type", response);
+  AWAIT_EXPECT_RESPONSE_BODY_EQ("[]", response);
+}
+
+
+// This is an end-to-end test that verifies that the slave returns the
+// correct container status and resource statistics based on the
+// currently running executors, and the values returned by the
+// '/containers' endpoint are as expected.
+TEST_F(SlaveTest, ContainersEndpoint)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  MockExecutor exec(DEFAULT_EXECUTOR_ID);
+  TestContainerizer containerizer(&exec);
+  StandaloneMasterDetector detector(master.get()->pid);
+
+  MockSlave slave(CreateSlaveFlags(), &detector, &containerizer);
+  spawn(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(_, _, _));
+  EXPECT_CALL(exec, registered(_, _, _, _));
+
+  Future<vector<Offer>> offers;
+
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  EXPECT_NE(0u, offers.get().size());
+
+  const Offer& offer = offers.get()[0];
+
+  TaskInfo task = createTask(
+      offer.slave_id(),
+      Resources::parse("cpus:0.1;mem:32").get(),
+      "sleep 1000",
+      exec.id);
+
+  EXPECT_CALL(exec, launchTask(_, _))
+    .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING));
+
+  Future<TaskStatus> status;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&status));
+
+  driver.launchTasks(offer.id(), {task});
+
+  AWAIT_READY(status);
+  EXPECT_EQ(TASK_RUNNING, status.get().state());
+
+  ResourceStatistics statistics;
+  statistics.set_mem_limit_bytes(2048);
+
+  EXPECT_CALL(containerizer, usage(_))
+    .WillOnce(Return(statistics));
+
+  ContainerStatus containerStatus;
+
+  CgroupInfo* cgroupInfo = containerStatus.mutable_cgroup_info();
+  CgroupInfo::NetCls* netCls = cgroupInfo->mutable_net_cls();
+  netCls->set_classid(42);
+
+  NetworkInfo* networkInfo = containerStatus.add_network_infos();
+  NetworkInfo::IPAddress* ipAddr = networkInfo->add_ip_addresses();
+  ipAddr->set_ip_address("192.168.1.20");
+
+  EXPECT_CALL(containerizer, status(_))
+    .WillOnce(Return(containerStatus));
+
+  Future<Response> response = process::http::get(
+      slave.self(),
+      "containers",
+      None(),
+      createBasicAuthHeaders(DEFAULT_CREDENTIAL));
+
+  AWAIT_READY(response);
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
+  AWAIT_EXPECT_RESPONSE_HEADER_EQ(APPLICATION_JSON, "Content-Type", response);
+
+  Try<JSON::Value> value = JSON::parse(response.get().body);
+  ASSERT_SOME(value);
+
+  Try<JSON::Value> expected = JSON::parse(
+      "[{"
+          "\"executor_id\":\"default\","
+          "\"executor_name\":\"\","
+          "\"source\":\"\","
+          "\"statistics\":{"
+              "\"mem_limit_bytes\":2048"
+          "},"
+          "\"status\":{"
+              "\"cgroup_info\":{\"net_cls\":{\"classid\":42}},"
+              "\"network_infos\":[{"
+                  "\"ip_addresses\":[{\"ip_address\":\"192.168.1.20\"}]"
+              "}]"
+          "}"
+      "}]");
+
+  ASSERT_SOME(expected);
+  EXPECT_TRUE(value.get().contains(expected.get()));
+
+  EXPECT_CALL(exec, shutdown(_))
+    .Times(AtMost(1));
+
+  driver.stop();
+  driver.join();
+
+  terminate(slave);
+  wait(slave);
 }
 
 
@@ -1782,10 +2382,10 @@ TEST_F(SlaveTest, PingTimeoutNoPings)
 {
   // Set shorter ping timeout values.
   master::Flags masterFlags = CreateMasterFlags();
-  masterFlags.slave_ping_timeout = Seconds(5);
-  masterFlags.max_slave_ping_timeouts = 2u;
+  masterFlags.agent_ping_timeout = Seconds(5);
+  masterFlags.max_agent_ping_timeouts = 2u;
   Duration totalTimeout =
-    masterFlags.slave_ping_timeout * masterFlags.max_slave_ping_timeouts;
+    masterFlags.agent_ping_timeout * masterFlags.max_agent_ping_timeouts;
 
   // Start a master.
   Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
@@ -1853,7 +2453,7 @@ TEST_F(SlaveTest, PingTimeoutSomePings)
   Future<Message> ping = FUTURE_MESSAGE(
       Eq(PingSlaveMessage().GetTypeName()), _, _);
 
-  Clock::advance(masterFlags.slave_ping_timeout);
+  Clock::advance(masterFlags.agent_ping_timeout);
 
   AWAIT_READY(ping);
 
@@ -1921,12 +2521,12 @@ TEST_F(SlaveTest, RateLimitSlaveShutdown)
   while (true) {
     AWAIT_READY(ping);
     pings++;
-    if (pings == masterFlags.max_slave_ping_timeouts) {
-      Clock::advance(masterFlags.slave_ping_timeout);
+    if (pings == masterFlags.max_agent_ping_timeouts) {
+      Clock::advance(masterFlags.agent_ping_timeout);
       break;
     }
     ping = FUTURE_MESSAGE(Eq(PingSlaveMessage().GetTypeName()), _, _);
-    Clock::advance(masterFlags.slave_ping_timeout);
+    Clock::advance(masterFlags.agent_ping_timeout);
   }
 
   // The master should attempt to acquire a permit.
@@ -1991,12 +2591,12 @@ TEST_F(SlaveTest, CancelSlaveShutdown)
   while (true) {
     AWAIT_READY(ping);
     pings++;
-    if (pings == masterFlags.max_slave_ping_timeouts) {
-      Clock::advance(masterFlags.slave_ping_timeout);
+    if (pings == masterFlags.max_agent_ping_timeouts) {
+      Clock::advance(masterFlags.agent_ping_timeout);
       break;
     }
     ping = FUTURE_MESSAGE(Eq(PingSlaveMessage().GetTypeName()), _, _);
-    Clock::advance(masterFlags.slave_ping_timeout);
+    Clock::advance(masterFlags.agent_ping_timeout);
   }
 
   // The master should attempt to acquire a permit.
@@ -2006,10 +2606,10 @@ TEST_F(SlaveTest, CancelSlaveShutdown)
   Clock::settle();
 
   // Reset the filters to allow pongs from the slave.
-  filter(NULL);
+  filter(nullptr);
 
   // Advance clock enough to do a ping pong.
-  Clock::advance(masterFlags.slave_ping_timeout);
+  Clock::advance(masterFlags.agent_ping_timeout);
   Clock::settle();
 
   // The master should have tried to cancel the removal.
@@ -2108,7 +2708,7 @@ TEST_F(SlaveTest, KillTaskBetweenRunTaskParts)
                     FutureSatisfy(&removeFramework)));
 
   Future<Nothing> killTask;
-  EXPECT_CALL(slave, killTask(_, _, _))
+  EXPECT_CALL(slave, killTask(_, _))
     .WillOnce(DoAll(Invoke(&slave, &MockSlave::unmocked_killTask),
                     FutureSatisfy(&killTask)));
 
@@ -2127,6 +2727,93 @@ TEST_F(SlaveTest, KillTaskBetweenRunTaskParts)
 
   terminate(slave);
   wait(slave);
+}
+
+
+// This test ensures that if a `killTask()` for an executor is received by the
+// agent before the executor registers, the executor is properly cleaned up.
+TEST_F(SlaveTest, KillTaskUnregisteredExecutor)
+{
+  // Start a master.
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  MockExecutor exec(DEFAULT_EXECUTOR_ID);
+  TestContainerizer containerizer(&exec);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  // Start a slave.
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), &containerizer);
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(_, _, _));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  EXPECT_NE(0u, offers.get().size());
+
+  TaskInfo task;
+  task.set_name("");
+  task.mutable_task_id()->set_value("1");
+  task.mutable_slave_id()->MergeFrom(offers.get()[0].slave_id());
+  task.mutable_resources()->MergeFrom(offers.get()[0].resources());
+  task.mutable_executor()->MergeFrom(DEFAULT_EXECUTOR_INFO);
+
+  EXPECT_CALL(exec, registered(_, _, _, _))
+    .Times(0);
+
+  EXPECT_CALL(exec, launchTask(_, _))
+    .Times(0);
+
+  EXPECT_CALL(exec, shutdown(_));
+
+  // Hold on to the executor registration message so that the task stays
+  // queued on the agent.
+  Future<Message> registerExecutorMessage =
+    DROP_MESSAGE(Eq(RegisterExecutorMessage().GetTypeName()), _, _);
+
+  driver.launchTasks(offers.get()[0].id(), {task});
+
+  AWAIT_READY(registerExecutorMessage);
+
+  Future<TaskStatus> status;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&status));
+
+  Future<Nothing> executorLost;
+  EXPECT_CALL(sched, executorLost(&driver, DEFAULT_EXECUTOR_ID, _, _))
+    .WillOnce(FutureSatisfy(&executorLost));
+
+  // Kill the task enqueued on the agent.
+  driver.killTask(task.task_id());
+
+  AWAIT_READY(status);
+  EXPECT_EQ(TASK_KILLED, status->state());
+  EXPECT_EQ(TaskStatus::REASON_EXECUTOR_UNREGISTERED, status->reason());
+
+  // Now let the executor register by spoofing the message.
+  RegisterExecutorMessage registerExecutor;
+  registerExecutor.ParseFromString(registerExecutorMessage->body);
+
+  process::post(registerExecutorMessage->from,
+                slave.get()->pid,
+                registerExecutor);
+
+  AWAIT_READY(executorLost);
+
+  driver.stop();
+  driver.join();
 }
 
 
@@ -2375,7 +3062,11 @@ TEST_F(SlaveTest, DiscoveryInfoAndPorts)
   AWAIT_READY(launchTask);
 
   // Verify label key and value in slave state endpoint.
-  Future<Response> response = process::http::get(slave.get()->pid, "state");
+  Future<Response> response = process::http::get(
+      slave.get()->pid,
+      "state",
+      None(),
+      createBasicAuthHeaders(DEFAULT_CREDENTIAL));
 
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
   AWAIT_EXPECT_RESPONSE_HEADER_EQ(APPLICATION_JSON, "Content-Type", response);
@@ -2403,6 +3094,100 @@ TEST_F(SlaveTest, DiscoveryInfoAndPorts)
   // that were set.
   EXPECT_EQ(JSON::Object(JSON::protobuf(*port1)), portResult1.get());
   EXPECT_EQ(JSON::Object(JSON::protobuf(*port2)), portResult2.get());
+
+  EXPECT_CALL(exec, shutdown(_))
+    .Times(AtMost(1));
+
+  driver.stop();
+  driver.join();
+}
+
+
+// This test verifies that executor labels are
+// exposed in the slave's state endpoint.
+TEST_F(SlaveTest, ExecutorLabels)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  MockExecutor exec(DEFAULT_EXECUTOR_ID);
+  TestContainerizer containerizer(&exec);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> slave = StartSlave(detector.get(), &containerizer);
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .Times(1);
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  EXPECT_NE(0u, offers->size());
+
+  TaskInfo task;
+  task.set_name("");
+  task.mutable_task_id()->set_value("1");
+  task.mutable_slave_id()->MergeFrom(offers.get()[0].slave_id());
+  task.mutable_resources()->MergeFrom(offers.get()[0].resources());
+  task.mutable_executor()->MergeFrom(DEFAULT_EXECUTOR_INFO);
+
+  // Add three labels to the executor (two of which share the same key).
+  Labels* labels = task.mutable_executor()->mutable_labels();
+
+  labels->add_labels()->CopyFrom(createLabel("key1", "value1"));
+  labels->add_labels()->CopyFrom(createLabel("key2", "value2"));
+  labels->add_labels()->CopyFrom(createLabel("key1", "value3"));
+
+  EXPECT_CALL(exec, registered(_, _, _, _))
+    .Times(1);
+
+  EXPECT_CALL(exec, launchTask(_, _))
+    .WillOnce(SendStatusUpdateFromTask(TASK_RUNNING));
+
+  Future<TaskStatus> status;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&status));
+
+  driver.launchTasks(offers.get()[0].id(), {task});
+
+  AWAIT_READY(status);
+  EXPECT_EQ(TASK_RUNNING, status->state());
+
+  // Verify label key and value in slave state endpoint.
+  Future<Response> response = process::http::get(
+      slave.get()->pid,
+      "state",
+      None(),
+      createBasicAuthHeaders(DEFAULT_CREDENTIAL));
+
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
+  AWAIT_EXPECT_RESPONSE_HEADER_EQ(APPLICATION_JSON, "Content-Type", response);
+
+  Try<JSON::Object> parse = JSON::parse<JSON::Object>(response->body);
+  ASSERT_SOME(parse);
+
+  Result<JSON::Array> labels_ = parse->find<JSON::Array>(
+      "frameworks[0].executors[0].labels");
+  ASSERT_SOME(labels_);
+
+  // Verify the contents of labels.
+  EXPECT_EQ(3u, labels_->values.size());
+  EXPECT_EQ(JSON::Value(JSON::protobuf(createLabel("key1", "value1"))),
+            labels_->values[0]);
+  EXPECT_EQ(JSON::Value(JSON::protobuf(createLabel("key2", "value2"))),
+            labels_->values[1]);
+  EXPECT_EQ(JSON::Value(JSON::protobuf(createLabel("key1", "value3"))),
+            labels_->values[2]);
 
   EXPECT_CALL(exec, shutdown(_))
     .Times(AtMost(1));
@@ -2481,7 +3266,11 @@ TEST_F(SlaveTest, TaskLabels)
   AWAIT_READY(update);
 
   // Verify label key and value in slave state endpoint.
-  Future<Response> response = process::http::get(slave.get()->pid, "state");
+  Future<Response> response = process::http::get(
+      slave.get()->pid,
+      "state",
+      None(),
+      createBasicAuthHeaders(DEFAULT_CREDENTIAL));
 
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
   AWAIT_EXPECT_RESPONSE_HEADER_EQ(APPLICATION_JSON, "Content-Type", response);
@@ -2580,7 +3369,11 @@ TEST_F(SlaveTest, TaskStatusLabels)
   AWAIT_READY(status);
 
   // Verify label key and value in master state endpoint.
-  Future<Response> response = process::http::get(slave.get()->pid, "state");
+  Future<Response> response = process::http::get(
+      slave.get()->pid,
+      "state",
+      None(),
+      createBasicAuthHeaders(DEFAULT_CREDENTIAL));
 
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
   AWAIT_EXPECT_RESPONSE_HEADER_EQ(APPLICATION_JSON, "Content-Type", response);
@@ -2667,14 +3460,20 @@ TEST_F(SlaveTest, TaskStatusContainerStatus)
   // TaskStatus.container_status.network_infos[0].ip_address.
   EXPECT_TRUE(status.get().has_container_status());
   EXPECT_EQ(1, status.get().container_status().network_infos().size());
-  EXPECT_TRUE(
-      status.get().container_status().network_infos(0).has_ip_address());
-  EXPECT_EQ(
-      slaveIPAddress,
-      status.get().container_status().network_infos(0).ip_address());
+  EXPECT_EQ(1, status.get().container_status().network_infos(0).ip_addresses().size()); // NOLINT(whitespace/line_length)
+
+  NetworkInfo::IPAddress ipAddress =
+    status.get().container_status().network_infos(0).ip_addresses(0);
+
+  ASSERT_TRUE(ipAddress.has_ip_address());
+  EXPECT_EQ(slaveIPAddress, ipAddress.ip_address());
 
   // Now do the same validation with state endpoint.
-  Future<Response> response = process::http::get(slave.get()->pid, "state");
+  Future<Response> response = process::http::get(
+      slave.get()->pid,
+      "state",
+      None(),
+      createBasicAuthHeaders(DEFAULT_CREDENTIAL));
 
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(OK().status, response);
   AWAIT_EXPECT_RESPONSE_HEADER_EQ(APPLICATION_JSON, "Content-Type", response);
@@ -2688,7 +3487,8 @@ TEST_F(SlaveTest, TaskStatusContainerStatus)
       slaveIPAddress,
       parse.get().find<JSON::String>(
           "frameworks[0].executors[0].tasks[0].statuses[0]"
-          ".container_status.network_infos[0].ip_address"));
+          ".container_status.network_infos[0]"
+          ".ip_addresses[0].ip_address"));
 
   EXPECT_CALL(exec, shutdown(_))
     .Times(AtMost(1));
@@ -2781,7 +3581,7 @@ TEST_F(SlaveTest, TotalSlaveResourcesIncludedInUsage)
   StandaloneMasterDetector detector(master.get()->pid);
 
   slave::Flags flags = CreateSlaveFlags();
-  flags.resources = "cpus:2;mem:1024;disk:1024;ports:[31000-32000]";
+  flags.resources = "cpus:2;gpus:0;mem:1024;disk:1024;ports:[31000-32000]";
 
   MockSlave slave(flags, &detector, &containerizer);
   spawn(slave);
@@ -3169,6 +3969,145 @@ TEST_F(SlaveTest, HTTPSchedulerSlaveRestart)
   AWAIT_READY(executorToFrameworkMessage1);
   AWAIT_READY(executorToFrameworkMessage2);
   AWAIT_READY(frameworkMessage);
+
+  driver.stop();
+  driver.join();
+}
+
+
+// Ensures that if `ExecutorInfo.shutdown_grace_period` is set, it
+// overrides the default value from the agent flag, is observed by
+// executor, and is enforced by the agent.
+TEST_F(SlaveTest, ExecutorShutdownGracePeriod)
+{
+  master::Flags masterFlags = CreateMasterFlags();
+  Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
+  ASSERT_SOME(master);
+
+  MockExecutor exec(DEFAULT_EXECUTOR_ID);
+
+  TestContainerizer containerizer(&exec);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  slave::Flags agentFlags = CreateSlaveFlags();
+  Try<Owned<cluster::Slave>> slave =
+    StartSlave(detector.get(), &containerizer, agentFlags);
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  // We need framework's ID to shutdown the executor later on.
+  Future<FrameworkID> frameworkId;
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .WillOnce(FutureArg<1>(&frameworkId));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers));
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  EXPECT_NE(0u, offers->size());
+  Offer offer = offers.get()[0];
+
+  // Customize executor shutdown grace period to be larger than the
+  // default agent flag value, so that we can check it is respected.
+  Duration customGracePeriod = agentFlags.executor_shutdown_grace_period * 2;
+
+  ExecutorInfo executorInfo(DEFAULT_EXECUTOR_INFO);
+  executorInfo.mutable_shutdown_grace_period()->set_nanoseconds(
+      customGracePeriod.ns());
+
+  TaskInfo task;
+  task.set_name("");
+  task.mutable_task_id()->set_value("2");
+  task.mutable_slave_id()->MergeFrom(offer.slave_id());
+  task.mutable_resources()->MergeFrom(offer.resources());
+  task.mutable_executor()->MergeFrom(executorInfo);
+
+  Future<TaskStatus> statusRunning;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusRunning));
+
+  EXPECT_CALL(exec, registered(_, _, _, _))
+    .Times(1);
+
+  Future<TaskInfo> receivedTask;
+  EXPECT_CALL(exec, launchTask(_, _))
+    .WillOnce(DoAll(SendStatusUpdateFromTask(TASK_RUNNING),
+                    FutureArg<1>(&receivedTask)));
+
+  driver.launchTasks(offer.id(), {task});
+
+  AWAIT_READY(statusRunning);
+  EXPECT_EQ(TASK_RUNNING, statusRunning->state());
+  EXPECT_EQ(customGracePeriod.ns(),
+            receivedTask->executor().shutdown_grace_period().nanoseconds());
+
+  // If executor is asked to shutdown but fails to do so within the grace
+  // shutdown period, the shutdown is enforced by the agent. The agent
+  // adjusts its timeout according to `ExecutorInfo.shutdown_grace_period`.
+  //
+  // NOTE: Executors relying on the executor driver have a built-in suicide
+  // mechanism (`ShutdownProcess`), that kills the OS process where the
+  // executor is running after the grace period ends. This mechanism is
+  // disabled in tests, hence we do not observe crashes induced by this test.
+  // The test containerizer only accepts "local" executors and it considers
+  // them "terminated" only once destroy is called.
+
+  EXPECT_CALL(exec, shutdown(_))
+    .Times(AtMost(1))
+    .WillOnce(Return());
+
+  // Once the grace period ends, the agent forcibly shuts down the executor.
+  Future<Nothing> executorShutdownTimeout =
+    FUTURE_DISPATCH(slave.get()->pid, &Slave::shutdownExecutorTimeout);
+
+  Future<TaskStatus> statusFailed;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusFailed));
+
+  Future<ExecutorID> lostExecutorId;
+  EXPECT_CALL(sched, executorLost(&driver, DEFAULT_EXECUTOR_ID, _, _))
+    .WillOnce(FutureArg<1>(&lostExecutorId));
+
+  // Ask executor to shutdown. There is no support in the scheduler
+  // driver for shutting down executors, hence we have to spoof it.
+  AWAIT_READY(frameworkId);
+  ShutdownExecutorMessage shutdownMessage;
+  shutdownMessage.mutable_executor_id()->CopyFrom(DEFAULT_EXECUTOR_ID);
+  shutdownMessage.mutable_framework_id()->CopyFrom(frameworkId.get());
+  post(master.get()->pid, slave.get()->pid, shutdownMessage);
+
+  // Ensure the `ShutdownExecutorMessage` message is
+  // received by the agent before we start the timer.
+  Clock::pause();
+  Clock::settle();
+  Clock::advance(agentFlags.executor_shutdown_grace_period);
+  Clock::settle();
+
+  // The executor shutdown timeout should not have fired, since the
+  // `ExecutorInfo` contains a grace period larger than the agent flag.
+  EXPECT_TRUE(executorShutdownTimeout.isPending());
+
+  // Trigger the shutdown grace period from the `ExecutorInfo`
+  // (note that is is 2x the agent flag).
+  Clock::advance(agentFlags.executor_shutdown_grace_period);
+
+  AWAIT_READY(executorShutdownTimeout);
+
+  AWAIT_READY(statusFailed);
+  EXPECT_EQ(TASK_FAILED, statusFailed->state());
+  EXPECT_EQ(TaskStatus::REASON_EXECUTOR_TERMINATED,
+            statusFailed->reason());
+
+  AWAIT_EXPECT_EQ(DEFAULT_EXECUTOR_ID, lostExecutorId);
+
+  Clock::resume();
 
   driver.stop();
   driver.join();

@@ -100,23 +100,6 @@ Future<Option<ContainerLaunchInfo>> PosixFilesystemIsolatorProcess::prepare(
 }
 
 
-Future<Nothing> PosixFilesystemIsolatorProcess::isolate(
-    const ContainerID& containerId,
-    pid_t pid)
-{
-  // No-op.
-  return Nothing();
-}
-
-
-Future<ContainerLimitation> PosixFilesystemIsolatorProcess::watch(
-    const ContainerID& containerId)
-{
-  // No-op.
-  return Future<ContainerLimitation>();
-}
-
-
 Future<Nothing> PosixFilesystemIsolatorProcess::update(
     const ContainerID& containerId,
     const Resources& resources)
@@ -203,6 +186,11 @@ Future<Nothing> PosixFilesystemIsolatorProcess::update(
                      os::strerror(errno));
     }
 
+    // TODO(hausdorff): (MESOS-5461) Persistent volumes maintain the invariant
+    // that they are used by one task at a time. This is currently enforced by
+    // `os::chown`. Windows does not support `os::chown`, we will need to
+    // revisit this later.
+#ifndef __WINDOWS__
     LOG(INFO) << "Changing the ownership of the persistent volume at '"
               << original << "' with uid " << s.st_uid
               << " and gid " << s.st_gid;
@@ -214,7 +202,7 @@ Future<Nothing> PosixFilesystemIsolatorProcess::update(
           original + "' with uid " + stringify(s.st_uid) +
           " and gid " + stringify(s.st_gid) + ": " + chown.error());
     }
-
+#endif
     string link = path::join(info->directory, containerPath);
 
     if (os::exists(link)) {
@@ -264,14 +252,6 @@ Future<Nothing> PosixFilesystemIsolatorProcess::update(
   info->resources = resources;
 
   return Nothing();
-}
-
-
-Future<ResourceStatistics> PosixFilesystemIsolatorProcess::usage(
-    const ContainerID& containerId)
-{
-  // No-op, no usage gathered.
-  return ResourceStatistics();
 }
 
 

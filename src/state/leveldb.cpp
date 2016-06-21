@@ -23,6 +23,9 @@
 #include <set>
 #include <string>
 
+#include <mesos/state/leveldb.hpp>
+#include <mesos/state/storage.hpp>
+
 #include <process/dispatch.hpp>
 #include <process/future.hpp>
 #include <process/process.hpp>
@@ -36,19 +39,15 @@
 
 #include "logging/logging.hpp"
 
-#include "messages/state.hpp"
-
-#include "state/leveldb.hpp"
-#include "state/storage.hpp"
-
 using namespace process;
 
 // Note that we don't add 'using std::set' here because we need
 // 'std::' to disambiguate the 'set' member.
 using std::string;
 
+using mesos::internal::state::Entry;
+
 namespace mesos {
-namespace internal {
 namespace state {
 
 
@@ -61,14 +60,14 @@ public:
   virtual void initialize();
 
   // Storage implementation.
-  Future<Option<Entry> > get(const string& name);
+  Future<Option<Entry>> get(const string& name);
   Future<bool> set(const Entry& entry, const UUID& uuid);
   Future<bool> expunge(const Entry& entry);
-  Future<std::set<string> > names();
+  Future<std::set<string>> names();
 
 private:
   // Helpers for interacting with leveldb.
-  Try<Option<Entry> > read(const string& name);
+  Try<Option<Entry>> read(const string& name);
   Try<bool> write(const Entry& entry);
 
   const string path;
@@ -79,12 +78,12 @@ private:
 
 
 LevelDBStorageProcess::LevelDBStorageProcess(const string& _path)
-  : path(_path), db(NULL) {}
+  : path(_path), db(nullptr) {}
 
 
 LevelDBStorageProcess::~LevelDBStorageProcess()
 {
-  delete db; // NULL if open failed in LevelDBStorageProcess::initialize.
+  delete db; // nullptr if open failed in LevelDBStorageProcess::initialize.
 }
 
 
@@ -100,12 +99,12 @@ void LevelDBStorageProcess::initialize()
     error = status.ToString();
   } else {
     // TODO(benh): Conditionally compact to avoid long recovery times?
-    db->CompactRange(NULL, NULL);
+    db->CompactRange(nullptr, nullptr);
   }
 }
 
 
-Future<std::set<string> > LevelDBStorageProcess::names()
+Future<std::set<string>> LevelDBStorageProcess::names()
 {
   if (error.isSome()) {
     return Failure(error.get());
@@ -128,13 +127,13 @@ Future<std::set<string> > LevelDBStorageProcess::names()
 }
 
 
-Future<Option<Entry> > LevelDBStorageProcess::get(const string& name)
+Future<Option<Entry>> LevelDBStorageProcess::get(const string& name)
 {
   if (error.isSome()) {
     return Failure(error.get());
   }
 
-  Try<Option<Entry> > option = read(name);
+  Try<Option<Entry>> option = read(name);
 
   if (option.isError()) {
     return Failure(option.error());
@@ -153,14 +152,14 @@ Future<bool> LevelDBStorageProcess::set(const Entry& entry, const UUID& uuid)
   // We do a read first to make sure the version has not changed. This
   // could be optimized in the future, for now it will probably hit
   // the cache anyway.
-  Try<Option<Entry> > option = read(entry.name());
+  Try<Option<Entry>> option = read(entry.name());
 
   if (option.isError()) {
     return Failure(option.error());
   }
 
   if (option.get().isSome()) {
-    if (UUID::fromBytes(option.get().get().uuid()) != uuid) {
+    if (UUID::fromBytes(option.get().get().uuid()).get() != uuid) {
       return false;
     }
   }
@@ -188,7 +187,7 @@ Future<bool> LevelDBStorageProcess::expunge(const Entry& entry)
   // We do a read first to make sure the version has not changed. This
   // could be optimized in the future, for now it will probably hit
   // the cache anyway.
-  Try<Option<Entry> > option = read(entry.name());
+  Try<Option<Entry>> option = read(entry.name());
 
   if (option.isError()) {
     return Failure(option.error());
@@ -198,8 +197,8 @@ Future<bool> LevelDBStorageProcess::expunge(const Entry& entry)
     return false;
   }
 
-  if (UUID::fromBytes(option.get().get().uuid()) !=
-      UUID::fromBytes(entry.uuid())) {
+  if (UUID::fromBytes(option.get().get().uuid()).get() !=
+      UUID::fromBytes(entry.uuid()).get()) {
     return false;
   }
 
@@ -220,7 +219,7 @@ Future<bool> LevelDBStorageProcess::expunge(const Entry& entry)
 }
 
 
-Try<Option<Entry> > LevelDBStorageProcess::read(const string& name)
+Try<Option<Entry>> LevelDBStorageProcess::read(const string& name)
 {
   CHECK_NONE(error);
 
@@ -286,7 +285,7 @@ LevelDBStorage::~LevelDBStorage()
 }
 
 
-Future<Option<Entry> > LevelDBStorage::get(const string& name)
+Future<Option<Entry>> LevelDBStorage::get(const string& name)
 {
   return dispatch(process, &LevelDBStorageProcess::get, name);
 }
@@ -304,11 +303,10 @@ Future<bool> LevelDBStorage::expunge(const Entry& entry)
 }
 
 
-Future<std::set<string> > LevelDBStorage::names()
+Future<std::set<string>> LevelDBStorage::names()
 {
   return dispatch(process, &LevelDBStorageProcess::names);
 }
 
 } // namespace state {
-} // namespace internal {
 } // namespace mesos {

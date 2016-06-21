@@ -19,6 +19,10 @@
 #include <utility>
 #include <vector>
 
+#include <mesos/zookeeper/group.hpp>
+#include <mesos/zookeeper/watcher.hpp>
+#include <mesos/zookeeper/zookeeper.hpp>
+
 #include <process/delay.hpp>
 #include <process/dispatch.hpp>
 #include <process/id.hpp>
@@ -29,24 +33,20 @@
 #include <stout/error.hpp>
 #include <stout/none.hpp>
 #include <stout/numify.hpp>
-#include <stout/os.hpp>
 #include <stout/path.hpp>
 #include <stout/result.hpp>
 #include <stout/some.hpp>
 #include <stout/strings.hpp>
 #include <stout/utils.hpp>
 
-#include "logging/logging.hpp"
+#include <stout/os/constants.hpp>
 
-#include "zookeeper/group.hpp"
-#include "zookeeper/watcher.hpp"
-#include "zookeeper/zookeeper.hpp"
+#include "logging/logging.hpp"
 
 using namespace process;
 
 using process::wait; // Necessary on some OS's to disambiguate.
 
-using std::make_pair;
 using std::queue;
 using std::set;
 using std::string;
@@ -98,8 +98,8 @@ GroupProcess::GroupProcess(
     acl(_auth.isSome()
         ? EVERYONE_READ_CREATOR_ALL
         : ZOO_OPEN_ACL_UNSAFE),
-    watcher(NULL),
-    zk(NULL),
+    watcher(nullptr),
+    zk(nullptr),
     state(DISCONNECTED),
     retrying(false)
 {}
@@ -118,8 +118,8 @@ GroupProcess::GroupProcess(
     acl(url.authentication.isSome()
         ? EVERYONE_READ_CREATOR_ALL
         : ZOO_OPEN_ACL_UNSAFE),
-    watcher(NULL),
-    zk(NULL),
+    watcher(nullptr),
+    zk(nullptr),
     state(DISCONNECTED),
     retrying(false)
 {}
@@ -426,7 +426,7 @@ Try<bool> GroupProcess::create()
 
   LOG(INFO) << "Trying to create path '" << znode << "' in ZooKeeper";
 
-  int code = zk->create(znode, "", acl, 0, NULL, true);
+  int code = zk->create(znode, "", acl, 0, nullptr, true);
 
   // We fail all non-retryable return codes except ZNONODEEXISTS (
   // since that means the path we were trying to create exists). Note
@@ -655,7 +655,10 @@ Result<bool> GroupProcess::doCancel(const Group::Membership& membership)
 {
   CHECK_EQ(state, READY);
 
-  string path = path::join(znode, zkBasename(membership));
+  string path = path::join(
+      znode,
+      zkBasename(membership),
+      os::POSIX_PATH_SEPARATOR);
 
   LOG(INFO) << "Trying to remove '" << path << "' in ZooKeeper";
 
@@ -695,14 +698,17 @@ Result<Option<string>> GroupProcess::doData(
 {
   CHECK_EQ(state, READY);
 
-  string path = path::join(znode, zkBasename(membership));
+  string path = path::join(
+      znode,
+      zkBasename(membership),
+      os::POSIX_PATH_SEPARATOR);
 
   LOG(INFO) << "Trying to get '" << path << "' in ZooKeeper";
 
   // Get data associated with ephemeral node.
   string result;
 
-  int code = zk->get(path, false, &result, NULL);
+  int code = zk->get(path, false, &result, nullptr);
 
   if (code == ZNONODE) {
     return Option<string>::none();
@@ -980,8 +986,8 @@ void GroupProcess::abort(const string& message)
   // ephemeral ZNodes as necessary.
   delete CHECK_NOTNULL(zk);
   delete CHECK_NOTNULL(watcher);
-  zk = NULL;
-  watcher = NULL;
+  zk = nullptr;
+  watcher = nullptr;
 }
 
 

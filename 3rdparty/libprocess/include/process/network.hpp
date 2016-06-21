@@ -18,33 +18,13 @@
 #include <stout/net.hpp>
 #include <stout/try.hpp>
 
+#include <stout/os/socket.hpp>
+
+
 namespace process {
 namespace network {
 
-/**
- * Returns a socket file descriptor for the specified options.
- *
- * **NOTE:** on OS X, the returned socket will have the SO_NOSIGPIPE
- * option set.
- */
-inline Try<int> socket(int family, int type, int protocol)
-{
-  int s;
-  if ((s = ::socket(family, type, protocol)) == -1) {
-    return ErrnoError();
-  }
-
-#ifdef __APPLE__
-  // Disable SIGPIPE via setsockopt because OS X does not support
-  // the MSG_NOSIGNAL flag on send(2).
-  const int enable = 1;
-  if (setsockopt(s, SOL_SOCKET, SO_NOSIGPIPE, &enable, sizeof(int)) == -1) {
-    return ErrnoError();
-  }
-#endif // __APPLE__
-
-  return s;
-}
+using net::socket;
 
 
 // TODO(benh): Remove and defer to Socket::accept.
@@ -63,32 +43,30 @@ inline Try<int> accept(int s)
 
 
 // TODO(benh): Remove and defer to Socket::bind.
-inline Try<int> bind(int s, const Address& address)
+inline Try<Nothing> bind(int s, const Address& address)
 {
   struct sockaddr_storage storage =
     net::createSockaddrStorage(address.ip, address.port);
 
-  int error = ::bind(s, (struct sockaddr*) &storage, address.size());
-  if (error < 0) {
+  if (::bind(s, (struct sockaddr*) &storage, address.size()) < 0) {
     return ErrnoError("Failed to bind on " + stringify(address));
   }
 
-  return error;
+  return Nothing();
 }
 
 
 // TODO(benh): Remove and defer to Socket::connect.
-inline Try<int> connect(int s, const Address& address)
+inline Try<Nothing, SocketError> connect(int s, const Address& address)
 {
   struct sockaddr_storage storage =
     net::createSockaddrStorage(address.ip, address.port);
 
-  int error = ::connect(s, (struct sockaddr*) &storage, address.size());
-  if (error < 0) {
-    return ErrnoError("Failed to connect to " + stringify(address));
+  if (::connect(s, (struct sockaddr*) &storage, address.size()) < 0) {
+    return SocketError("Failed to connect to " + stringify(address));
   }
 
-  return error;
+  return Nothing();
 }
 
 

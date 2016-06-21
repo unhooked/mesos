@@ -19,6 +19,10 @@
 #include <vector>
 #include <utility>
 
+#include <mesos/authorizer/authorizer.hpp>
+
+#include <mesos/master/detector.hpp>
+
 #include <mesos/mesos.hpp>
 
 #include <mesos/module/anonymous.hpp>
@@ -26,6 +30,10 @@
 #include <mesos/slave/resource_estimator.hpp>
 
 #include <process/owned.hpp>
+
+#ifdef __WINDOWS__
+#include <process/windows/winsock.hpp>
+#endif // __WINDOWS__
 
 #include <stout/check.hpp>
 #include <stout/flags.hpp>
@@ -36,6 +44,7 @@
 #include <stout/try.hpp>
 
 #include "common/build.hpp"
+#include "common/http.hpp"
 
 #include "hook/manager.hpp"
 
@@ -44,8 +53,6 @@
 #endif // __linux__
 
 #include "logging/logging.hpp"
-
-#include "master/detector.hpp"
 
 #include "messages/flags.hpp"
 #include "messages/messages.hpp"
@@ -61,12 +68,17 @@
 using namespace mesos::internal;
 using namespace mesos::internal::slave;
 
+using mesos::master::detector::MasterDetector;
+
 using mesos::modules::Anonymous;
 using mesos::modules::ModuleManager;
+
+using mesos::master::detector::MasterDetector;
 
 using mesos::slave::QoSController;
 using mesos::slave::ResourceEstimator;
 
+using mesos::Authorizer;
 using mesos::SlaveInfo;
 
 using process::Owned;
@@ -82,14 +94,39 @@ using std::string;
 using std::vector;
 
 
-void version()
-{
-  cout << "mesos" << " " << MESOS_VERSION << endl;
-}
-
-
 int main(int argc, char** argv)
 {
+  // The order of initialization is as follows:
+  // * Windows socket stack.
+  // * Validate flags.
+  // * Log build information.
+  // * Libprocess
+  // * Logging
+  // * Version process
+  // * Firewall rules: should be initialized before initializing HTTP endpoints.
+  // * Modules: Load module libraries and manifests before they
+  //   can be instantiated.
+  // * Anonymous modules: Later components such as Allocators, and master
+  //   contender/detector might depend upon anonymous modules.
+  // * Hooks.
+  // * Systemd support (if it exists).
+  // * Fetcher and Containerizer.
+  // * Master detector.
+  // * Authorizer.
+  // * Garbage collector.
+  // * Status update manager.
+  // * Resource estimator.
+  // * QoS controller.
+  // * `Agent` process.
+  //
+  // TODO(avinash): Add more comments discussing the rationale behind for this
+  // particular component ordering.
+
+#ifdef __WINDOWS__
+  // Initialize the Windows socket stack.
+  process::Winsock winsock;
+#endif
+
   GOOGLE_PROTOBUF_VERIFY_VERSION;
 
   slave::Flags flags;
@@ -112,17 +149,17 @@ int main(int argc, char** argv)
   Option<string> advertise_ip;
   flags.add(&advertise_ip,
             "advertise_ip",
-            "IP address advertised to reach this Mesos slave.\n"
-            "The slave does not bind to this IP address.\n"
-            "However, this IP address may be used to access this slave.");
+            "IP address advertised to reach this Mesos agent.\n"
+            "The agent does not bind to this IP address.\n"
+            "However, this IP address may be used to access this agent.");
 
   Option<string> advertise_port;
   flags.add(&advertise_port,
             "advertise_port",
-            "Port advertised to reach this Mesos slave (along with\n"
-            "`advertise_ip`). The slave does not bind to this port.\n"
+            "Port advertised to reach this Mesos agent (along with\n"
+            "`advertise_ip`). The agent does not bind to this port.\n"
             "However, this port (along with `advertise_ip`) may be used to\n"
-            "access this slave.");
+            "access this agent.");
 
   Option<string> master;
   flags.add(&master,
@@ -140,10 +177,10 @@ int main(int argc, char** argv)
   flags.add(&ip_discovery_command,
             "ip_discovery_command",
             "Optional IP discovery binary: if set, it is expected to emit\n"
-            "the IP address which the slave will try to bind to.\n"
+            "the IP address which the agent will try to bind to.\n"
             "Cannot be used in conjunction with `--ip`.");
 
-  Try<Nothing> load = flags.load("MESOS_", argc, argv);
+  Try<flags::Warnings> load = flags.load("MESOS_", argc, argv);
 
   // TODO(marco): this pattern too should be abstracted away
   // in FlagsBase; I have seen it at least 15 times.
@@ -158,30 +195,20 @@ int main(int argc, char** argv)
   }
 
   if (flags.version) {
-    version();
+    cout << "mesos" << " " << MESOS_VERSION << endl;
     return EXIT_SUCCESS;
   }
 
-  if (master.isNone()) {
-    cerr << flags.usage("Missing required option `--master`") << endl;
+  if (master.isNone() && flags.master_detector.isNone()) {
+    cerr << flags.usage("Missing required option `--master` or "
+                        "`--master_detector`.") << endl;
     return EXIT_FAILURE;
   }
 
-  // Initialize modules. Note that since other subsystems may depend
-  // upon modules, we should initialize modules before anything else.
-  if (flags.modules.isSome()) {
-    Try<Nothing> result = ModuleManager::load(flags.modules.get());
-    if (result.isError()) {
-      EXIT(EXIT_FAILURE) << "Error loading modules: " << result.error();
-    }
-  }
-
-  // Initialize hooks.
-  if (flags.hooks.isSome()) {
-    Try<Nothing> result = HookManager::initialize(flags.hooks.get());
-    if (result.isError()) {
-      EXIT(EXIT_FAILURE) << "Error installing hooks: " << result.error();
-    }
+  if (master.isSome() && flags.master_detector.isSome()) {
+    cerr << flags.usage("Only one of --master or --master_detector options "
+                        "should be specified.");
+    return EXIT_FAILURE;
   }
 
   // Initialize libprocess.
@@ -212,16 +239,8 @@ int main(int argc, char** argv)
     os::setenv("LIBPROCESS_ADVERTISE_PORT", advertise_port.get());
   }
 
-  const string id = process::ID::generate("slave"); // Process ID.
-
-  process::initialize(id);
-
-  logging::initialize(argv[0], flags, true); // Catch signals.
-
-  spawn(new VersionProcess(), true);
-
+  // Log build information.
   LOG(INFO) << "Build: " << build::DATE << " by " << build::USER;
-
   LOG(INFO) << "Version: " << MESOS_VERSION;
 
   if (build::GIT_TAG.isSome()) {
@@ -232,40 +251,24 @@ int main(int argc, char** argv)
     LOG(INFO) << "Git SHA: " << build::GIT_SHA.get();
   }
 
-  Fetcher fetcher;
+  const string id = process::ID::generate("slave"); // Process ID.
 
-#ifdef __linux__
-  // Initialize systemd if it exists.
-  if (systemd::exists() && flags.systemd_enable_support) {
-    LOG(INFO) << "Inializing systemd state";
-
-    systemd::Flags systemdFlags;
-    systemdFlags.enabled = flags.systemd_enable_support;
-    systemdFlags.runtime_directory = flags.systemd_runtime_directory;
-    systemdFlags.cgroups_hierarchy = flags.cgroups_hierarchy;
-
-    Try<Nothing> initialize = systemd::initialize(systemdFlags);
-    if (initialize.isError()) {
-      EXIT(EXIT_FAILURE)
-        << "Failed to initialize systemd: " + initialize.error();
-    }
-  }
-#endif // __linux__
-
-  Try<Containerizer*> containerizer =
-    Containerizer::create(flags, false, &fetcher);
-
-  if (containerizer.isError()) {
-    EXIT(EXIT_FAILURE)
-      << "Failed to create a containerizer: " << containerizer.error();
+  // If `process::initialize()` returns `false`, then it was called before this
+  // invocation, meaning the authentication realm for libprocess-level HTTP
+  // endpoints was set incorrectly. This should be the first invocation.
+  if (!process::initialize(id, DEFAULT_HTTP_AUTHENTICATION_REALM)) {
+    EXIT(EXIT_FAILURE) << "The call to `process::initialize()` in the agent's "
+                       << "`main()` was not the function's first invocation";
   }
 
-  Try<MasterDetector*> detector = MasterDetector::create(master.get());
+  logging::initialize(argv[0], flags, true); // Catch signals.
 
-  if (detector.isError()) {
-    EXIT(EXIT_FAILURE)
-      << "Failed to create a master detector: " << detector.error();
+  // Log any flag warnings (after logging is initialized).
+  foreach (const flags::Warning& warning, load->warnings) {
+    LOG(WARNING) << warning.message;
   }
+
+  spawn(new VersionProcess(), true);
 
   if (flags.firewall_rules.isSome()) {
     vector<Owned<FirewallRule>> rules;
@@ -285,6 +288,26 @@ int main(int argc, char** argv)
     process::firewall::install(move(rules));
   }
 
+  // Initialize modules.
+  if (flags.modules.isSome() && flags.modulesDir.isSome()) {
+    EXIT(EXIT_FAILURE) <<
+      flags.usage("Only one of --modules or --modules_dir should be specified");
+  }
+
+  if (flags.modulesDir.isSome()) {
+    Try<Nothing> result = ModuleManager::load(flags.modulesDir.get());
+    if (result.isError()) {
+      EXIT(EXIT_FAILURE) << "Error loading modules: " << result.error();
+    }
+  }
+
+  if (flags.modules.isSome()) {
+    Try<Nothing> result = ModuleManager::load(flags.modules.get());
+    if (result.isError()) {
+      EXIT(EXIT_FAILURE) << "Error loading modules: " << result.error();
+    }
+  }
+
   // Create anonymous modules.
   foreach (const string& name, ModuleManager::find<Anonymous>()) {
     Try<Anonymous*> create = ModuleManager::create<Anonymous>(name);
@@ -302,7 +325,87 @@ int main(int argc, char** argv)
     // terminating.
   }
 
-  Files files;
+  // Initialize hooks.
+  if (flags.hooks.isSome()) {
+    Try<Nothing> result = HookManager::initialize(flags.hooks.get());
+    if (result.isError()) {
+      EXIT(EXIT_FAILURE) << "Error installing hooks: " << result.error();
+    }
+  }
+
+#ifdef __linux__
+  // Initialize systemd if it exists.
+  if (systemd::exists() && flags.systemd_enable_support) {
+    LOG(INFO) << "Inializing systemd state";
+
+    systemd::Flags systemdFlags;
+    systemdFlags.enabled = flags.systemd_enable_support;
+    systemdFlags.runtime_directory = flags.systemd_runtime_directory;
+    systemdFlags.cgroups_hierarchy = flags.cgroups_hierarchy;
+
+    Try<Nothing> initialize = systemd::initialize(systemdFlags);
+    if (initialize.isError()) {
+      EXIT(EXIT_FAILURE)
+        << "Failed to initialize systemd: " + initialize.error();
+    }
+  }
+#endif // __linux__
+
+  Fetcher fetcher;
+
+  Try<Containerizer*> containerizer =
+    Containerizer::create(flags, false, &fetcher);
+
+  if (containerizer.isError()) {
+    EXIT(EXIT_FAILURE)
+      << "Failed to create a containerizer: " << containerizer.error();
+  }
+
+  Try<MasterDetector*> detector_ = MasterDetector::create(
+      master, flags.master_detector);
+
+  if (detector_.isError()) {
+    EXIT(EXIT_FAILURE)
+      << "Failed to create a master detector: " << detector_.error();
+  }
+
+  MasterDetector* detector = detector_.get();
+
+  Option<Authorizer*> authorizer_ = None();
+
+  string authorizerName = flags.authorizer;
+
+  Result<Authorizer*> authorizer((None()));
+  if (authorizerName != slave::DEFAULT_AUTHORIZER) {
+    LOG(INFO) << "Creating '" << authorizerName << "' authorizer";
+
+    // NOTE: The contents of --acls will be ignored.
+    authorizer = Authorizer::create(authorizerName);
+  } else {
+    // `authorizerName` is `DEFAULT_AUTHORIZER` at this point.
+    if (flags.acls.isSome()) {
+      LOG(INFO) << "Creating default '" << authorizerName << "' authorizer";
+
+      authorizer = Authorizer::create(flags.acls.get());
+    }
+  }
+
+  if (authorizer.isError()) {
+    EXIT(EXIT_FAILURE) << "Could not create '" << authorizerName
+                       << "' authorizer: " << authorizer.error();
+  } else if (authorizer.isSome()) {
+    authorizer_ = authorizer.get();
+
+    // Set the authorization callbacks for libprocess HTTP endpoints.
+    // Note that these callbacks capture `authorizer_.get()`, but the agent
+    // creates a copy of the authorizer during construction. Thus, if in the
+    // future it becomes possible to dynamically set the authorizer, this would
+    // break.
+    process::http::authorization::setCallbacks(
+        createAuthorizationCallbacks(authorizer_.get()));
+  }
+
+  Files files(DEFAULT_HTTP_AUTHENTICATION_REALM);
   GarbageCollector gc;
   StatusUpdateManager statusUpdateManager(flags);
 
@@ -325,18 +428,19 @@ int main(int argc, char** argv)
   }
 
 
-  LOG(INFO) << "Starting Mesos slave";
+  LOG(INFO) << "Starting Mesos agent";
 
   Slave* slave = new Slave(
       id,
       flags,
-      detector.get(),
+      detector,
       containerizer.get(),
       &files,
       &gc,
       &statusUpdateManager,
       resourceEstimator.get(),
-      qosController.get());
+      qosController.get(),
+      authorizer_);
 
   process::spawn(slave);
   process::wait(slave->self());
@@ -347,9 +451,13 @@ int main(int argc, char** argv)
 
   delete qosController.get();
 
-  delete detector.get();
+  delete detector;
 
   delete containerizer.get();
+
+  if (authorizer_.isSome()) {
+    delete authorizer_.get();
+  }
 
   return EXIT_SUCCESS;
 }

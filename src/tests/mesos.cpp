@@ -21,6 +21,8 @@
 
 #include <mesos/slave/container_logger.hpp>
 
+#include <mesos/master/detector.hpp>
+
 #include <stout/check.hpp>
 #include <stout/foreach.hpp>
 #include <stout/json.hpp>
@@ -56,6 +58,8 @@ using testing::Invoke;
 
 using mesos::fetcher::FetcherInfo;
 
+using mesos::master::detector::MasterDetector;
+
 using mesos::slave::ContainerLogger;
 
 using namespace process;
@@ -69,9 +73,25 @@ namespace internal {
 namespace tests {
 
 #ifdef MESOS_HAS_JAVA
-ZooKeeperTestServer* MesosZooKeeperTest::server = NULL;
+ZooKeeperTestServer* MesosZooKeeperTest::server = nullptr;
 Option<zookeeper::URL> MesosZooKeeperTest::url;
 #endif // MESOS_HAS_JAVA
+
+void MesosTest::SetUpTestCase()
+{
+  // We set the connection delay used by the scheduler library to 0.
+  // This is done to speed up the tests.
+  os::setenv("MESOS_CONNECTION_DELAY_MAX", "0ms");
+}
+
+
+void MesosTest::TearDownTestCase()
+{
+  os::unsetenv("MESOS_CONNECTION_DELAY_MAX");
+
+  SSLTemporaryDirectoryTest::TearDownTestCase();
+}
+
 
 MesosTest::MesosTest(const Option<zookeeper::URL>& _zookeeperUrl)
   : zookeeperUrl(_zookeeperUrl) {}
@@ -89,7 +109,10 @@ master::Flags MesosTest::CreateMasterFlags()
 
   flags.authenticate_http = true;
   flags.authenticate_frameworks = true;
-  flags.authenticate_slaves = true;
+  flags.authenticate_agents = true;
+
+  flags.authenticate_http_frameworks = true;
+  flags.http_framework_authenticators = "basic";
 
   // Create a default credentials file.
   const string& path = path::join(os::getcwd(), "credentials");
@@ -147,26 +170,62 @@ slave::Flags MesosTest::CreateSlaveFlags()
 
   flags.launcher_dir = getLauncherDir();
 
-  // Create a default credential file.
-  const string& path = path::join(directory.get(), "credential");
+  {
+    // Create a default credential file for master/agent authentication.
+    const string& path = path::join(directory.get(), "credential");
 
-  Try<int> fd = os::open(
-      path,
-      O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
-      S_IRUSR | S_IWUSR | S_IRGRP);
+    Try<int> fd = os::open(
+        path,
+        O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
+        S_IRUSR | S_IWUSR | S_IRGRP);
 
-  CHECK_SOME(fd);
+    CHECK_SOME(fd);
 
-  Credential credential;
-  credential.set_principal(DEFAULT_CREDENTIAL.principal());
-  credential.set_secret(DEFAULT_CREDENTIAL.secret());
+    Credential credential;
+    credential.set_principal(DEFAULT_CREDENTIAL.principal());
+    credential.set_secret(DEFAULT_CREDENTIAL.secret());
 
-  CHECK_SOME(os::write(fd.get(), stringify(JSON::protobuf(credential))))
-    << "Failed to write slave credential to '" << path << "'";
+    CHECK_SOME(os::write(fd.get(), stringify(JSON::protobuf(credential))))
+      << "Failed to write agent credential to '" << path << "'";
 
-  CHECK_SOME(os::close(fd.get()));
+    CHECK_SOME(os::close(fd.get()));
 
-  flags.credential = path;
+    flags.credential = path;
+
+    // Set default (permissive) ACLs.
+    flags.acls = ACLs();
+  }
+
+  flags.authenticate_http = true;
+
+  {
+    // Create a default HTTP credentials file.
+    const string& path = path::join(directory.get(), "http_credentials");
+
+    Try<int> fd = os::open(
+        path,
+        O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
+        S_IRUSR | S_IWUSR | S_IRGRP);
+
+    CHECK_SOME(fd);
+
+    Credentials httpCredentials;
+
+    Credential* httpCredential = httpCredentials.add_credentials();
+    httpCredential->set_principal(DEFAULT_CREDENTIAL.principal());
+    httpCredential->set_secret(DEFAULT_CREDENTIAL.secret());
+
+    httpCredential = httpCredentials.add_credentials();
+    httpCredential->set_principal(DEFAULT_CREDENTIAL_2.principal());
+    httpCredential->set_secret(DEFAULT_CREDENTIAL_2.secret());
+
+    CHECK_SOME(os::write(fd.get(), stringify(JSON::protobuf(httpCredentials))))
+      << "Failed to write HTTP credentials to '" << path << "'";
+
+    CHECK_SOME(os::close(fd.get()));
+
+    flags.http_credentials = path;
+  }
 
   flags.resources = defaultAgentResourcesString;
 
@@ -346,6 +405,25 @@ Try<Owned<cluster::Slave>> MesosTest::StartSlave(
       qoSController);
 }
 
+
+Try<Owned<cluster::Slave>> MesosTest::StartSlave(
+    mesos::master::detector::MasterDetector* detector,
+    mesos::Authorizer* authorizer,
+    const Option<slave::Flags>& flags)
+{
+  return cluster::Slave::start(
+      detector,
+      flags.isNone() ? CreateSlaveFlags() : flags.get(),
+      None(),
+      None(),
+      None(),
+      None(),
+      None(),
+      None(),
+      authorizer);
+}
+
+
 // Although the constructors and destructors for mock classes are
 // often trivial, defining them out-of-line (in a separate compilation
 // unit) improves compilation time: see MESOS-3827.
@@ -419,7 +497,8 @@ MockSlave::MockSlave(
     const slave::Flags& flags,
     MasterDetector* detector,
     slave::Containerizer* containerizer,
-    const Option<mesos::slave::QoSController*>& _qosController)
+    const Option<mesos::slave::QoSController*>& _qosController,
+    const Option<mesos::Authorizer*>& authorizer)
   : slave::Slave(
         process::ID::generate("slave"),
         flags,
@@ -429,14 +508,16 @@ MockSlave::MockSlave(
         &gc,
         statusUpdateManager = new slave::StatusUpdateManager(flags),
         &resourceEstimator,
-        _qosController.isSome() ? _qosController.get() : &qosController)
+        _qosController.isSome() ? _qosController.get() : &qosController,
+        authorizer),
+    files(slave::DEFAULT_HTTP_AUTHENTICATION_REALM)
 {
   // Set up default behaviors, calling the original methods.
   EXPECT_CALL(*this, runTask(_, _, _, _, _))
     .WillRepeatedly(Invoke(this, &MockSlave::unmocked_runTask));
   EXPECT_CALL(*this, _runTask(_, _, _))
     .WillRepeatedly(Invoke(this, &MockSlave::unmocked__runTask));
-  EXPECT_CALL(*this, killTask(_, _, _))
+  EXPECT_CALL(*this, killTask(_, _))
     .WillRepeatedly(Invoke(this, &MockSlave::unmocked_killTask));
   EXPECT_CALL(*this, removeFramework(_))
     .WillRepeatedly(Invoke(this, &MockSlave::unmocked_removeFramework));
@@ -444,6 +525,8 @@ MockSlave::MockSlave(
     .WillRepeatedly(Invoke(this, &MockSlave::unmocked___recover));
   EXPECT_CALL(*this, qosCorrections())
     .WillRepeatedly(Invoke(this, &MockSlave::unmocked_qosCorrections));
+  EXPECT_CALL(*this, usage())
+    .WillRepeatedly(Invoke(this, &MockSlave::unmocked_usage));
 }
 
 
@@ -475,10 +558,9 @@ void MockSlave::unmocked__runTask(
 
 void MockSlave::unmocked_killTask(
     const UPID& from,
-    const FrameworkID& frameworkId,
-    const TaskID& taskId)
+    const KillTaskMessage& killTaskMessage)
 {
-  slave::Slave::killTask(from, frameworkId, taskId);
+  slave::Slave::killTask(from, killTaskMessage);
 }
 
 
@@ -497,6 +579,12 @@ void MockSlave::unmocked___recover(const Future<Nothing>& future)
 void MockSlave::unmocked_qosCorrections()
 {
   slave::Slave::qosCorrections();
+}
+
+
+process::Future<ResourceUsage> MockSlave::unmocked_usage()
+{
+  return slave::Slave::usage();
 }
 
 
@@ -532,8 +620,9 @@ MockContainerLogger::~MockContainerLogger() {}
 
 MockDocker::MockDocker(
     const string& path,
-    const string& socket)
-  : Docker(path, socket)
+    const string& socket,
+    const Option<JSON::Object>& config)
+  : Docker(path, socket, config)
 {
   EXPECT_CALL(*this, ps(_, _))
     .WillRepeatedly(Invoke(this, &MockDocker::_ps));
@@ -597,11 +686,25 @@ MockDockerContainerizerProcess::~MockDockerContainerizerProcess() {}
 
 MockAuthorizer::MockAuthorizer()
 {
+  // Implementation of the ObjectApprover interface authorizing all objects.
+  class ObjectApproverAll : public ObjectApprover
+  {
+  public:
+    virtual Try<bool> approved(
+        const Option<ObjectApprover::Object>& object) const noexcept override
+    {
+      return true;
+    }
+  };
+
   // NOTE: We use 'EXPECT_CALL' and 'WillRepeatedly' here instead of
   // 'ON_CALL' and 'WillByDefault'. See 'TestContainerizer::SetUp()'
   // for more details.
   EXPECT_CALL(*this, authorized(_))
     .WillRepeatedly(Return(true));
+
+  EXPECT_CALL(*this, getObjectApprover(_, _))
+    .WillRepeatedly(Return(Owned<ObjectApprover>(new ObjectApproverAll())));
 }
 
 
@@ -666,7 +769,7 @@ slave::Flags ContainerizerTest<slave::MesosContainerizer>::CreateSlaveFlags()
     flags.cgroups_root = TEST_CGROUPS_ROOT + "_" + UUID::random().toString();
 
     // Enable putting the slave into memory and cpuacct cgroups.
-    flags.slave_subsystems = "memory,cpuacct";
+    flags.agent_subsystems = "memory,cpuacct";
   } else {
     flags.isolation = "posix/cpu,posix/mem";
   }

@@ -28,6 +28,8 @@
 
 namespace process {
 
+constexpr char DEFAULT_HTTP_AUTHENTICATION_REALM[] = "libprocess-realm";
+
 // A simple test event listener that makes sure to resume the clock
 // after each test even if the previous test had a partial result
 // (i.e., an ASSERT_* failed).
@@ -292,6 +294,10 @@ template <typename T1, typename T2>
   AWAIT_ASSERT_EQ_FOR(expected, actual, Seconds(15))
 
 
+#define AWAIT_EQ_FOR(expected, actual, duration)              \
+  AWAIT_ASSERT_EQ_FOR(expected, actual, duration)
+
+
 #define AWAIT_EQ(expected, actual)              \
   AWAIT_ASSERT_EQ(expected, actual)
 
@@ -304,12 +310,52 @@ template <typename T1, typename T2>
   AWAIT_EXPECT_EQ_FOR(expected, actual, Seconds(15))
 
 
+#define AWAIT_ASSERT_TRUE_FOR(actual, duration)                 \
+  AWAIT_ASSERT_EQ_FOR(true, actual, duration)
+
+
+#define AWAIT_ASSERT_TRUE(actual)       \
+  AWAIT_ASSERT_EQ(true, actual)
+
+
+#define AWAIT_TRUE_FOR(actual, duration)                 \
+  AWAIT_ASSERT_TRUE_FOR(actual, duration)
+
+
+#define AWAIT_TRUE(actual)       \
+  AWAIT_ASSERT_TRUE(actual)
+
+
+#define AWAIT_EXPECT_TRUE_FOR(actual, duration)               \
+  AWAIT_EXPECT_EQ_FOR(true, actual, duration)
+
+
 #define AWAIT_EXPECT_TRUE(actual)               \
-  AWAIT_EXPECT_EQ_FOR(true, actual, Seconds(15))
+  AWAIT_EXPECT_EQ(true, actual)
+
+
+#define AWAIT_ASSERT_FALSE_FOR(actual, duration)                 \
+  AWAIT_ASSERT_EQ_FOR(false, actual, duration)
+
+
+#define AWAIT_ASSERT_FALSE(actual)       \
+  AWAIT_ASSERT_EQ(false, actual)
+
+
+#define AWAIT_FALSE_FOR(actual, duration)                 \
+  AWAIT_ASSERT_FALSE_FOR(actual, duration)
+
+
+#define AWAIT_FALSE(actual)       \
+  AWAIT_ASSERT_FALSE(actual)
+
+
+#define AWAIT_EXPECT_FALSE_FOR(actual, duration)               \
+  AWAIT_EXPECT_EQ_FOR(false, actual, duration)
 
 
 #define AWAIT_EXPECT_FALSE(actual)               \
-  AWAIT_EXPECT_EQ_FOR(false, actual, Seconds(15))
+  AWAIT_EXPECT_EQ(false, actual)
 
 
 inline ::testing::AssertionResult AwaitAssertResponseStatusEq(
@@ -337,6 +383,14 @@ inline ::testing::AssertionResult AwaitAssertResponseStatusEq(
 
   return result;
 }
+
+
+#define AWAIT_ASSERT_RESPONSE_STATUS_EQ_FOR(expected, actual, duration) \
+  ASSERT_PRED_FORMAT3(AwaitAssertResponseStatusEq, expected, actual, duration)
+
+
+#define AWAIT_ASSERT_RESPONSE_STATUS_EQ(expected, actual)               \
+  AWAIT_ASSERT_RESPONSE_STATUS_EQ_FOR(expected, actual, Seconds(15))
 
 
 #define AWAIT_EXPECT_RESPONSE_STATUS_EQ_FOR(expected, actual, duration) \
@@ -372,6 +426,14 @@ inline ::testing::AssertionResult AwaitAssertResponseBodyEq(
 
   return result;
 }
+
+
+#define AWAIT_ASSERT_RESPONSE_BODY_EQ_FOR(expected, actual, duration)   \
+  ASSERT_PRED_FORMAT3(AwaitAssertResponseBodyEq, expected, actual, duration)
+
+
+#define AWAIT_ASSERT_RESPONSE_BODY_EQ(expected, actual)                 \
+  AWAIT_ASSERT_RESPONSE_BODY_EQ_FOR(expected, actual, Seconds(15))
 
 
 #define AWAIT_EXPECT_RESPONSE_BODY_EQ_FOR(expected, actual, duration)   \
@@ -413,6 +475,14 @@ inline ::testing::AssertionResult AwaitAssertResponseHeaderEq(
 
   return result;
 }
+
+
+#define AWAIT_ASSERT_RESPONSE_HEADER_EQ_FOR(expected, key, actual, duration) \
+  ASSERT_PRED_FORMAT4(AwaitAssertResponseHeaderEq, expected, key, actual, duration) // NOLINT(whitespace/line_length)
+
+
+#define AWAIT_ASSERT_RESPONSE_HEADER_EQ(expected, key, actual)          \
+  AWAIT_ASSERT_RESPONSE_HEADER_EQ_FOR(expected, key, actual, Seconds(15))
 
 
 #define AWAIT_EXPECT_RESPONSE_HEADER_EQ_FOR(expected, key, actual, duration) \

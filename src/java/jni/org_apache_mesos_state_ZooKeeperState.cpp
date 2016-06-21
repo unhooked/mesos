@@ -18,17 +18,19 @@
 
 #include <string>
 
-#include <stout/duration.hpp>
+#include <mesos/state/state.hpp>
+#include <mesos/state/zookeeper.hpp>
 
-#include "state/state.hpp"
-#include "state/zookeeper.hpp"
+#include <stout/duration.hpp>
 
 #include "construct.hpp"
 #include "convert.hpp"
 
-using namespace mesos::internal::state;
-
 using std::string;
+
+using mesos::state::State;
+using mesos::state::Storage;
+using mesos::state::ZooKeeperStorage;
 
 extern "C" {
 
@@ -104,11 +106,11 @@ JNIEXPORT void JNICALL Java_org_apache_mesos_state_ZooKeeperState_initialize__Lj
   string znode = construct<string>(env, jznode);
 
   // Create the C++ State.
-  Storage* storage = NULL;
-  if (jscheme != NULL && jcredentials != NULL) {
+  Storage* storage = nullptr;
+  if (jscheme != nullptr && jcredentials != nullptr) {
     string scheme = construct<string>(env, jscheme);
 
-    jbyte* temp = env->GetByteArrayElements(jcredentials, NULL);
+    jbyte* temp = env->GetByteArrayElements(jcredentials, nullptr);
     jsize length = env->GetArrayLength(jcredentials);
 
     string credentials((char*) temp, (size_t) length);
@@ -122,7 +124,7 @@ JNIEXPORT void JNICALL Java_org_apache_mesos_state_ZooKeeperState_initialize__Lj
     storage = new ZooKeeperStorage(servers, timeout, znode);
   }
 
-  CHECK(storage != NULL);
+  CHECK(storage != nullptr);
 
   State* state = new State(storage);
 

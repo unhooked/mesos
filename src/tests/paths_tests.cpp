@@ -19,7 +19,6 @@
 #include <stout/check.hpp>
 #include <stout/os.hpp>
 #include <stout/path.hpp>
-#include <stout/protobuf.hpp>
 #include <stout/stringify.hpp>
 #include <stout/strings.hpp>
 #include <stout/uuid.hpp>
@@ -44,7 +43,7 @@ class PathsTest : public ::testing::Test
 public:
   virtual void SetUp()
   {
-    slaveId.set_value("slave1");
+    slaveId.set_value("agent1");
     frameworkId.set_value("framework1");
     executorId.set_value("executor1");
     taskId.set_value("task1");

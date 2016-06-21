@@ -23,7 +23,6 @@
 #include <stout/check.hpp>
 #include <stout/error.hpp>
 #include <stout/foreach.hpp>
-#include <stout/format.hpp>
 #include <stout/none.hpp>
 #include <stout/nothing.hpp>
 #include <stout/numify.hpp>
@@ -86,7 +85,7 @@ Result<State> recover(const string& rootDir, bool strict)
       CHECK_SOME(id);
 
       if (id.get() != strings::trim(read.get())) {
-        LOG(INFO) << "Slave host rebooted";
+        LOG(INFO) << "Agent host rebooted";
         return state;
       }
     }
@@ -98,14 +97,14 @@ Result<State> recover(const string& rootDir, bool strict)
   if (!os::exists(latest)) {
     // The slave was asked to shutdown or died before it registered
     // and had a chance to create the "latest" symlink.
-    LOG(INFO) << "Failed to find the latest slave from '" << rootDir << "'";
+    LOG(INFO) << "Failed to find the latest agent from '" << rootDir << "'";
     return state;
   }
 
   // Get the latest slave id.
   Result<string> directory = os::realpath(latest);
   if (!directory.isSome()) {
-    return Error("Failed to find latest slave: " +
+    return Error("Failed to find latest agent: " +
                  (directory.isError()
                   ? directory.error()
                   : "No such file or directory"));
@@ -138,14 +137,14 @@ Try<SlaveState> SlaveState::recover(
   if (!os::exists(path)) {
     // This could happen if the slave died before it registered with
     // the master.
-    LOG(WARNING) << "Failed to find slave info file '" << path << "'";
+    LOG(WARNING) << "Failed to find agent info file '" << path << "'";
     return state;
   }
 
   const Result<SlaveInfo>& slaveInfo = ::protobuf::read<SlaveInfo>(path);
 
   if (slaveInfo.isError()) {
-    const string& message = "Failed to read slave info from '" + path + "': " +
+    const string& message = "Failed to read agent info from '" + path + "': " +
                             slaveInfo.error();
     if (strict) {
       return Error(message);
@@ -159,7 +158,7 @@ Try<SlaveState> SlaveState::recover(
   if (slaveInfo.isNone()) {
     // This could happen if the slave died after opening the file for
     // writing but before it checkpointed anything.
-    LOG(WARNING) << "Found empty slave info file '" << path << "'";
+    LOG(WARNING) << "Found empty agent info file '" << path << "'";
     return state;
   }
 
@@ -169,7 +168,7 @@ Try<SlaveState> SlaveState::recover(
   Try<list<string> > frameworks = paths::getFrameworkPaths(rootDir, slaveId);
 
   if (frameworks.isError()) {
-    return Error("Failed to find frameworks for slave " + slaveId.value() +
+    return Error("Failed to find frameworks for agent " + slaveId.value() +
                  ": " + frameworks.error());
   }
 
@@ -639,7 +638,7 @@ Try<TaskState> TaskState::recover(
     if (record.get().type() == StatusUpdateRecord::UPDATE) {
       state.updates.push_back(record.get().update());
     } else {
-      state.acks.insert(UUID::fromBytes(record.get().uuid()));
+      state.acks.insert(UUID::fromBytes(record.get().uuid()).get());
     }
   }
 

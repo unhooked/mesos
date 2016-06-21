@@ -42,7 +42,7 @@ The following steps indicate how to increment the quorum size, using 3 -> 5 mast
 To increase the quorum by N, repeat this process to increment the quorum size N times.
 
 NOTE: Currently, moving out of a single master setup requires wiping the replicated log
-state and starting fresh. This will wipe all persistent data (e.g., slaves, maintenance
+state and starting fresh. This will wipe all persistent data (e.g., agents, maintenance
 information, quota information, etc). To move from 1 master to 3 masters:
 
 1. Stop the standalone master.
@@ -64,3 +64,6 @@ Please see the NOTE section above. So long as the failed master is guaranteed to
 
 ## External access for Mesos master
 If the default IP (or the command line arg `--ip`) is an internal IP, then external entities such as framework schedulers will be unable to reach the master. To address that scenario, an externally accessible IP:port can be setup via the `--advertise_ip` and `--advertise_port` command line arguments of `mesos-master`. If configured, external entities such as framework schedulers interact with the advertise_ip:advertise_port from where the request needs to be proxied to the internal IP:port on which the Mesos master is listening.
+
+## HTTP requests to non-leading master
+HTTP requests to some master endpoints (e.g., [/state](endpoints/master/state.md), [/machine/down](endpoints/master/machine/down.md)) can only be answered by the leading master. Such requests made to a non-leading master will result in either a `307 Temporary Redirect` (with the location of the leading master) or `503 Service Unavailable` (if the master does not know who the current leader is).

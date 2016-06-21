@@ -43,7 +43,6 @@
 #include "local/local.hpp"
 
 #include "master/master.hpp"
-#include "master/detector.hpp"
 
 #include "slave/constants.hpp"
 #include "slave/flags.hpp"
@@ -60,6 +59,8 @@ using mesos::internal::master::Master;
 using mesos::internal::slave::GarbageCollector;
 using mesos::internal::slave::GarbageCollectorProcess;
 using mesos::internal::slave::Slave;
+
+using mesos::master::detector::MasterDetector;
 
 using process::Clock;
 using process::Future;
@@ -148,7 +149,7 @@ TEST_F(GarbageCollectorTest, Unschedule)
   GarbageCollector gc;
 
   // Attempt to unschedule a file that is not scheduled.
-  AWAIT_ASSERT_EQ(false, gc.unschedule("bogus"));
+  AWAIT_ASSERT_FALSE(gc.unschedule("bogus"));
 
   // Make some temporary files to gc.
   const string& file1 = "file1";
@@ -171,9 +172,9 @@ TEST_F(GarbageCollectorTest, Unschedule)
   Future<Nothing> schedule3 = gc.schedule(Seconds(10), file3);
 
   // Unschedule each operation.
-  AWAIT_ASSERT_EQ(true, gc.unschedule(file2));
-  AWAIT_ASSERT_EQ(true, gc.unschedule(file3));
-  AWAIT_ASSERT_EQ(true, gc.unschedule(file1));
+  AWAIT_ASSERT_TRUE(gc.unschedule(file2));
+  AWAIT_ASSERT_TRUE(gc.unschedule(file3));
+  AWAIT_ASSERT_TRUE(gc.unschedule(file1));
 
   // Advance the clock to ensure nothing was GCed.
   Clock::advance(Seconds(10));
@@ -219,7 +220,7 @@ TEST_F(GarbageCollectorTest, Prune)
   Future<Nothing> schedule3 = gc.schedule(Seconds(15), file3);
   Future<Nothing> schedule4 = gc.schedule(Seconds(15), file4);
 
-  AWAIT_ASSERT_EQ(true, gc.unschedule(file3));
+  AWAIT_ASSERT_TRUE(gc.unschedule(file3));
   AWAIT_DISCARDED(schedule3);
 
   // Prune file1 and file2.
@@ -471,7 +472,11 @@ TEST_F(GarbageCollectorIntegrationTest, ExitedFramework)
   process::UPID filesUpid("files", process::address());
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(
       process::http::NotFound().status,
-      process::http::get(filesUpid, "browse", "path=" + frameworkDir));
+      process::http::get(
+          filesUpid,
+          "browse",
+          "path=" + frameworkDir,
+          createBasicAuthHeaders(DEFAULT_CREDENTIAL)));
 
   Clock::resume();
 }
@@ -574,7 +579,11 @@ TEST_F(GarbageCollectorIntegrationTest, ExitedExecutor)
   process::UPID files("files", process::address());
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(
       process::http::NotFound().status,
-      process::http::get(files, "browse", "path=" + executorDir));
+      process::http::get(
+          files,
+          "browse",
+          "path=" + executorDir,
+          createBasicAuthHeaders(DEFAULT_CREDENTIAL)));
 
   Clock::resume();
 
@@ -691,7 +700,11 @@ TEST_F(GarbageCollectorIntegrationTest, DiskUsage)
   process::UPID files("files", process::address());
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(
       process::http::NotFound().status,
-      process::http::get(files, "browse", "path=" + executorDir));
+      process::http::get(
+          files,
+          "browse",
+          "path=" + executorDir,
+          createBasicAuthHeaders(DEFAULT_CREDENTIAL)));
 
   Clock::resume();
 

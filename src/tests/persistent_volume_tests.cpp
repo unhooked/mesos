@@ -14,6 +14,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <list>
 #include <string>
 #include <vector>
 
@@ -28,16 +29,22 @@
 #include <process/owned.hpp>
 
 #include <stout/foreach.hpp>
-#include <stout/format.hpp>
-#include <stout/hashset.hpp>
+#include <stout/fs.hpp>
+#include <stout/none.hpp>
 #include <stout/path.hpp>
 #include <stout/strings.hpp>
 
 #include <stout/os/exists.hpp>
 
+#ifdef __linux__
+#include "linux/fs.hpp"
+#endif // __linux__
+
 #include "master/constants.hpp"
 #include "master/flags.hpp"
 #include "master/master.hpp"
+
+#include "master/detector/standalone.hpp"
 
 #include "slave/flags.hpp"
 #include "slave/paths.hpp"
@@ -55,6 +62,10 @@ using mesos::internal::master::Master;
 
 using mesos::internal::slave::Slave;
 
+using mesos::master::detector::MasterDetector;
+using mesos::master::detector::StandaloneMasterDetector;
+
+using std::list;
 using std::string;
 using std::vector;
 
@@ -70,7 +81,8 @@ namespace tests {
 enum PersistentVolumeSourceType
 {
   NONE,
-  PATH
+  PATH,
+  MOUNT
 };
 
 
@@ -82,13 +94,71 @@ protected:
   virtual void SetUp()
   {
     MesosTest::SetUp();
+
     Try<string> path = environment->mkdtemp();
     ASSERT_SOME(path) << "Failed to mkdtemp";
+
     diskPath = path.get();
+
+    if (GetParam() == MOUNT) {
+      // On linux we mount a `tmpfs`.
+#ifdef __linux__
+      for (size_t i = 1; i <= NUM_DISKS; ++i) {
+        string disk = path::join(diskPath, "disk" + stringify(i));
+        ASSERT_SOME(os::mkdir(disk));
+        ASSERT_SOME(fs::mount(None(), disk, "tmpfs", 0, "size=10M"));
+      }
+#else // __linux__
+    // Otherwise we need to create 2 directories to mock the 2 devices.
+      for (size_t i = 1; i <= NUM_DISKS; ++i) {
+        string disk = path::join(diskPath, "disk" + stringify(i));
+        ASSERT_SOME(os::mkdir(disk));
+      }
+#endif // __linux__
+    }
   }
 
-  Resource getDiskResource(const Megabytes& mb)
+  virtual void TearDown()
   {
+#ifdef __linux__
+    if (GetParam() == MOUNT) {
+      for (size_t i = 1; i <= NUM_DISKS; ++i) {
+        ASSERT_SOME(
+            fs::unmountAll(path::join(diskPath, "disk" + stringify(i))));
+      }
+    }
+#endif // __linux__
+    MesosTest::TearDown();
+  }
+
+  master::Flags MasterFlags(const vector<FrameworkInfo>& frameworks)
+  {
+    master::Flags flags = CreateMasterFlags();
+
+    ACLs acls;
+    hashset<string> roles;
+
+    foreach (const FrameworkInfo& framework, frameworks) {
+      mesos::ACL::RegisterFramework* acl = acls.add_register_frameworks();
+      acl->mutable_principals()->add_values(framework.principal());
+      acl->mutable_roles()->add_values(framework.role());
+
+      roles.insert(framework.role());
+    }
+
+    flags.acls = acls;
+    flags.roles = strings::join(",", roles);
+
+    return flags;
+  }
+
+  // Creates a disk with / without a `source` based on the
+  // parameterization of the test. `id` influences the `root` if one
+  // is specified so that we can create multiple disks in the tests.
+  Resource getDiskResource(const Megabytes& mb, size_t id = 1)
+  {
+    CHECK_LE(1u, id);
+    CHECK_GE(NUM_DISKS, id);
     Resource diskResource;
 
     switch (GetParam()) {
@@ -107,7 +177,18 @@ protected:
             "role1",
             None(),
             None(),
-            createDiskSourcePath(diskPath));
+            createDiskSourcePath(path::join(diskPath, "disk" + stringify(id))));
+
+        break;
+      }
+      case MOUNT: {
+        diskResource = createDiskResource(
+            stringify(mb.megabytes()),
+            "role1",
+            None(),
+            None(),
+            createDiskSourceMount(
+                path::join(diskPath, "disk" + stringify(id))));
 
         break;
       }
@@ -118,13 +199,17 @@ protected:
 
   string getSlaveResources()
   {
+    // Create 2 disks that can be used to create persistent volumes.
+    // NOTE: These will be merged if our fixture parameter is `NONE`.
     Resources resources = Resources::parse("cpus:2;mem:2048").get() +
-      getDiskResource(Megabytes(2048));
+      getDiskResource(Megabytes(2048), 1) +
+      getDiskResource(Megabytes(2048), 2);
 
     return stringify(JSON::protobuf(
         static_cast<const RepeatedPtrField<Resource>&>(resources)));
   }
 
+  static constexpr size_t NUM_DISKS = 2;
   string diskPath;
 };
 
@@ -138,18 +223,40 @@ INSTANTIATE_TEST_CASE_P(
         PersistentVolumeSourceType::PATH));
 
 
+// We also want to parameterize them for `MOUNT`. On linux this means
+// using `tmpfs`.
+#ifdef __linux__
+// On linux we have to run this test as root, as we need permissions
+// to access `tmpfs`.
+INSTANTIATE_TEST_CASE_P(
+    ROOT_MountDiskResource,
+    PersistentVolumeTest,
+    ::testing::Values(
+        PersistentVolumeSourceType::MOUNT));
+#else // __linux__
+// Otherwise we can run it without root privileges as we just require
+// a directory.
+INSTANTIATE_TEST_CASE_P(
+    MountDiskResource,
+    PersistentVolumeTest,
+    ::testing::Values(
+        PersistentVolumeSourceType::MOUNT));
+#endif // __linux__
+
+
 // This test verifies that CheckpointResourcesMessages are sent to the
 // slave when the framework creates/destroys persistent volumes, and
 // the resources in the messages correctly reflect the resources that
 // need to be checkpointed on the slave.
-TEST_P(PersistentVolumeTest, SendingCheckpointResourcesMessage)
+TEST_P(PersistentVolumeTest, CreateAndDestroyPersistentVolumes)
 {
+  Clock::pause();
+
   FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
   frameworkInfo.set_role("role1");
 
   // Create a master.
   master::Flags masterFlags = CreateMasterFlags();
-  masterFlags.allocation_interval = Milliseconds(50);
   masterFlags.roles = frameworkInfo.role();
 
   Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
@@ -175,6 +282,8 @@ TEST_P(PersistentVolumeTest, SendingCheckpointResourcesMessage)
 
   driver.start();
 
+  Clock::advance(masterFlags.allocation_interval);
+
   AWAIT_READY(offers);
   EXPECT_FALSE(offers.get().empty());
 
@@ -190,16 +299,36 @@ TEST_P(PersistentVolumeTest, SendingCheckpointResourcesMessage)
     FUTURE_PROTOBUF(CheckpointResourcesMessage(), _, _);
 
   Resource volume1 = createPersistentVolume(
-      getDiskResource(Megabytes(64)),
+      getDiskResource(Megabytes(2048), 1),
       "id1",
       "path1",
-      None());
+      None(),
+      frameworkInfo.principal());
 
   Resource volume2 = createPersistentVolume(
-      getDiskResource(Megabytes(128)),
+      getDiskResource(Megabytes(2048), 2),
       "id2",
       "path2",
-      None());
+      None(),
+      frameworkInfo.principal());
+
+  string volume1Path = slave::paths::getPersistentVolumePath(
+      slaveFlags.work_dir, volume1);
+
+  string volume2Path = slave::paths::getPersistentVolumePath(
+      slaveFlags.work_dir, volume2);
+
+  // For MOUNT disks, we expect the volume's directory to already
+  // exist (it is created by the test `SetUp()` function). For
+  // non-MOUNT disks, the directory is created when the persistent
+  // volume is created.
+  if (GetParam() == MOUNT) {
+    EXPECT_TRUE(os::exists(volume1Path));
+    EXPECT_TRUE(os::exists(volume2Path));
+  } else {
+    EXPECT_FALSE(os::exists(volume1Path));
+    EXPECT_FALSE(os::exists(volume2Path));
+  }
 
   // We use the filter explicitly here so that the resources will not
   // be filtered for 5 seconds (the default).
@@ -229,6 +358,14 @@ TEST_P(PersistentVolumeTest, SendingCheckpointResourcesMessage)
   EXPECT_EQ(Resources(message2.get().resources()),
             Resources(volume1) + Resources(volume2));
 
+  // Ensure that the `CheckpointResourcesMessage`s reach the slave.
+  Clock::settle();
+
+  EXPECT_TRUE(os::exists(volume1Path));
+  EXPECT_TRUE(os::exists(volume2Path));
+
+  Clock::advance(masterFlags.allocation_interval);
+
   AWAIT_READY(offers);
   EXPECT_FALSE(offers.get().empty());
 
@@ -248,6 +385,27 @@ TEST_P(PersistentVolumeTest, SendingCheckpointResourcesMessage)
   // volume2 but not volume1.
   AWAIT_READY(message3);
   EXPECT_EQ(Resources(message3.get().resources()), volume2);
+
+  // Ensure that the `CheckpointResourcesMessage`s reach the slave.
+  Clock::settle();
+
+  // For MOUNT disks, we preserve the top-level volume directory (but
+  // delete all of the files and subdirectories underneath it). For
+  // non-MOUNT disks, the volume directory should be removed when the
+  // volume is destroyed.
+  if (GetParam() == MOUNT) {
+    EXPECT_TRUE(os::exists(volume1Path));
+
+    Try<list<string>> files = ::fs::list(path::join(volume1Path, "*"));
+    CHECK_SOME(files);
+    EXPECT_EQ(0u, files.get().size());
+  } else {
+    EXPECT_FALSE(os::exists(volume1Path));
+  }
+
+  EXPECT_TRUE(os::exists(volume2Path));
+
+  Clock::resume();
 
   driver.stop();
   driver.join();
@@ -281,7 +439,7 @@ TEST_P(PersistentVolumeTest, ResourcesCheckpointing)
   Future<vector<Offer>> offers;
   EXPECT_CALL(sched, resourceOffers(&driver, _))
     .WillOnce(FutureArg<1>(&offers))
-    .WillRepeatedly(Return());        // Ignore subsequent offers.
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   driver.start();
 
@@ -294,10 +452,11 @@ TEST_P(PersistentVolumeTest, ResourcesCheckpointing)
     FUTURE_PROTOBUF(CheckpointResourcesMessage(), _, slave.get()->pid);
 
   Resource volume = createPersistentVolume(
-      getDiskResource(Megabytes(64)),
+      getDiskResource(Megabytes(2048)),
       "id1",
       "path1",
-      None());
+      None(),
+      frameworkInfo.principal());
 
   driver.acceptOffers(
       {offer.id()},
@@ -346,7 +505,7 @@ TEST_P(PersistentVolumeTest, PreparePersistentVolume)
   Future<vector<Offer>> offers;
   EXPECT_CALL(sched, resourceOffers(&driver, _))
     .WillOnce(FutureArg<1>(&offers))
-    .WillRepeatedly(Return());        // Ignore subsequent offers.
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   driver.start();
 
@@ -356,10 +515,11 @@ TEST_P(PersistentVolumeTest, PreparePersistentVolume)
   Offer offer = offers.get()[0];
 
   Resource volume = createPersistentVolume(
-      getDiskResource(Megabytes(64)),
+      getDiskResource(Megabytes(2048)),
       "id1",
       "path1",
-      None());
+      None(),
+      frameworkInfo.principal());
 
   Future<CheckpointResourcesMessage> checkpointResources =
     FUTURE_PROTOBUF(CheckpointResourcesMessage(), _, slave.get()->pid);
@@ -413,7 +573,7 @@ TEST_P(PersistentVolumeTest, MasterFailover)
   Future<vector<Offer>> offers1;
   EXPECT_CALL(sched, resourceOffers(&driver, _))
     .WillOnce(FutureArg<1>(&offers1))
-    .WillRepeatedly(Return());        // Ignore subsequent offers.
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   driver.start();
 
@@ -423,10 +583,11 @@ TEST_P(PersistentVolumeTest, MasterFailover)
   Offer offer1 = offers1.get()[0];
 
   Resource volume = createPersistentVolume(
-      getDiskResource(Megabytes(64)),
+      getDiskResource(Megabytes(2048)),
       "id1",
       "path1",
-      None());
+      None(),
+      frameworkInfo.principal());
 
   Future<CheckpointResourcesMessage> checkpointResources =
     FUTURE_PROTOBUF(CheckpointResourcesMessage(), _, slave.get()->pid);
@@ -455,7 +616,7 @@ TEST_P(PersistentVolumeTest, MasterFailover)
   Future<vector<Offer>> offers2;
   EXPECT_CALL(sched, resourceOffers(&driver, _))
     .WillOnce(FutureArg<1>(&offers2))
-    .WillRepeatedly(Return());        // Ignore subsequent offers.
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   master = StartMaster(masterFlags);
   ASSERT_SOME(master);
@@ -508,7 +669,7 @@ TEST_P(PersistentVolumeTest, IncompatibleCheckpointedResources)
   Future<vector<Offer>> offers;
   EXPECT_CALL(sched, resourceOffers(&driver, _))
     .WillOnce(FutureArg<1>(&offers))
-    .WillRepeatedly(Return());        // Ignore subsequent offers.
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   driver.start();
 
@@ -518,10 +679,11 @@ TEST_P(PersistentVolumeTest, IncompatibleCheckpointedResources)
   Offer offer = offers.get()[0];
 
   Resource volume = createPersistentVolume(
-      getDiskResource(Megabytes(64)),
+      getDiskResource(Megabytes(2048)),
       "id1",
       "path1",
-      None());
+      None(),
+      frameworkInfo.principal());
 
   Future<CheckpointResourcesMessage> checkpointResources =
     FUTURE_PROTOBUF(CheckpointResourcesMessage(), _, _);
@@ -568,7 +730,10 @@ TEST_P(PersistentVolumeTest, IncompatibleCheckpointedResources)
 // the container path it specifies.
 TEST_P(PersistentVolumeTest, AccessPersistentVolume)
 {
-  Try<Owned<cluster::Master>> master = StartMaster();
+  Clock::pause();
+
+  master::Flags masterFlags = CreateMasterFlags();
+  Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
   ASSERT_SOME(master);
 
   slave::Flags slaveFlags = CreateSlaveFlags();
@@ -593,7 +758,7 @@ TEST_P(PersistentVolumeTest, AccessPersistentVolume)
   Future<vector<Offer>> offers;
   EXPECT_CALL(sched, resourceOffers(&driver, _))
     .WillOnce(FutureArg<1>(&offers))
-    .WillRepeatedly(Return());        // Ignore subsequent offers.
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   driver.start();
 
@@ -605,14 +770,14 @@ TEST_P(PersistentVolumeTest, AccessPersistentVolume)
   Offer offer = offers.get()[0];
 
   Resource volume = createPersistentVolume(
-      getDiskResource(Megabytes(64)),
+      getDiskResource(Megabytes(2048)),
       "id1",
       "path1",
-      None());
+      None(),
+      frameworkInfo.principal());
 
   // Create a task which writes a file in the persistent volume.
-  Resources taskResources = Resources::parse("cpus:1;mem:128").get() +
-    getDiskResource(Megabytes(32)) + volume;
+  Resources taskResources = Resources::parse("cpus:1;mem:128").get() + volume;
 
   TaskInfo task = createTask(
       offer.slave_id(),
@@ -624,6 +789,12 @@ TEST_P(PersistentVolumeTest, AccessPersistentVolume)
   EXPECT_CALL(sched, statusUpdate(&driver, _))
     .WillOnce(FutureArg<1>(&status1))
     .WillOnce(FutureArg<1>(&status2));
+
+  Future<Nothing> statusUpdateAcknowledgement1 =
+    FUTURE_DISPATCH(slave.get()->pid, &Slave::_statusUpdateAcknowledgement);
+
+  Future<Nothing> statusUpdateAcknowledgement2 =
+    FUTURE_DISPATCH(slave.get()->pid, &Slave::_statusUpdateAcknowledgement);
 
   driver.acceptOffers(
       {offer.id()},
@@ -647,7 +818,7 @@ TEST_P(PersistentVolumeTest, AccessPersistentVolume)
   ExecutorID executorId;
   executorId.set_value(task.task_id().value());
 
-  const string& directory = slave::paths::getExecutorLatestRunPath(
+  string directory = slave::paths::getExecutorLatestRunPath(
       slaveFlags.work_dir,
       offer.slave_id(),
       frameworkId.get(),
@@ -655,11 +826,64 @@ TEST_P(PersistentVolumeTest, AccessPersistentVolume)
 
   EXPECT_FALSE(os::exists(path::join(directory, "path1")));
 
-  const string& volumePath = slave::paths::getPersistentVolumePath(
+  string volumePath = slave::paths::getPersistentVolumePath(
       slaveFlags.work_dir,
       volume);
 
-  EXPECT_SOME_EQ("abc\n", os::read(path::join(volumePath, "file")));
+  string filePath1 = path::join(volumePath, "file");
+
+  EXPECT_SOME_EQ("abc\n", os::read(filePath1));
+
+  // Ensure that the slave has received the acknowledgment of the
+  // TASK_FINISHED status update; this implies the acknowledgement
+  // reached the master, which is necessary for the task's resources
+  // to be recovered by the allocator.
+  AWAIT_READY(statusUpdateAcknowledgement1);
+  AWAIT_READY(statusUpdateAcknowledgement2);
+
+  // Expect an offer containing the persistent volume.
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  Clock::advance(masterFlags.allocation_interval);
+
+  AWAIT_READY(offers);
+
+  offer = offers.get()[0];
+
+  EXPECT_TRUE(Resources(offer.resources()).contains(volume));
+
+  Future<CheckpointResourcesMessage> checkpointMessage =
+    FUTURE_PROTOBUF(CheckpointResourcesMessage(), _, _);
+
+  driver.acceptOffers({offer.id()}, {DESTROY(volume)});
+
+  AWAIT_READY(checkpointMessage);
+
+  Resources checkpointResources = checkpointMessage.get().resources();
+  EXPECT_FALSE(checkpointResources.contains(volume));
+
+  // Ensure that `checkpointMessage` reaches the slave.
+  Clock::settle();
+
+  EXPECT_FALSE(os::exists(filePath1));
+
+  // For MOUNT disks, we preserve the top-level volume directory (but
+  // delete all of the files and subdirectories underneath it). For
+  // non-MOUNT disks, the volume directory should be removed when the
+  // volume is destroyed.
+  if (GetParam() == MOUNT) {
+    EXPECT_TRUE(os::exists(volumePath));
+
+    Try<list<string>> files = ::fs::list(path::join(volumePath, "*"));
+    CHECK_SOME(files);
+    EXPECT_EQ(0u, files.get().size());
+  } else {
+    EXPECT_FALSE(os::exists(volumePath));
+  }
+
+  Clock::resume();
 
   driver.stop();
   driver.join();
@@ -699,7 +923,7 @@ TEST_P(PersistentVolumeTest, SlaveRecovery)
   Future<vector<Offer>> offers;
   EXPECT_CALL(sched, resourceOffers(&driver, _))
     .WillOnce(FutureArg<1>(&offers))
-    .WillRepeatedly(Return());        // Ignore subsequent offers.
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
 
   driver.start();
 
@@ -711,14 +935,15 @@ TEST_P(PersistentVolumeTest, SlaveRecovery)
   Offer offer = offers.get()[0];
 
   Resource volume = createPersistentVolume(
-      getDiskResource(Megabytes(64)),
+      getDiskResource(Megabytes(2048)),
       "id1",
       "path1",
-      None());
+      None(),
+      frameworkInfo.principal());
 
-  // Create a task which writes a file in the persistent volume.
-  Resources taskResources = Resources::parse("cpus:1;mem:128").get() +
-    getDiskResource(Megabytes(32)) + volume;
+  // Create a task which tests for the existence of
+  // the persistent volume directory.
+  Resources taskResources = Resources::parse("cpus:1;mem:128").get() + volume;
 
   TaskInfo task = createTask(
       offer.slave_id(),
@@ -861,10 +1086,11 @@ TEST_P(PersistentVolumeTest, GoodACLCreateThenDestroy)
   Offer offer = offers.get()[0];
 
   Resource volume = createPersistentVolume(
-      getDiskResource(Megabytes(128)),
+      getDiskResource(Megabytes(2048)),
       "id1",
       "path1",
-      None());
+      None(),
+      frameworkInfo.principal());
 
   Future<CheckpointResourcesMessage> checkpointResources1 =
     FUTURE_PROTOBUF(CheckpointResourcesMessage(), _, slave.get()->pid);
@@ -987,7 +1213,7 @@ TEST_P(PersistentVolumeTest, GoodACLNoPrincipal)
   // Create a scheduler/framework.
   MockScheduler sched;
   MesosSchedulerDriver driver(
-      &sched, frameworkInfo, master.get()->pid, DEFAULT_CREDENTIAL);
+      &sched, frameworkInfo, master.get()->pid);
 
   EXPECT_CALL(sched, registered(&driver, _, _));
 
@@ -1008,9 +1234,10 @@ TEST_P(PersistentVolumeTest, GoodACLNoPrincipal)
   Offer offer = offers.get()[0];
 
   Resource volume = createPersistentVolume(
-      getDiskResource(Megabytes(128)),
+      getDiskResource(Megabytes(2048)),
       "id1",
       "path1",
+      None(),
       None());
 
   Future<CheckpointResourcesMessage> checkpointResources1 =
@@ -1078,6 +1305,7 @@ TEST_P(PersistentVolumeTest, GoodACLNoPrincipal)
   driver.join();
 }
 
+// TODO(greggomann): Change the names of `driver1` and `driver2` below.
 
 // This test verifies that `create` and `destroy` operations fail as expected
 // when authorization fails and no principal is supplied.
@@ -1100,6 +1328,11 @@ TEST_P(PersistentVolumeTest, BadACLNoPrincipal)
   mesos::ACL::CreateVolume* create2 = acls.add_create_volumes();
   create2->mutable_principals()->set_type(mesos::ACL::Entity::ANY);
   create2->mutable_roles()->set_type(mesos::ACL::Entity::NONE);
+
+  // This ACL declares that no principal can destroy persistent volumes.
+  mesos::ACL::DestroyVolume* destroy = acls.add_destroy_volumes();
+  destroy->mutable_principals()->set_type(mesos::ACL::Entity::ANY);
+  destroy->mutable_creator_principals()->set_type(mesos::ACL::Entity::NONE);
 
   // We use this filter so that resources will not
   // be filtered for 5 seconds (the default).
@@ -1156,32 +1389,35 @@ TEST_P(PersistentVolumeTest, BadACLNoPrincipal)
 
   Offer offer = offers.get()[0];
 
-  Resource volume = createPersistentVolume(
-      getDiskResource(Megabytes(128)),
-      "id1",
-      "path1",
-      None());
+  {
+    Resource volume = createPersistentVolume(
+        getDiskResource(Megabytes(2048)),
+        "id1",
+        "path1",
+        None(),
+        None());
 
-  // Attempt to create the persistent volume using `acceptOffers`.
-  driver1.acceptOffers(
-      {offer.id()},
-      {CREATE(volume)},
-      filters);
+    // Attempt to create the persistent volume using `acceptOffers`.
+    driver1.acceptOffers(
+        {offer.id()},
+        {CREATE(volume)},
+        filters);
 
-  // Expect another offer.
-  EXPECT_CALL(sched1, resourceOffers(&driver1, _))
-    .WillOnce(FutureArg<1>(&offers));
+    // Expect another offer.
+    EXPECT_CALL(sched1, resourceOffers(&driver1, _))
+      .WillOnce(FutureArg<1>(&offers));
 
-  Clock::settle();
-  Clock::advance(masterFlags.allocation_interval);
+    Clock::settle();
+    Clock::advance(masterFlags.allocation_interval);
 
-  AWAIT_READY(offers);
-  EXPECT_FALSE(offers.get().empty());
+    AWAIT_READY(offers);
+    EXPECT_FALSE(offers.get().empty());
 
-  offer = offers.get()[0];
+    offer = offers.get()[0];
 
-  // Check that the persistent volume is not contained in this offer.
-  EXPECT_FALSE(Resources(offer.resources()).contains(volume));
+    // Check that the persistent volume is not contained in this offer.
+    EXPECT_FALSE(Resources(offer.resources()).contains(volume));
+  }
 
   // Decline the offer and suppress so the second
   // framework will receive the offer instead.
@@ -1208,6 +1444,13 @@ TEST_P(PersistentVolumeTest, BadACLNoPrincipal)
   EXPECT_FALSE(offers.get().empty());
 
   offer = offers.get()[0];
+
+  Resource volume = createPersistentVolume(
+      getDiskResource(Megabytes(2048)),
+      "id1",
+      "path1",
+      None(),
+      frameworkInfo2.principal());
 
   // Create the persistent volume using `acceptOffers`.
   driver2.acceptOffers(
@@ -1268,6 +1511,9 @@ TEST_P(PersistentVolumeTest, BadACLNoPrincipal)
   EXPECT_FALSE(offers.get().empty());
 
   // Check that the persistent volume is still contained in this offer.
+  // TODO(greggomann): In addition to checking that the volume is contained in
+  // the offer, we should also confirm that the Destroy operation failed for the
+  // correct reason. See MESOS-5470.
   EXPECT_TRUE(Resources(offer.resources()).contains(volume));
 
   driver1.stop();
@@ -1296,9 +1542,14 @@ TEST_P(PersistentVolumeTest, BadACLDropCreateAndDestroy)
 
   // This ACL declares that all other principals
   // cannot create any persistent volumes.
-  mesos::ACL::CreateVolume* create = acls.add_create_volumes();
-  create->mutable_principals()->set_type(mesos::ACL::Entity::ANY);
-  create->mutable_roles()->set_type(mesos::ACL::Entity::NONE);
+  mesos::ACL::CreateVolume* create2 = acls.add_create_volumes();
+  create2->mutable_principals()->set_type(mesos::ACL::Entity::ANY);
+  create2->mutable_roles()->set_type(mesos::ACL::Entity::NONE);
+
+  // This ACL declares that no principal can destroy persistent volumes.
+  mesos::ACL::DestroyVolume* destroy = acls.add_destroy_volumes();
+  destroy->mutable_principals()->set_type(mesos::ACL::Entity::ANY);
+  destroy->mutable_creator_principals()->set_type(mesos::ACL::Entity::NONE);
 
   // We use the filter explicitly here so that the resources will not
   // be filtered for 5 seconds (the default).
@@ -1355,32 +1606,35 @@ TEST_P(PersistentVolumeTest, BadACLDropCreateAndDestroy)
 
   Offer offer = offers.get()[0];
 
-  Resource volume = createPersistentVolume(
-      getDiskResource(Megabytes(128)),
-      "id1",
-      "path1",
-      None());
+  {
+    Resource volume = createPersistentVolume(
+        getDiskResource(Megabytes(2048)),
+        "id1",
+        "path1",
+        None(),
+        frameworkInfo1.principal());
 
-  // Attempt to create a persistent volume using `acceptOffers`.
-  driver1.acceptOffers(
-      {offer.id()},
-      {CREATE(volume)},
-      filters);
+    // Attempt to create a persistent volume using `acceptOffers`.
+    driver1.acceptOffers(
+        {offer.id()},
+        {CREATE(volume)},
+        filters);
 
-  // Expect another offer.
-  EXPECT_CALL(sched1, resourceOffers(&driver1, _))
-    .WillOnce(FutureArg<1>(&offers));
+    // Expect another offer.
+    EXPECT_CALL(sched1, resourceOffers(&driver1, _))
+      .WillOnce(FutureArg<1>(&offers));
 
-  Clock::settle();
-  Clock::advance(masterFlags.allocation_interval);
+    Clock::settle();
+    Clock::advance(masterFlags.allocation_interval);
 
-  AWAIT_READY(offers);
-  EXPECT_FALSE(offers.get().empty());
+    AWAIT_READY(offers);
+    EXPECT_FALSE(offers.get().empty());
 
-  offer = offers.get()[0];
+    offer = offers.get()[0];
 
-  // Check that the persistent volume is not contained in this offer.
-  EXPECT_FALSE(Resources(offer.resources()).contains(volume));
+    // Check that the persistent volume is not contained in this offer.
+    EXPECT_FALSE(Resources(offer.resources()).contains(volume));
+  }
 
   // Decline the offer and suppress so the second
   // framework will receive the offer instead.
@@ -1407,6 +1661,13 @@ TEST_P(PersistentVolumeTest, BadACLDropCreateAndDestroy)
   EXPECT_FALSE(offers.get().empty());
 
   offer = offers.get()[0];
+
+  Resource volume = createPersistentVolume(
+      getDiskResource(Megabytes(2048)),
+      "id1",
+      "path1",
+      None(),
+      frameworkInfo2.principal());
 
   // Create a persistent volume using `acceptOffers`.
   driver2.acceptOffers(
@@ -1467,6 +1728,9 @@ TEST_P(PersistentVolumeTest, BadACLDropCreateAndDestroy)
   EXPECT_FALSE(offers.get().empty());
 
   // Check that the persistent volume is still contained in this offer.
+  // TODO(greggomann): In addition to checking that the volume is contained in
+  // the offer, we should also confirm that the Destroy operation failed for the
+  // correct reason. See MESOS-5470.
   EXPECT_TRUE(Resources(offer.resources()).contains(volume));
 
   driver1.stop();

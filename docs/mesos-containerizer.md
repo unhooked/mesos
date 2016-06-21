@@ -13,6 +13,7 @@ can selectively enable different isolators.
 It also provides basic support for POSIX systems (e.g., OSX) but
 without any actual isolation, only resource usage reporting.
 
+
 ### Shared Filesystem
 
 The SharedFilesystem isolator can optionally be used on Linux hosts to
@@ -21,7 +22,7 @@ filesystem.
 
 The modifications are specified in the ContainerInfo included in the
 ExecutorInfo, either by a framework or by using the
-`--default_container_info` slave flag.
+`--default_container_info` agent flag.
 
 ContainerInfo specifies Volumes which map parts of the shared
 filesystem (host\_path) into the container's view of the filesystem
@@ -41,6 +42,7 @@ executor's work directory (mode 1777) and simultaneously mount it as
 /tmp inside the container. This is transparent to processes running
 inside the container. Containers will not be able to see the host's
 /tmp or any other container's /tmp.
+
 
 ### Pid Namespace
 
@@ -69,20 +71,64 @@ The Posix Disk isolator provides basic disk isolation. It is able to
 report the disk usage for each sandbox and optionally enforce the disk
 quota. It can be used on both Linux and OS X.
 
-To enable the Posix Disk isolator, append `posix/disk` to the
-`--isolation` flag when starting the slave.
+To enable the Posix Disk isolator, append `disk/du` to the `--isolation`
+flag when starting the agent.
 
 By default, the disk quota enforcement is disabled. To enable it,
-specify `--enforce_container_disk_quota` when starting the slave.
+specify `--enforce_container_disk_quota` when starting the agent.
 
 The Posix Disk isolator reports disk usage for each sandbox by
 periodically running the `du` command. The disk usage can be retrieved
-from the resource statistics endpoint ([/monitor/statistics](endpoints/monitor/statistics.md)).
+from the resource statistics endpoint ([/monitor/statistics](endpoints/slave/monitor/statistics.md)).
 
-The interval between two `du`s can be controlled by the slave flag
+The interval between two `du`s can be controlled by the agent flag
 `--container_disk_watch_interval`. For example,
 `--container_disk_watch_interval=1mins` sets the interval to be 1
 minute. The default interval is 15 seconds.
+
+
+### XFS Disk Isolator
+
+The XFS Disk isolator uses XFS project quotas to track the disk
+space used by each container sandbox and to enforce the corresponding
+disk space allocation. Write operations performed by tasks exceeding
+their disk allocation will fail with an `EDQUOT` error. The task
+will not be terminated by the containerizer.
+
+The XFS disk isolator is functionally similar to Posix Disk isolator
+but avoids the cost of repeatedly running the `du`.  Though they will
+not interfere with each other, it is not recommended to use them together.
+
+To enable the XFS Disk isolator, append `disk/xfs` to the `--isolation`
+flag when starting the agent.
+
+The XFS Disk isolator requires the sandbox directory to be located
+on an XFS filesystem that is mounted with the `pquota` option. There
+is no need to configure
+[projects](http://man7.org/linux/man-pages/man5/projects.5.html)
+or [projid](http://man7.org/linux/man-pages/man5/projid.5.html)
+files. The range of project IDs given to the `--xfs_project_range`
+must not overlap any project IDs allocated for other uses.
+
+The XFS disk isolator does not natively support an accounting-only mode
+like that of the Posix Disk isolator. Quota enforcement can be disabled
+by mounting the filesystem with the `pqnoenforce` mount option.
+
+The [xfs_quota](http://man7.org/linux/man-pages/man8/xfs_quota.8.html)
+command can be used to show the current allocation of project IDs
+and quota. For example:
+
+    $ xfs_quota -x -c "report -a -n -L 5000 -U 1000"
+
+To show which project a file belongs to, use the
+[xfs_io](http://man7.org/linux/man-pages/man8/xfs_io.8.html) command
+to display the `fsxattr.projid` field. For example:
+
+    $ xfs_io -r -c stat /mnt/mesos/
+
+Note that the Posix Disk isolator flags `--enforce_container_disk_quota`,
+`--container_disk_watch_interval` and `--enforce_container_disk_quota` do
+not apply to the XFS Disk isolator.
 
 
 ### Docker Runtime Isolator
@@ -91,10 +137,10 @@ The Docker Runtime isolator is used for supporting runtime
 configurations from the docker image (e.g., Entrypoint/Cmd, Env,
 etc.). This isolator is tied with `--image_providers=docker`. If
 `--image_providers` contains `docker`, this isolator must be used.
-Otherwise, slave will refuse to start.
+Otherwise, agent will refuse to start.
 
 To enable the Docker Runtime isolator, append `docker/runtime` to the
-`--isolation` flag when starting the slave.
+`--isolation` flag when starting the agent.
 
 Currently, docker image default `Entrypoint`, `Cmd`, `Env` and
 `WorkingDir` are supported with docker runtime isolator. Users can
@@ -131,15 +177,15 @@ arguments.
     <td>sh=0<br>value=0<br>argv=0</td>
     <td>Error</td>
     <td>/Cmd[0]<br>Cmd[1]..</td>
-    <td>/Entrypt[0]<br>Entrypy[1]..</td>
-    <td>/Entrypy[0]<br>Entrypy[1]..<br>Cmd..</td>
+    <td>/Entrypt[0]<br>Entrypt[1]..</td>
+    <td>/Entrypt[0]<br>Entrypt[1]..<br>Cmd..</td>
   </tr>
   <tr>
     <td>sh=0<br>value=0<br>argv=1</td>
     <td>Error</td>
     <td>/Cmd[0]<br>argv</td>
-    <td>/Entrypt[0]<br>Entrypy[1]..<br>argv</td>
-    <td>/Entrypy[0]<br>Entrypy[1]..<br>argv</td>
+    <td>/Entrypt[0]<br>Entrypt[1]..<br>argv</td>
+    <td>/Entrypt[0]<br>Entrypt[1]..<br>argv</td>
   </tr>
   <tr>
     <td>sh=0<br>value=1<br>argv=0</td>
@@ -191,7 +237,7 @@ arguments.
 The cgroups/net_cls isolator allows operators to provide network
 performance isolation and network segmentation for containers within
 a Mesos cluster. To enable the cgroups/net_cls isolator, append
-`cgroups/net_cls` to the `--isolation` flag when starting the slave.
+`cgroups/net_cls` to the `--isolation` flag when starting the agent.
 
 As the name suggests, the isolator enables the net_cls subsystem for
 Linux cgroups and assigns a net_cls cgroup to each container launched
@@ -219,13 +265,23 @@ handles, and assumes the operator is going to manage/assign these
 handles. To enable the management of net_cls handles by the
 cgroups/net_cls isolator you need to specify a 16-bit primary handle,
 of the form 0xAAAA, using the `--cgroups_net_cls_primary_handle` flag at
-slave startup.
+agent startup.
 
-Once a primary handle has been specified for a slave, for each
+Once a primary handle has been specified for a agent, for each
 container the cgroups/net_cls isolator allocates a 16-bit secondary
 handle. It then assigns the 32-bit combination of the primary and
 secondary handle to the net_cls cgroup associated with the container
 by writing to `net_cls.classid`. The cgroups/net_cls isolator exposes
 the assigned net_cls handle to operators by exposing the handle as
 part of the `ContainerStatus` &mdash;associated with any task running within
-the container&mdash; in the slave's `state` endpoint.
+the container&mdash; in the agent's [/state](endpoints/slave/state.md) endpoint.
+
+
+### The `docker/volume` Isolator
+
+This is described in a [separate document](docker-volume.md).
+
+
+### The `network/cni` Isolator
+
+This is described in a [separate document](cni.md).

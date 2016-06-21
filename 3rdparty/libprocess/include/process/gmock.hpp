@@ -275,7 +275,7 @@ public:
   TestsFilter* install()
   {
     if (!started) {
-      EXIT(1)
+      EXIT(EXIT_FAILURE)
         << "To use FUTURE/DROP_MESSAGE/DISPATCH, etc. you need to do the "
         << "following before you invoke RUN_ALL_TESTS():\n\n"
         << "\t::testing::TestEventListeners& listeners =\n"
@@ -283,7 +283,7 @@ public:
         << "\tlisteners.Append(process::FilterTestEventListener::instance());";
     }
 
-    if (filter != NULL) {
+    if (filter != nullptr) {
       return filter;
     }
 
@@ -302,16 +302,16 @@ public:
 
   virtual void OnTestEnd(const ::testing::TestInfo&)
   {
-    if (filter != NULL) {
+    if (filter != nullptr) {
       // Remove the filter in libprocess _before_ deleting.
-      process::filter(NULL);
+      process::filter(nullptr);
       delete filter;
-      filter = NULL;
+      filter = nullptr;
     }
   }
 
 private:
-  FilterTestEventListener() : filter(NULL), started(false) {}
+  FilterTestEventListener() : filter(nullptr), started(false) {}
 
   TestsFilter* filter;
 

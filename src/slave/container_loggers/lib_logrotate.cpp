@@ -140,9 +140,9 @@ public:
         Subprocess::FD(outfds.read, Subprocess::IO::OWNED),
         Subprocess::PATH("/dev/null"),
         Subprocess::FD(STDERR_FILENO),
+        NO_SETSID,
         outFlags,
         environment,
-        None(),
         None(),
         parentHooks);
 
@@ -187,9 +187,9 @@ public:
         Subprocess::FD(errfds.read, Subprocess::IO::OWNED),
         Subprocess::PATH("/dev/null"),
         Subprocess::FD(STDERR_FILENO),
+        NO_SETSID,
         errFlags,
         environment,
-        None(),
         None(),
         parentHooks);
 
@@ -267,7 +267,7 @@ org_apache_mesos_LogrotateContainerLogger(
     "Apache Mesos",
     "modules@mesos.apache.org",
     "Logrotate Container Logger module.",
-    NULL,
+    nullptr,
     [](const Parameters& parameters) -> ContainerLogger* {
       // Convert `parameters` into a map.
       std::map<std::string, std::string> values;
@@ -277,11 +277,16 @@ org_apache_mesos_LogrotateContainerLogger(
 
       // Load and validate flags from the map.
       mesos::internal::logger::Flags flags;
-      Try<Nothing> load = flags.load(values);
+      Try<flags::Warnings> load = flags.load(values);
 
       if (load.isError()) {
         LOG(ERROR) << "Failed to parse parameters: " << load.error();
-        return NULL;
+        return nullptr;
+      }
+
+      // Log any flag warnings.
+      foreach (const flags::Warning& warning, load->warnings) {
+        LOG(WARNING) << warning.message;
       }
 
       return new mesos::internal::logger::LogrotateContainerLogger(flags);

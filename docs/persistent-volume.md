@@ -16,12 +16,15 @@ such as HDFS and Cassandra to store their data within Mesos rather than having
 to resort to workarounds (e.g., writing task state to a distributed filesystem
 that is mounted at a well-known location outside the task's sandbox).
 
+## Usage
+
 Persistent volumes can only be created from __reserved__ disk resources, whether
 it be statically reserved or dynamically reserved. A dynamically reserved
 persistent volume also cannot be unreserved without first explicitly destroying
 the volume. These rules exist to limit accidental mistakes, such as a persistent
 volume containing sensitive data being offered to other frameworks in the
-cluster.
+cluster. Similarly, a persistent volume cannot be destroyed if there is an
+active task that is still using the volume.
 
 Please refer to the [Reservation](reservation.md) documentation for details
 regarding reservation mechanisms available in Mesos.
@@ -30,8 +33,8 @@ Persistent volumes can also be created on isolated and auxiliary disks by
 reserving [multiple disk resources](multiple-disk.md).
 
 Persistent volumes can be created by __operators__ and authorized
-__frameworks__. By default, frameworks and operators can create volumes for any
-role and destroy any persistent volumes. [Authorization](authorization.md)
+__frameworks__. By default, frameworks and operators can create volumes for _any_
+role and destroy _any_ persistent volume. [Authorization](authorization.md)
 allows this behavior to be limited so that volumes can only be created for
 particular roles and only particular volumes can be destroyed. For these
 operations to be authorized, the framework or operator should provide a
@@ -46,12 +49,18 @@ appropriate ACLs. For more information, see the
 * `/create-volumes` and `/destroy-volumes` HTTP endpoints allow
   __operators__ to manage persistent volumes through the master.
 
+When a persistent volume is destroyed, all the data on that volume is removed
+from the agent's filesystem. Note that for persistent volumes created on `Mount`
+disks, the root directory is not removed, because it is typically the mount
+point used for a separate storage device.
+
 In the following sections, we will walk through examples of each of the
 interfaces described above.
 
-### Framework Scheduler API
+## Framework Scheduler API
 
-#### `Offer::Operation::Create`
+<a name="offer-operation-create"></a>
+### `Offer::Operation::Create`
 
 A framework can create volumes through the resource offer cycle.  Suppose we
 receive a resource offer with 2048 MB of dynamically reserved disk.
@@ -79,9 +88,16 @@ an `Offer::Operation` message via the `acceptOffers` API.
 `Offer::Operation::Create` has a `volumes` field which specifies the persistent
 volume information. We need to specify the following:
 
-1. The ID for the persistent volume; this must be unique per role on each slave.
-1. The non-nested relative path within the container to mount the volume.
-1. The permissions for the volume. Currently, `"RW"` is the only possible value.
+1. The ID for the persistent volume; this must be unique per role on each agent.
+2. The non-nested relative path within the container to mount the volume.
+3. The permissions for the volume. Currently, `"RW"` is the only possible value.
+4. If the framework provided a principal when registering with the master, then
+   the `disk.persistence.principal` field must be set to that principal. If the
+   framework did not provide a principal when registering, then the
+   `disk.persistence.principal` field can take any value, or can be left unset.
+   Note that the `principal` field determines the "creator principal" when
+   [authorization](authorization.md) is enabled, even if authentication is
+   disabled.
 
         {
           "type" : Offer::Operation::CREATE,
@@ -97,7 +113,8 @@ volume information. We need to specify the following:
                 },
                 "disk": {
                   "persistence": {
-                    "id" : <persistent_volume_id>
+                    "id" : <persistent_volume_id>,
+                    "principal" : <framework_principal>
                   },
                   "volume" : {
                     "container_path" : <container_path>,
@@ -139,13 +156,13 @@ persistent volume:
       ]
     }
 
-#### `Offer::Operation::Destroy`
+### `Offer::Operation::Destroy`
 
 A framework can destroy persistent volumes through the resource offer cycle. In
-[Offer::Operation::Create](#offeroperationcreate), we created a persistent
-volume from 2048 MB of disk resources. Mesos will not garbage-collect this
-volume until we explicitly destroy it. Suppose we would like to destroy the
-volume we created. First, we receive a resource offer (copy/pasted from above):
+[Offer::Operation::Create](#offer-operation-create), we created a persistent
+volume from 2048 MB of disk resources. The volume will continue to exist until
+it is explicitly destroyed. Suppose we would like to destroy the volume we
+created. First, we receive a resource offer (copy/pasted from above):
 
     {
       "id" : <offer_id>,
@@ -174,7 +191,7 @@ volume we created. First, we receive a resource offer (copy/pasted from above):
       ]
     }
 
-We destroy the persistent volume by sending the `Offer::Operation` message via
+We can destroy the persistent volume by sending a `Offer::Operation` message via
 the `acceptOffers` API. `Offer::Operation::Destroy` has a `volumes` field which
 specifies the persistent volumes to be destroyed.
 
@@ -204,8 +221,9 @@ specifies the persistent volumes to be destroyed.
       }
     }
 
-If this request succeeds, the persistent volume will be destroyed but the disk
-resources will still be reserved. As such, a subsequent resource offer will
+If this request succeeds, the persistent volume will be destroyed, and all the
+files and directories associated with the volume will be deleted. However, the
+disk resources will still be reserved. As such, a subsequent resource offer will
 contain the following reserved disk resources:
 
     {
@@ -229,12 +247,7 @@ contain the following reserved disk resources:
 Those reserved resources can then be used as normal: e.g., they can be used to
 create another persistent volume or can be unreserved.
 
-Garbage collection for persistent volumes is planned but has not been
-implemented yet -- [MESOS-2408](https://issues.apache.org/jira/browse/MESOS-2408).
-In the mean time, even after you destroy a persistent volume, its content will
-remain on disk.
-
-### Operator HTTP Endpoints
+## Operator HTTP Endpoints
 
 As described above, persistent volumes can be created by a framework scheduler
 as part of the resource offer cycle. Persistent volumes can also be created and
@@ -242,12 +255,20 @@ destroyed by sending HTTP requests to the `/create-volumes` and
 `/destroy-volumes` endpoints, respectively. This capability is intended for use
 by operators and administrative tools.
 
-#### `/create-volumes`
+### `/create-volumes`
 
 To use this endpoint, the operator should first ensure that a reservation for
-the necessary resources has been made on the appropriate slave (e.g., by using
+the necessary resources has been made on the appropriate agent (e.g., by using
 the [/reserve](endpoints/master/reserve.md) HTTP endpoint or by configuring a
-static reservation).
+static reservation). The information that must be included in a request to this
+endpoint is similar to that of the `CREATE` offer operation. One difference is
+the required value of the `disk.persistence.principal` field: when HTTP
+authentication is enabled on the master, the field must be set to the same
+principal that is provided in the request's HTTP headers. When HTTP
+authentication is disabled, the `disk.persistence.principal` field can take any
+value, or can be left unset. Note that the `principal` field determines the
+"creator principal" when [authorization](authorization.md) is enabled, even if
+HTTP authentication is disabled.
 
 To create a 512MB persistent volume for the `ads` role on a dynamically reserved
 disk resource, we can send an HTTP POST request to the master's
@@ -267,7 +288,8 @@ disk resource, we can send an HTTP POST request to the master's
              },
              "disk": {
                "persistence": {
-                 "id" : <persistence_id>
+                 "id" : <persistence_id>,
+                 "principal" : <operator_principal>
                },
                "volume": {
                  "mode": "RW",
@@ -280,26 +302,25 @@ disk resource, we can send an HTTP POST request to the master's
 
 The user receives one of the following HTTP responses:
 
-* `200 OK`: Request accepted (see below).
+* `202 Accepted`: Request accepted (see below).
 * `400 BadRequest`: Invalid arguments (e.g., missing parameters).
 * `401 Unauthorized`: Unauthenticated request.
 * `403 Forbidden`: Unauthorized request.
 * `409 Conflict`: Insufficient resources to create the volumes.
 
 A single `/create-volumes` request can create multiple persistent volumes, but
-all of the volumes must be on the same slave.
+all of the volumes must be on the same agent.
 
-Note that when `200 OK` is returned by this endpoint, it does __not__ mean that
-the persistent volumes have been created successfully. Instead, this return code
-indicates that the create operation has been validated successfully by the
-master. The request is then forwarded asynchronously to the Mesos slave where
-the reserved resources are located. That asynchronous message may not be
-delivered or creating the volumes at the slave might fail, in which case no
-volumes will be created. To determine if a create operation has succeeded, the
-user can examine the state of the appropriate Mesos slave (e.g., via the slave's
+This endpoint returns the 202 ACCEPTED HTTP status code, which indicates that
+the create operation has been validated successfully by the master. The request
+is then forwarded asynchronously to the Mesos agent where the reserved
+resources are located. That asynchronous message may not be delivered or
+creating the volumes at the agent might fail, in which case no volumes will be
+created. To determine if a create operation has succeeded, the user can examine
+the state of the appropriate Mesos agent (e.g., via the agent's
 [/state](endpoints/slave/state.md) HTTP endpoint).
 
-#### `/destroy-volumes`
+### `/destroy-volumes`
 
 To destroy the volume created above, we can send an HTTP POST to the master's
 [/destroy-volumes](endpoints/master/destroy-volumes.md) endpoint like so:
@@ -331,32 +352,31 @@ To destroy the volume created above, we can send an HTTP POST to the master's
 
 The user receives one of the following HTTP responses:
 
-* `200 OK`: Request accepted (see below).
+* `202 Accepted`: Request accepted (see below).
 * `400 BadRequest`: Invalid arguments (e.g., missing parameters).
 * `401 Unauthorized`: Unauthenticated request.
 * `403 Forbidden`: Unauthorized request.
 * `409 Conflict`: Insufficient resources to destroy the volumes.
 
 A single `/destroy-volumes` request can destroy multiple persistent volumes, but
-all of the volumes must be on the same slave.
+all of the volumes must be on the same agent.
 
-Note that when `200 OK` is returned by this endpoint, it does __not__ mean that
-the persistent volumes have been destroyed successfully. Instead, this return
-code indicates that the destroy operation has been validated successfully by the
-master. The request is then forwarded asynchronously to the Mesos slave where
-the persistent volumes are located. That asynchronous message may not be
-delivered or destroying the volumes at the slave might fail, in which case no
-volumes will be destroyed. To determine if a destroy operation has succeeded,
-the user can examine the state of the appropriate Mesos slave (e.g., via the
-slave's [/state](endpoints/slave/state.md) HTTP endpoint).
+This endpoint returns the 202 ACCEPTED HTTP status code, which indicates that
+the destroy operation has been validated successfully by the master. The
+request is then forwarded asynchronously to the Mesos agent where the reserved
+resources are located. That asynchronous message may not be delivered or
+destroying the volumes at the agent might fail, in which case no volumes will
+be destroyed. To determine if a destroy operation has succeeded, the user can
+examine the state of the appropriate Mesos agent (e.g., via the agent's
+[/state](endpoints/slave/state.md) HTTP endpoint).
 
-### Listing Persistent Volumes
+## Listing Persistent Volumes
 
-Information about the persistent volumes at each slave in the cluster can be
+Information about the persistent volumes at each agent in the cluster can be
 found by querying the [/slaves](endpoints/master/slaves.md) master endpoint
 (under the `reserved_resources_full` key).
 
-### Programming with Persistent Volumes
+## Programming with Persistent Volumes
 
 Some suggestions to keep in mind when building applications that use persistent
 volumes:
@@ -364,6 +384,16 @@ volumes:
 * A single `acceptOffers` call can be used to both create a new dynamic
   reservation (via `Offer::Operation::Reserve`) and create a new persistent
   volume on those newly reserved resources (via `Offer::Operation::Create`).
+
+* Volume IDs must be unique per role on each agent. However, it is strongly
+  recommended that frameworks use globally unique volume IDs, to avoid potential
+  confusion between volumes on different agents that use the same volume
+  ID. Note also that the agent ID where a volume resides might change over
+  time. For example, suppose a volume is created on an agent and then the
+  agent's host machine is rebooted. When the agent registers with Mesos after
+  the reboot, it will be assigned a new AgentID---but it will retain the same
+  volume it had previouly. Hence, frameworks should not assume that using the
+  pair <AgentID, VolumeID> is a stable way to identify a volume in a cluster.
 
 * Attempts to dynamically reserve resources or create persistent volumes might
   fail---for example, because the network message containing the operation did
@@ -373,7 +403,7 @@ volumes:
 
 * When using HTTP endpoints to reserve resources or create persistent volumes,
   _some_ failures can be detected by examining the HTTP response code returned
-  to the client. However, it is still possible for a `200` response code to be
+  to the client. However, it is still possible for a `202` response code to be
   returned to the client but for the associated operation to fail---see
   discussion above.
 
@@ -440,3 +470,13 @@ volumes:
   frameworks are configured to collaborate with one another when using
   role-specific resources. For more information, see the discussion of
   [multiple frameworks in the same role](roles.md#roles-multiple-frameworks).
+
+## Version History
+
+Persistent volumes were introduced in Mesos 0.23. Mesos 0.27 introduced HTTP
+endpoints for creating and destroying volumes. Mesos 0.28 introduced support for
+[multiple disk resources](multiple-disk.md), and also enhanced the `/slaves`
+master endpoint to include detailed information about persistent volumes and
+dynamic reservations. Mesos 1.0 changed the semantics of destroying a volume:
+in previous releases, destroying a volume would remove the Mesos-level metadata,
+but would not remove the volume's data from the agent's filesystem.

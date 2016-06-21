@@ -413,7 +413,7 @@ Future<Nothing> CgroupsNetClsIsolatorProcess::recover(
   }
 
   foreach (const string& cgroup, cgroups.get()) {
-    // Ignore the slave cgroup (see the --slave_subsystems flag).
+    // Ignore the slave cgroup (see the --agent_subsystems flag).
     // TODO(idownes): Remove this when the cgroups layout is updated,
     // see MESOS-1185.
     if (cgroup == path::join(flags.cgroups_root, "slave")) {
@@ -468,20 +468,6 @@ Future<Nothing> CgroupsNetClsIsolatorProcess::update(
     const Resources& resources)
 {
   return Nothing();
-}
-
-
-// The net_cls handles aren't treated as resources. Further, they have
-// fixed values and hence don't have a notion of usage. We are
-// therefore returning an empty 'ResourceStatistics' object.
-Future<ResourceStatistics> CgroupsNetClsIsolatorProcess::usage(
-    const ContainerID& containerId)
-{
-  if (!infos.contains(containerId)) {
-    return Failure("Unknown container");
-  }
-
-  return ResourceStatistics();
 }
 
 

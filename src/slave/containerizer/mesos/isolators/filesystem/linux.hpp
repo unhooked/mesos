@@ -54,19 +54,9 @@ public:
       const ContainerID& containerId,
       const mesos::slave::ContainerConfig& containerConfig);
 
-  virtual process::Future<Nothing> isolate(
-      const ContainerID& containerId,
-      pid_t pid);
-
-  virtual process::Future<mesos::slave::ContainerLimitation> watch(
-      const ContainerID& containerId);
-
   virtual process::Future<Nothing> update(
       const ContainerID& containerId,
       const Resources& resources);
-
-  virtual process::Future<ResourceStatistics> usage(
-      const ContainerID& containerId);
 
   virtual process::Future<Nothing> cleanup(
       const ContainerID& containerId);
@@ -76,7 +66,6 @@ private:
 
   Try<std::string> script(
       const ContainerID& containerId,
-      const ExecutorInfo& executorInfo,
       const mesos::slave::ContainerConfig& containerConfig);
 
   const Flags flags;
@@ -85,17 +74,17 @@ private:
   {
     Info(const std::string& _directory) : directory(_directory) {}
 
-    const std::string directory;
+    Info(const std::string& _directory,
+         const ExecutorInfo& _executor)
+      : directory(_directory),
+        executor(_executor) {}
 
-    // The absolute path to the container's work directory mount point
-    // in the new root filesystem if the container changes its root
-    // filesystem (i.e., '<rootfs>/<flags.sandbox_directory>'). If the
-    // container does not specify a root filesystem, this field will
-    // not be set.
-    Option<std::string> sandbox;
+    const std::string directory;
 
     // Track resources so we can unmount unneeded persistent volumes.
     Resources resources;
+
+    Option<ExecutorInfo> executor;
   };
 
   hashmap<ContainerID, process::Owned<Info>> infos;

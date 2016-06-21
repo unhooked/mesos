@@ -57,9 +57,12 @@ using mesos::internal::master::Master;
 
 using mesos::internal::protobuf::createLabel;
 
+using mesos::internal::slave::DockerContainerizer;
 using mesos::internal::slave::Fetcher;
 using mesos::internal::slave::MesosContainerizer;
 using mesos::internal::slave::Slave;
+
+using mesos::master::detector::MasterDetector;
 
 using mesos::slave::ContainerLogger;
 
@@ -93,6 +96,7 @@ const char* testLabelKey = "MESOS_Test_Label";
 const char* testLabelValue = "ApacheMesos";
 const char* testRemoveLabelKey = "MESOS_Test_Remove_Label";
 const char* testRemoveLabelValue = "FooBar";
+const char* testErrorLabelKey = "MESOS_Test_Error_Label";
 const char* testEnvironmentVariableName = "MESOS_TEST_ENVIRONMENT_VARIABLE";
 
 class HookTest : public MesosTest
@@ -232,8 +236,8 @@ TEST_F(HookTest, MasterSlaveLostHookTest)
   master::Flags masterFlags = CreateMasterFlags();
 
   // Speed up timeout cycles.
-  masterFlags.slave_ping_timeout = Seconds(1);
-  masterFlags.max_slave_ping_timeouts = 1;
+  masterFlags.agent_ping_timeout = Seconds(1);
+  masterFlags.max_agent_ping_timeouts = 1;
 
   Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
   ASSERT_SOME(master);
@@ -255,7 +259,7 @@ TEST_F(HookTest, MasterSlaveLostHookTest)
 
   // Forward clock slave timeout.
   Duration totalTimeout =
-    masterFlags.slave_ping_timeout * masterFlags.max_slave_ping_timeouts;
+    masterFlags.agent_ping_timeout * masterFlags.max_agent_ping_timeouts;
 
   Clock::pause();
   Clock::advance(totalTimeout);
@@ -363,7 +367,9 @@ TEST_F(HookTest, VerifySlaveLaunchExecutorHook)
 
   // Executor shutdown would force the Slave to execute the
   // remove-executor hook.
-  EXPECT_CALL(exec, shutdown(_));
+  Future<Nothing> shutdown;
+  EXPECT_CALL(exec, shutdown(_))
+    .WillOnce(FutureSatisfy(&shutdown));;
 
   Future<TaskStatus> status;
   EXPECT_CALL(sched, statusUpdate(&driver, _))
@@ -381,6 +387,10 @@ TEST_F(HookTest, VerifySlaveLaunchExecutorHook)
 
   driver.stop();
   driver.join();
+
+  // Explicitly destroy the container.
+  AWAIT_READY(shutdown);
+  containerizer.destroy(offers.get()[0].framework_id(), DEFAULT_EXECUTOR_ID);
 
   // The scheduler shutdown from above forces the executor to
   // shutdown. This in turn should force the Slave to execute
@@ -578,9 +588,6 @@ TEST_F(HookTest, VerifySlaveTaskStatusDecorator)
   // network isolation group. The `ip_address` field is deprecated, but the
   // hook module should continue to set it as well as the new `ip_addresses`
   // field for now.
-  EXPECT_TRUE(networkInfo.has_ip_address());
-  EXPECT_EQ("4.3.2.1", networkInfo.ip_address());
-
   EXPECT_EQ(1, networkInfo.ip_addresses().size());
   EXPECT_TRUE(networkInfo.ip_addresses(0).has_ip_address());
   EXPECT_EQ("4.3.2.1", networkInfo.ip_addresses(0).ip_address());
@@ -599,6 +606,202 @@ TEST_F(HookTest, VerifySlaveTaskStatusDecorator)
 
   EXPECT_CALL(exec, shutdown(_))
     .Times(AtMost(1));
+
+  driver.stop();
+  driver.join();
+}
+
+
+// This test verifies that the slave pre-launch docker environment
+// decorator can attach environment variables to a task.
+TEST_F(HookTest, ROOT_DOCKER_VerifySlavePreLaunchDockerEnvironmentDecorator)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  MockDocker* mockDocker =
+    new MockDocker(tests::flags.docker, tests::flags.docker_socket);
+
+  Shared<Docker> docker(mockDocker);
+
+  slave::Flags flags = CreateSlaveFlags();
+
+  Fetcher fetcher;
+
+  Try<ContainerLogger*> logger =
+    ContainerLogger::create(flags.container_logger);
+
+  ASSERT_SOME(logger);
+
+  MockDockerContainerizer containerizer(
+      flags,
+      &fetcher,
+      Owned<ContainerLogger>(logger.get()),
+      docker);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  Try<Owned<cluster::Slave>> slave =
+    StartSlave(detector.get(), &containerizer, flags);
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(&driver, _, _));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  ASSERT_EQ(1u, offers.get().size());
+
+  TaskInfo task = createTask(
+      offers.get()[0],
+      "test \"$FOO_DOCKER\" = 'docker_bar'");
+
+  ContainerInfo containerInfo;
+  containerInfo.set_type(ContainerInfo::DOCKER);
+
+  // TODO(tnachen): Use local image to test if possible.
+  ContainerInfo::DockerInfo dockerInfo;
+  dockerInfo.set_image("alpine");
+  containerInfo.mutable_docker()->CopyFrom(dockerInfo);
+
+  task.mutable_container()->CopyFrom(containerInfo);
+
+  Future<ContainerID> containerId;
+  EXPECT_CALL(containerizer, launch(_, _, _, _, _, _, _, _))
+    .WillOnce(DoAll(FutureArg<0>(&containerId),
+                    Invoke(&containerizer,
+                           &MockDockerContainerizer::_launch)));
+
+  Future<TaskStatus> statusRunning;
+  Future<TaskStatus> statusFinished;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusRunning))
+    .WillOnce(FutureArg<1>(&statusFinished))
+    .WillRepeatedly(DoDefault());
+
+  driver.launchTasks(offers.get()[0].id(), {task});
+
+  AWAIT_READY_FOR(containerId, Seconds(60));
+  AWAIT_READY_FOR(statusRunning, Seconds(60));
+  EXPECT_EQ(TASK_RUNNING, statusRunning.get().state());
+  AWAIT_READY_FOR(statusFinished, Seconds(60));
+  EXPECT_EQ(TASK_FINISHED, statusFinished.get().state());
+
+  Future<containerizer::Termination> termination =
+    containerizer.wait(containerId.get());
+
+  driver.stop();
+  driver.join();
+
+  AWAIT_READY(termination);
+
+  Future<list<Docker::Container>> containers =
+    docker.get()->ps(true, slave::DOCKER_NAME_PREFIX);
+
+  AWAIT_READY(containers);
+
+  // Cleanup all mesos launched containers.
+  foreach (const Docker::Container& container, containers.get()) {
+    AWAIT_READY_FOR(docker.get()->rm(container.id, true), Seconds(30));
+  }
+}
+
+
+// This test verifies that the slave pre-launch docker validator hook can check
+// labels on a task and subsequently prevent the task from being launched
+// if a specific label is present.
+TEST_F(HookTest, ROOT_DOCKER_VerifySlavePreLaunchDockerValidator)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  MockDocker* mockDocker =
+    new MockDocker(tests::flags.docker, tests::flags.docker_socket);
+
+  Shared<Docker> docker(mockDocker);
+
+  slave::Flags flags = CreateSlaveFlags();
+
+  Fetcher fetcher;
+
+  Try<ContainerLogger*> logger =
+    ContainerLogger::create(flags.container_logger);
+
+  ASSERT_SOME(logger);
+
+  MockDockerContainerizer containerizer(
+      flags,
+      &fetcher,
+      Owned<ContainerLogger>(logger.get()),
+      docker);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  Try<Owned<cluster::Slave>> slave =
+    StartSlave(detector.get(), &containerizer, flags);
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+  MesosSchedulerDriver driver(
+      &sched, DEFAULT_FRAMEWORK_INFO, master.get()->pid, DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(&driver, _, _));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  ASSERT_EQ(1u, offers.get().size());
+
+  TaskInfo task;
+  task.set_name("");
+  task.mutable_task_id()->set_value("1");
+  task.mutable_slave_id()->CopyFrom(offers.get()[0].slave_id());
+  task.mutable_resources()->CopyFrom(offers.get()[0].resources());
+
+  // Add a special label which the validator hook checks for.
+  // The existence of this label will cause the hook to reject the task.
+  Labels* labels = task.mutable_labels();
+  labels->add_labels()->CopyFrom(
+      createLabel(testErrorLabelKey, testLabelValue));
+
+  ContainerInfo containerInfo;
+  containerInfo.set_type(ContainerInfo::DOCKER);
+
+  CommandInfo command;
+  command.set_value("exit 0");
+
+  // TODO(tnachen): Use local image to test if possible.
+  ContainerInfo::DockerInfo dockerInfo;
+  dockerInfo.set_image("alpine");
+  containerInfo.mutable_docker()->CopyFrom(dockerInfo);
+
+  task.mutable_command()->CopyFrom(command);
+  task.mutable_container()->CopyFrom(containerInfo);
+
+  driver.launchTasks(offers.get()[0].id(), {task});
+
+  Future<TaskStatus> statusError;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusError));
+
+  AWAIT_READY(statusError);
+
+  EXPECT_EQ(TASK_FAILED, statusError.get().state());
+  EXPECT_EQ(TaskStatus::REASON_CONTAINER_LAUNCH_FAILED, statusError->reason());
 
   driver.stop();
   driver.join();
@@ -727,6 +930,119 @@ TEST_F(HookTest, ROOT_DOCKER_VerifySlavePreLaunchDockerHook)
     AWAIT_READY_FOR(docker.get()->rm(container.id, true), Seconds(30));
   }
 }
+
+
+// Test that the slave post fetch hook is executed after fetching the
+// URIs but before the container is launched. We launch a command task
+// with a file URI (file name is "post_fetch_hook"). The test hook
+// will try to delete that file in the sandbox directory. We validate
+// the hook by verifying that "post_fetch_hook" file does not exist in
+// the sandbox when container is running.
+TEST_F(HookTest, ROOT_DOCKER_VerifySlavePostFetchHook)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  Try<Owned<Docker>> _docker = Docker::create(
+      tests::flags.docker,
+      tests::flags.docker_socket);
+  ASSERT_SOME(_docker);
+
+  Shared<Docker> docker = _docker->share();
+
+  slave::Flags flags = CreateSlaveFlags();
+
+  Fetcher fetcher;
+
+  Try<ContainerLogger*> logger =
+    ContainerLogger::create(flags.container_logger);
+  ASSERT_SOME(logger);
+
+  DockerContainerizer containerizer(
+      flags,
+      &fetcher,
+      Owned<ContainerLogger>(logger.get()),
+      docker);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+
+  Try<Owned<cluster::Slave>> slave = StartSlave(
+      detector.get(),
+      &containerizer,
+      flags);
+  ASSERT_SOME(slave);
+
+  MockScheduler sched;
+
+  MesosSchedulerDriver driver(
+      &sched,
+      DEFAULT_FRAMEWORK_INFO,
+      master.get()->pid,
+      DEFAULT_CREDENTIAL);
+
+  EXPECT_CALL(sched, registered(&driver, _, _));
+
+  Future<vector<Offer>> offers;
+  EXPECT_CALL(sched, resourceOffers(&driver, _))
+    .WillOnce(FutureArg<1>(&offers))
+    .WillRepeatedly(Return()); // Ignore subsequent offers.
+
+  driver.start();
+
+  AWAIT_READY(offers);
+  ASSERT_NE(0u, offers->size());
+
+  TaskInfo task = createTask(
+      offers.get()[0].slave_id(),
+      Resources::parse("cpus:1;mem:128").get(),
+      "test ! -f " + path::join(flags.sandbox_directory, "post_fetch_hook"));
+
+  // Add a URI for a file on the host filesystem. This file will be
+  // fetched to the sandbox and will later be deleted by the hook.
+  const string file = path::join(sandbox.get(), "post_fetch_hook");
+  ASSERT_SOME(os::touch(file));
+
+  CommandInfo::URI* uri = task.mutable_command()->add_uris();
+  uri->set_value(file);
+
+  ContainerInfo* containerInfo = task.mutable_container();
+  containerInfo->set_type(ContainerInfo::DOCKER);
+
+  ContainerInfo::DockerInfo* dockerInfo = containerInfo->mutable_docker();
+  dockerInfo->set_image("alpine");
+
+  Future<TaskStatus> statusRunning;
+  Future<TaskStatus> statusFinished;
+  EXPECT_CALL(sched, statusUpdate(&driver, _))
+    .WillOnce(FutureArg<1>(&statusRunning))
+    .WillOnce(FutureArg<1>(&statusFinished));
+
+  driver.launchTasks(offers.get()[0].id(), {task});
+
+  AWAIT_READY_FOR(statusRunning, Seconds(60));
+  EXPECT_EQ(TASK_RUNNING, statusRunning.get().state());
+
+  AWAIT_READY_FOR(statusFinished, Seconds(60));
+  EXPECT_EQ(TASK_FINISHED, statusFinished.get().state());
+
+  driver.stop();
+  driver.join();
+
+  Future<list<Docker::Container>> containers =
+    docker->ps(true, slave::DOCKER_NAME_PREFIX);
+
+  AWAIT_READY(containers);
+
+  // Cleanup all mesos launched containers.
+  foreach (const Docker::Container& container, containers.get()) {
+    AWAIT_READY_FOR(docker->rm(container.id, true), Seconds(30));
+  }
+}
+
+
+// TODO(jieyu): Add a test for slavePostFetchHook using Mesos
+// containerizer.
+
 
 // Test that the changes made by the resources decorator hook are correctly
 // propagated to the resource offer.

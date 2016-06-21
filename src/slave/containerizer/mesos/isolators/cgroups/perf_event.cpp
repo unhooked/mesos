@@ -175,7 +175,7 @@ Future<Nothing> CgroupsPerfEventIsolatorProcess::recover(
   }
 
   foreach (const string& cgroup, cgroups.get()) {
-    // Ignore the slave cgroup (see the --slave_subsystems flag).
+    // Ignore the slave cgroup (see the --agent_subsystems flag).
     // TODO(idownes): Remove this when the cgroups layout is updated,
     // see MESOS-1185.
     if (cgroup == path::join(flags.cgroups_root, "slave")) {
@@ -275,23 +275,6 @@ Future<Nothing> CgroupsPerfEventIsolatorProcess::isolate(
                    "' : " + assign.error());
   }
 
-  return Nothing();
-}
-
-
-Future<ContainerLimitation> CgroupsPerfEventIsolatorProcess::watch(
-    const ContainerID& containerId)
-{
-  // No resources are limited.
-  return Future<ContainerLimitation>();
-}
-
-
-Future<Nothing> CgroupsPerfEventIsolatorProcess::update(
-    const ContainerID& containerId,
-    const Resources& resources)
-{
-  // Nothing to update.
   return Nothing();
 }
 

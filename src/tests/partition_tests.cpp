@@ -33,6 +33,8 @@
 
 #include "master/allocator/mesos/allocator.hpp"
 
+#include "master/detector/standalone.hpp"
+
 #include "slave/constants.hpp"
 #include "slave/flags.hpp"
 #include "slave/slave.hpp"
@@ -47,6 +49,9 @@ using mesos::internal::master::allocator::MesosAllocatorProcess;
 
 using mesos::internal::slave::Slave;
 
+using mesos::master::detector::MasterDetector;
+using mesos::master::detector::StandaloneMasterDetector;
+
 using process::Clock;
 using process::Future;
 using process::Message;
@@ -60,19 +65,28 @@ using testing::AtMost;
 using testing::Eq;
 using testing::Return;
 
+using ::testing::WithParamInterface;
+
 namespace mesos {
 namespace internal {
 namespace tests {
 
 
-class PartitionTest : public MesosTest {};
+class PartitionTest : public MesosTest,
+                      public WithParamInterface<bool> {};
+
+
+// The Registrar tests are parameterized by "strictness".
+INSTANTIATE_TEST_CASE_P(Strict, PartitionTest, ::testing::Bool());
 
 
 // This test checks that a scheduler gets a slave lost
 // message for a partitioned slave.
-TEST_F(PartitionTest, PartitionedSlave)
+TEST_P(PartitionTest, PartitionedSlave)
 {
   master::Flags masterFlags = CreateMasterFlags();
+  masterFlags.registry_strict = GetParam();
+
   Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
   ASSERT_SOME(master);
 
@@ -119,14 +133,14 @@ TEST_F(PartitionTest, PartitionedSlave)
   while (true) {
     AWAIT_READY(ping);
     pings++;
-    if (pings == masterFlags.max_slave_ping_timeouts) {
+    if (pings == masterFlags.max_agent_ping_timeouts) {
      break;
     }
     ping = FUTURE_MESSAGE(Eq(PingSlaveMessage().GetTypeName()), _, _);
-    Clock::advance(masterFlags.slave_ping_timeout);
+    Clock::advance(masterFlags.agent_ping_timeout);
   }
 
-  Clock::advance(masterFlags.slave_ping_timeout);
+  Clock::advance(masterFlags.agent_ping_timeout);
 
   AWAIT_READY(slaveLost);
 
@@ -151,11 +165,13 @@ TEST_F(PartitionTest, PartitionedSlave)
 // partitioned slave, thus sending its tasks to LOST. At this point,
 // when the partition is removed, the slave will attempt to
 // re-register with its running tasks. We've already notified
-// frameworks that these tasks were LOST, so we have to have the slave
+// frameworks that these tasks were LOST, so we have to have the
 // slave shut down.
-TEST_F(PartitionTest, PartitionedSlaveReregistration)
+TEST_P(PartitionTest, PartitionedSlaveReregistration)
 {
   master::Flags masterFlags = CreateMasterFlags();
+  masterFlags.registry_strict = GetParam();
+
   Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
   ASSERT_SOME(master);
 
@@ -248,15 +264,15 @@ TEST_F(PartitionTest, PartitionedSlaveReregistration)
   while (true) {
     AWAIT_READY(ping);
     pings++;
-    if (pings == masterFlags.max_slave_ping_timeouts) {
+    if (pings == masterFlags.max_agent_ping_timeouts) {
      break;
     }
     ping = FUTURE_MESSAGE(Eq(PingSlaveMessage().GetTypeName()), _, _);
-    Clock::advance(masterFlags.slave_ping_timeout);
+    Clock::advance(masterFlags.agent_ping_timeout);
     Clock::settle();
   }
 
-  Clock::advance(masterFlags.slave_ping_timeout);
+  Clock::advance(masterFlags.agent_ping_timeout);
   Clock::settle();
 
   // The master will have notified the framework of the lost task.
@@ -268,6 +284,11 @@ TEST_F(PartitionTest, PartitionedSlaveReregistration)
 
   // The master will notify the framework that the slave was lost.
   AWAIT_READY(slaveLost);
+
+  JSON::Object stats = Metrics();
+  EXPECT_EQ(1, stats.values["master/tasks_lost"]);
+  EXPECT_EQ(1, stats.values["master/slave_removals"]);
+  EXPECT_EQ(1, stats.values["master/slave_removals/reason_unhealthy"]);
 
   Clock::resume();
 
@@ -303,9 +324,11 @@ TEST_F(PartitionTest, PartitionedSlaveReregistration)
 // the slave may attempt to send updates if it was unaware that the
 // master removed it. We've already notified frameworks that these
 // tasks were LOST, so we have to have the slave shut down.
-TEST_F(PartitionTest, PartitionedSlaveStatusUpdates)
+TEST_P(PartitionTest, PartitionedSlaveStatusUpdates)
 {
   master::Flags masterFlags = CreateMasterFlags();
+  masterFlags.registry_strict = GetParam();
+
   Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
   ASSERT_SOME(master);
 
@@ -367,15 +390,15 @@ TEST_F(PartitionTest, PartitionedSlaveStatusUpdates)
   while (true) {
     AWAIT_READY(ping);
     pings++;
-    if (pings == masterFlags.max_slave_ping_timeouts) {
+    if (pings == masterFlags.max_agent_ping_timeouts) {
      break;
     }
     ping = FUTURE_MESSAGE(Eq(PingSlaveMessage().GetTypeName()), _, _);
-    Clock::advance(masterFlags.slave_ping_timeout);
+    Clock::advance(masterFlags.agent_ping_timeout);
     Clock::settle();
   }
 
-  Clock::advance(masterFlags.slave_ping_timeout);
+  Clock::advance(masterFlags.agent_ping_timeout);
   Clock::settle();
 
   // Wait for the master to attempt to shut down the slave.
@@ -383,6 +406,10 @@ TEST_F(PartitionTest, PartitionedSlaveStatusUpdates)
 
   // The master will notify the framework that the slave was lost.
   AWAIT_READY(slaveLost);
+
+  JSON::Object stats = Metrics();
+  EXPECT_EQ(1, stats.values["master/slave_removals"]);
+  EXPECT_EQ(1, stats.values["master/slave_removals/reason_unhealthy"]);
 
   shutdownMessage = FUTURE_PROTOBUF(ShutdownMessage(), _, slave.get()->pid);
 
@@ -423,9 +450,11 @@ TEST_F(PartitionTest, PartitionedSlaveStatusUpdates)
 // it was unaware that the master removed it. We've already
 // notified frameworks that the tasks under the executors were LOST,
 // so we have to have the slave shut down.
-TEST_F(PartitionTest, PartitionedSlaveExitedExecutor)
+TEST_P(PartitionTest, PartitionedSlaveExitedExecutor)
 {
   master::Flags masterFlags = CreateMasterFlags();
+  masterFlags.registry_strict = GetParam();
+
   Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
   ASSERT_SOME(master);
 
@@ -512,15 +541,15 @@ TEST_F(PartitionTest, PartitionedSlaveExitedExecutor)
   while (true) {
     AWAIT_READY(ping);
     pings++;
-    if (pings == masterFlags.max_slave_ping_timeouts) {
+    if (pings == masterFlags.max_agent_ping_timeouts) {
      break;
     }
     ping = FUTURE_MESSAGE(Eq(PingSlaveMessage().GetTypeName()), _, _);
-    Clock::advance(masterFlags.slave_ping_timeout);
+    Clock::advance(masterFlags.agent_ping_timeout);
     Clock::settle();
   }
 
-  Clock::advance(masterFlags.slave_ping_timeout);
+  Clock::advance(masterFlags.agent_ping_timeout);
   Clock::settle();
 
   // The master will have notified the framework of the lost task.
@@ -532,6 +561,11 @@ TEST_F(PartitionTest, PartitionedSlaveExitedExecutor)
 
   // The master will notify the framework that the slave was lost.
   AWAIT_READY(slaveLost);
+
+  JSON::Object stats = Metrics();
+  EXPECT_EQ(1, stats.values["master/tasks_lost"]);
+  EXPECT_EQ(1, stats.values["master/slave_removals"]);
+  EXPECT_EQ(1, stats.values["master/slave_removals/reason_unhealthy"]);
 
   shutdownMessage = FUTURE_PROTOBUF(ShutdownMessage(), _, slave.get()->pid);
 
@@ -549,10 +583,13 @@ TEST_F(PartitionTest, PartitionedSlaveExitedExecutor)
 }
 
 
+class OneWayPartitionTest : public MesosTest {};
+
+
 // This test verifies that if master --> slave socket closes and the
 // slave is not aware of it (i.e., one way network partition), slave
 // will re-register with the master.
-TEST_F(PartitionTest, OneWayPartitionMasterToSlave)
+TEST_F(OneWayPartitionTest, MasterToSlave)
 {
   // Start a master.
   master::Flags masterFlags = CreateMasterFlags();
@@ -593,10 +630,54 @@ TEST_F(PartitionTest, OneWayPartitionMasterToSlave)
   Clock::settle();
 
   // Let the slave observer send the next ping.
-  Clock::advance(masterFlags.slave_ping_timeout);
+  Clock::advance(masterFlags.agent_ping_timeout);
 
   // Slave should re-register.
   AWAIT_READY(slaveReregisteredMessage);
+}
+
+
+// This test verifies that if master --> framework socket closes and the
+// framework is not aware of it (i.e., one way network partition), all
+// subsequent calls from the framework after the master has marked it as
+// disconnected would result in an error message causing the framework to abort.
+TEST_F(OneWayPartitionTest, MasterToScheduler)
+{
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  FrameworkInfo frameworkInfo = DEFAULT_FRAMEWORK_INFO;
+  frameworkInfo.set_failover_timeout(Weeks(2).secs());
+
+  MockScheduler sched;
+  StandaloneMasterDetector detector(master.get()->pid);
+  TestingMesosSchedulerDriver driver(&sched, &detector, frameworkInfo);
+
+  Future<process::Message> frameworkRegisteredMessage =
+    FUTURE_MESSAGE(Eq(FrameworkRegisteredMessage().GetTypeName()), _, _);
+
+  Future<Nothing> registered;
+  EXPECT_CALL(sched, registered(&driver, _, _))
+    .WillOnce(FutureSatisfy(&registered));
+
+  driver.start();
+
+  AWAIT_READY(frameworkRegisteredMessage);
+
+  AWAIT_READY(registered);
+
+  Future<Nothing> error;
+  EXPECT_CALL(sched, error(&driver, _))
+    .WillOnce(FutureSatisfy(&error));
+
+  // Simulate framework disconnection. This should result in an error message.
+  ASSERT_TRUE(process::inject::exited(
+      frameworkRegisteredMessage.get().to, master.get()->pid));
+
+  AWAIT_READY(error);
+
+  driver.stop();
+  driver.join();
 }
 
 } // namespace tests {

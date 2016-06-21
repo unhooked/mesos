@@ -18,18 +18,17 @@
 
 #include <gmock/gmock.h>
 
+#include <mesos/zookeeper/authentication.hpp>
+#include <mesos/zookeeper/group.hpp>
+
 #include <process/future.hpp>
 #include <process/gmock.hpp>
 #include <process/gtest.hpp>
 
 #include <stout/gtest.hpp>
 #include <stout/option.hpp>
-#include <stout/os.hpp>
 
 #include "tests/zookeeper.hpp"
-
-#include "zookeeper/authentication.hpp"
-#include "zookeeper/group.hpp"
 
 using zookeeper::Group;
 using zookeeper::GroupProcess;
@@ -284,7 +283,7 @@ TEST_F(GroupTest, MultipleGroups)
 
   server->expireSession(session1.get().get());
 
-  AWAIT_ASSERT_EQ(false, cancelled);
+  AWAIT_ASSERT_FALSE(cancelled);
 }
 
 
@@ -302,7 +301,7 @@ TEST_F(GroupTest, GroupPathWithRestrictivePerms)
       "42",
       zookeeper::EVERYONE_READ_CREATOR_ALL,
       0,
-      NULL);
+      nullptr);
 
   ASSERT_ZK_GET("42", &authenticatedZk, "/read-only");
 
@@ -311,7 +310,7 @@ TEST_F(GroupTest, GroupPathWithRestrictivePerms)
       "37",
       ZOO_OPEN_ACL_UNSAFE,
       0,
-      NULL);
+      nullptr);
 
   ASSERT_ZK_GET("37", &authenticatedZk, "/read-only/writable");
 

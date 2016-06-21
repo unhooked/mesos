@@ -16,6 +16,7 @@
 
 #include <stdio.h>
 
+#include <map>
 #include <string>
 
 #include <mesos/mesos.hpp>
@@ -27,9 +28,14 @@
 #include <process/reap.hpp>
 #include <process/owned.hpp>
 
+#include <stout/error.hpp>
 #include <stout/flags.hpp>
-#include <stout/protobuf.hpp>
+#include <stout/json.hpp>
 #include <stout/os.hpp>
+#include <stout/protobuf.hpp>
+#include <stout/try.hpp>
+
+#include <stout/os/killtree.hpp>
 
 #include "common/status_utils.hpp"
 
@@ -41,12 +47,15 @@
 
 #include "messages/messages.hpp"
 
+#include "slave/constants.hpp"
+
 using namespace mesos;
 using namespace process;
 
 using std::cerr;
 using std::cout;
 using std::endl;
+using std::map;
 using std::string;
 using std::vector;
 
@@ -70,17 +79,20 @@ public:
       const string& containerName,
       const string& sandboxDirectory,
       const string& mappedDirectory,
-      const Duration& stopTimeout,
-      const string& healthCheckDir)
+      const Duration& shutdownGracePeriod,
+      const string& healthCheckDir,
+      const map<string, string>& taskEnvironment)
     : killed(false),
       killedByHealthCheck(false),
+      terminated(false),
       healthPid(-1),
       healthCheckDir(healthCheckDir),
       docker(docker),
       containerName(containerName),
       sandboxDirectory(sandboxDirectory),
       mappedDirectory(mappedDirectory),
-      stopTimeout(stopTimeout),
+      shutdownGracePeriod(shutdownGracePeriod),
+      taskEnvironment(taskEnvironment),
       stop(Nothing()),
       inspect(Nothing()) {}
 
@@ -106,7 +118,7 @@ public:
 
   void disconnected(ExecutorDriver* driver)
   {
-    cout << "Disconnected from the slave" << endl;
+    cout << "Disconnected from the agent" << endl;
   }
 
   void launchTask(ExecutorDriver* driver, const TaskInfo& task)
@@ -124,6 +136,11 @@ public:
 
     // Capture the TaskID.
     taskId = task.task_id();
+
+    // Capture the kill policy.
+    if (task.has_kill_policy()) {
+      killPolicy = task.kill_policy();
+    }
 
     cout << "Starting task " << taskId.get() << endl;
 
@@ -145,14 +162,17 @@ public:
         sandboxDirectory,
         mappedDirectory,
         task.resources() + task.executor().resources(),
-        None(),
+        taskEnvironment,
         Subprocess::FD(STDOUT_FILENO),
         Subprocess::FD(STDERR_FILENO));
 
-    run->onAny(defer(self(), &Self::reaped, driver, lambda::_1));
+    run->onAny(defer(self(), &Self::reaped, lambda::_1));
 
     // Delay sending TASK_RUNNING status update until we receive
-    // inspect output.
+    // inspect output. Note that we store a future that completes
+    // after the sending of the running update. This allows us to
+    // ensure that the terminal update is sent after the running
+    // update (see `reaped()`).
     inspect = docker->inspect(containerName, DOCKER_INSPECT_DELAY)
       .then(defer(self(), [=](const Docker::Container& container) {
         if (!killed) {
@@ -169,11 +189,15 @@ public:
             NetworkInfo* networkInfo =
               status.mutable_container_status()->add_network_infos();
 
-            // TODO(CD): Deprecated -- Remove after 0.27.0.
-            networkInfo->set_ip_address(container.ipAddress.get());
+            // Copy the NetworkInfo if it is specified in the
+            // ContainerInfo. A Docker container has at most one
+            // NetworkInfo, which is validated in containerizer.
+            if (task.container().network_infos().size() > 0) {
+              networkInfo->CopyFrom(task.container().network_infos(0));
+              networkInfo->clear_ip_addresses();
+            }
 
-            NetworkInfo::IPAddress* ipAddress =
-              networkInfo->add_ip_addresses();
+            NetworkInfo::IPAddress* ipAddress = networkInfo->add_ip_addresses();
             ipAddress->set_ip_address(container.ipAddress.get());
           }
           driver->sendStatusUpdate(status);
@@ -188,11 +212,17 @@ public:
 
   void killTask(ExecutorDriver* driver, const TaskID& taskId)
   {
-    cout << "Received killTask" << endl;
+    cout << "Received killTask for task " << taskId.value() << endl;
 
-    // Since the docker executor manages a single task, we
-    // shutdown completely when we receive a killTask.
-    shutdown(driver);
+    // Using shutdown grace period as a default is backwards compatible
+    // with the `stop_timeout` flag, deprecated in 1.0.
+    Duration gracePeriod = shutdownGracePeriod;
+
+    if (killPolicy.isSome() && killPolicy->has_grace_period()) {
+      gracePeriod = Nanoseconds(killPolicy->grace_period().nanoseconds());
+    }
+
+    killTask(driver, taskId, gracePeriod);
   }
 
   void frameworkMessage(ExecutorDriver* driver, const string& data) {}
@@ -201,38 +231,28 @@ public:
   {
     cout << "Shutting down" << endl;
 
-    if (run.isSome() && !killed) {
-      // Send TASK_KILLING if the framework can handle it.
-      CHECK_SOME(frameworkInfo);
-      CHECK_SOME(taskId);
-
-      foreach (const FrameworkInfo::Capability& c,
-               frameworkInfo->capabilities()) {
-        if (c.type() == FrameworkInfo::Capability::TASK_KILLING_STATE) {
-          TaskStatus status;
-          status.mutable_task_id()->CopyFrom(taskId.get());
-          status.set_state(TASK_KILLING);
-          driver->sendStatusUpdate(status);
-          break;
-        }
-      }
-
-      // The docker daemon might still be in progress starting the
-      // container, therefore we kill both the docker run process
-      // and also ask the daemon to stop the container.
-      run->discard();
-      stop = docker->stop(containerName, stopTimeout);
-      killed = true;
-    }
-
-    // Cleanup health check process.
+    // Currently, 'docker->run' uses the reaper internally, hence we need
+    // to account for the reap interval. We also leave a small buffer of
+    // time to do the forced kill, otherwise the agent may destroy the
+    // container before we can send `TASK_KILLED`.
     //
-    // TODO(bmahler): Consider doing this after the task has been
-    // reaped, since a framework may be interested in health
-    // information while the task is being killed (consider a
-    // task that takes 30 minutes to be cleanly killed).
-    if (healthPid != -1) {
-      os::killtree(healthPid, SIGKILL);
+    // TODO(alexr): Remove `MAX_REAP_INTERVAL` once the reaper signals
+    // immediately after the watched process has exited.
+    Duration gracePeriod =
+      shutdownGracePeriod - process::MAX_REAP_INTERVAL() - Seconds(1);
+
+    // Since the docker executor manages a single task,
+    // shutdown boils down to killing this task.
+    //
+    // TODO(bmahler): If a shutdown arrives after a kill task within
+    // the grace period of the `KillPolicy`, we may need to escalate
+    // more quickly (e.g. the shutdown grace period allotted by the
+    // agent is smaller than the kill grace period).
+    if (run.isSome()) {
+      CHECK_SOME(taskId);
+      killTask(driver, taskId.get(), gracePeriod);
+    } else {
+      driver->stop();
     }
   }
 
@@ -273,164 +293,274 @@ protected:
   }
 
 private:
-  void reaped(
-      ExecutorDriver* _driver,
-      const Future<Nothing>& run)
+  void killTask(
+      ExecutorDriver* driver,
+      const TaskID& _taskId,
+      const Duration& gracePeriod)
   {
-    // Wait for docker->stop to finish, and best effort wait for the
-    // inspect future to complete with a timeout.
-    stop.onAny(defer(self(), [=](const Future<Nothing>&) {
+    if (terminated) {
+      return;
+    }
+
+    // TODO(alexr): If a kill is in progress, consider adjusting
+    // the grace period if a new one is provided.
+
+    // Issue the kill signal if the container is running
+    // and we haven't killed it yet.
+    if (run.isSome() && !killed) {
+      // We have to issue the kill after 'docker inspect' has
+      // completed, otherwise we may race with 'docker run'
+      // and docker may not know about the container. Note
+      // that we postpone setting `killed` because we don't
+      // want to send TASK_KILLED without having actually
+      // issued the kill.
       inspect
-        .after(DOCKER_INSPECT_TIMEOUT, [=](const Future<Nothing>&) {
-          inspect.discard();
-          return inspect;
-        })
-        .onAny(defer(self(), [=](const Future<Nothing>&) {
-          CHECK_SOME(driver);
-          TaskState state;
-          string message;
-          if (!stop.isReady()) {
-            state = TASK_FAILED;
-            message = "Unable to stop docker container, error: " +
-                      (stop.isFailed() ? stop.failure() : "future discarded");
-          } else if (killed) {
-            state = TASK_KILLED;
-          } else if (!run.isReady()) {
-            state = TASK_FAILED;
-            message = "Docker container run error: " +
-                      (run.isFailed() ?
-                       run.failure() : "future discarded");
-          } else {
-            state = TASK_FINISHED;
-          }
+        .onAny(defer(self(), &Self::_killTask, _taskId, gracePeriod));
+    }
 
-          CHECK_SOME(taskId);
+    // Cleanup health check process.
+    //
+    // TODO(bmahler): Consider doing this after the task has been
+    // reaped, since a framework may be interested in health
+    // information while the task is being killed (consider a
+    // task that takes 30 minutes to be cleanly killed).
+    if (healthPid != -1) {
+      os::killtree(healthPid, SIGKILL);
+      healthPid = -1;
+    }
+  }
 
-          TaskStatus taskStatus;
-          taskStatus.mutable_task_id()->CopyFrom(taskId.get());
-          taskStatus.set_state(state);
-          taskStatus.set_message(message);
-          if (killed && killedByHealthCheck) {
-            taskStatus.set_healthy(false);
-          }
+  void _killTask(const TaskID& taskId_, const Duration& gracePeriod)
+  {
+    CHECK_SOME(driver);
+    CHECK_SOME(frameworkInfo);
+    CHECK_SOME(taskId);
+    CHECK_EQ(taskId_, taskId.get());
 
-          driver.get()->sendStatusUpdate(taskStatus);
+    if (!terminated && !killed) {
+      // Because we rely on `killed` to determine whether
+      // to send TASK_KILLED, we set `killed` only once the
+      // kill is issued. If we set it earlier we're more
+      // likely to send a TASK_KILLED without having ever
+      // signaled the container. Note that in general it's
+      // a race between signaling and the container
+      // terminating with a non-zero exit status.
+      killed = true;
 
-          // A hack for now ... but we need to wait until the status update
-          // is sent to the slave before we shut ourselves down.
-          // TODO(tnachen): Remove this hack and also the same hack in the
-          // command executor when we have the new HTTP APIs to wait until
-          // an ack.
-          os::sleep(Seconds(1));
-          driver.get()->stop();
-        }));
-    }));
+      // Send TASK_KILLING if the framework can handle it.
+      foreach (const FrameworkInfo::Capability& c,
+               frameworkInfo->capabilities()) {
+        if (c.type() == FrameworkInfo::Capability::TASK_KILLING_STATE) {
+          TaskStatus status;
+          status.mutable_task_id()->CopyFrom(taskId.get());
+          status.set_state(TASK_KILLING);
+          driver.get()->sendStatusUpdate(status);
+          break;
+        }
+      }
+
+      // TODO(bmahler): Replace this with 'docker kill' so
+      // that we can adjust the grace period in the case of
+      // a `KillPolicy` override.
+      stop = docker->stop(containerName, gracePeriod);
+    }
+  }
+
+  void reaped(const Future<Option<int>>& run)
+  {
+    terminated = true;
+
+    // In case the stop is stuck, discard it.
+    stop.discard();
+
+    // We wait for inspect to finish in order to ensure we send
+    // the TASK_RUNNING status update.
+    inspect
+      .onAny(defer(self(), &Self::_reaped, run));
+
+    // If the inspect takes too long we discard it to ensure we
+    // don't wait forever, however in this case there may be no
+    // TASK_RUNNING update.
+    inspect
+      .after(DOCKER_INSPECT_TIMEOUT, [=](const Future<Nothing>&) {
+        inspect.discard();
+        return inspect;
+      });
+  }
+
+  void _reaped(const Future<Option<int>>& run)
+  {
+    TaskState state;
+    string message;
+
+    if (!run.isReady()) {
+      // TODO(bmahler): Include the run command in the message.
+      state = TASK_FAILED;
+      message = "Failed to run docker container: " +
+          (run.isFailed() ? run.failure() : "discarded");
+    } else if (run->isNone()) {
+      state = TASK_FAILED;
+      message = "Failed to get exit status of container";
+    } else {
+      int status = run->get();
+      CHECK(WIFEXITED(status) || WIFSIGNALED(status)) << status;
+
+      if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        state = TASK_FINISHED;
+      } else if (killed) {
+        // Send TASK_KILLED if the task was killed as a result of
+        // kill() or shutdown(). Note that in general there is a
+        // race between signaling the container and it terminating
+        // uncleanly on its own.
+        //
+        // TODO(bmahler): Consider using the exit status to
+        // determine whether the container was terminated via
+        // our signal or terminated on its own.
+        state = TASK_KILLED;
+      } else {
+        state = TASK_FAILED;
+      }
+
+      message = "Container " + WSTRINGIFY(status);
+    }
+
+    CHECK_SOME(taskId);
+
+    TaskStatus taskStatus;
+    taskStatus.mutable_task_id()->CopyFrom(taskId.get());
+    taskStatus.set_state(state);
+    taskStatus.set_message(message);
+    if (killed && killedByHealthCheck) {
+      taskStatus.set_healthy(false);
+    }
+
+    CHECK_SOME(driver);
+    driver.get()->sendStatusUpdate(taskStatus);
+
+    // A hack for now ... but we need to wait until the status update
+    // is sent to the slave before we shut ourselves down.
+    // TODO(tnachen): Remove this hack and also the same hack in the
+    // command executor when we have the new HTTP APIs to wait until
+    // an ack.
+    os::sleep(Seconds(1));
+    driver.get()->stop();
   }
 
   void launchHealthCheck(const string& containerName, const TaskInfo& task)
   {
-    if (!killed && task.has_health_check()) {
-      HealthCheck healthCheck = task.health_check();
+    // Bail out early if we have been already killed or if the task has no
+    // associated health checks.
+    //
+    // TODO(alexr): Consider starting health checks even if we have
+    // already been killed to ensure that tasks are health checked
+    // while in their kill grace period.
+    if (killed || !task.has_health_check()) {
+      return;
+    }
 
-      // Wrap the original health check command in "docker exec".
-      if (healthCheck.has_command()) {
-          CommandInfo command = healthCheck.command();
+    HealthCheck healthCheck = task.health_check();
+    if (!healthCheck.has_command()) {
+      cerr << "Unable to launch health process: "
+           << "Only command health check is supported now" << endl;
+      return;
+    }
 
-          // "docker exec" require docker version greater than 1.3.0.
-          Try<Nothing> validateVersion =
-            docker->validateVersion(Version(1, 3, 0));
-          if (validateVersion.isError()) {
-            cerr << "Unable to launch health process: "
-                 << validateVersion.error() << endl;
-            return;
-          }
+    // "docker exec" require docker version greater than 1.3.0.
+    Try<Nothing> validateVersion =
+      docker->validateVersion(Version(1, 3, 0));
 
-          vector<string> argv;
-          argv.push_back(docker->getPath());
-          argv.push_back("exec");
-          argv.push_back(containerName);
+    if (validateVersion.isError()) {
+      cerr << "Unable to launch health process: "
+           << validateVersion.error() << endl;
+      return;
+    }
 
-          if (command.shell()) {
-            if (!command.has_value()) {
-              cerr << "Unable to launch health process: "
-                   << "Shell command is not specified." << endl;
-              return;
-            }
+    // Wrap the original health check command in "docker exec".
+    const CommandInfo& command = healthCheck.command();
+    if (!command.has_value()) {
+      cerr << "Unable to launch health process: "
+           << (command.shell() ? "Shell command" : "Executable path")
+           << " is not specified" << endl;
+      return;
+    }
 
-            argv.push_back("sh");
-            argv.push_back("-c");
-            argv.push_back("\"");
-            argv.push_back(command.value());
-            argv.push_back("\"");
-          } else {
-            if (!command.has_value()) {
-              cerr << "Unable to launch health process: "
-                   << "Executable path is not specified." << endl;
-              return;
-            }
+    vector<string> argv;
+    argv.push_back(docker->getPath());
+    argv.push_back("exec");
+    argv.push_back(containerName);
 
-            argv.push_back(command.value());
-            foreach (const string& argument, command.arguments()) {
-              argv.push_back(argument);
-            }
-          }
+    if (command.shell()) {
+      argv.push_back("sh");
+      argv.push_back("-c");
+      argv.push_back("\"");
+      argv.push_back(command.value());
+      argv.push_back("\"");
+    } else {
+      argv.push_back(command.value());
 
-          command.set_shell(true);
-          command.clear_arguments();
-          command.set_value(strings::join(" ", argv));
-          healthCheck.mutable_command()->CopyFrom(command);
-      } else {
-          cerr << "Unable to launch health process: "
-               << "Only command health check is supported now." << endl;
-          return;
-      }
-
-      JSON::Object json = JSON::protobuf(healthCheck);
-
-      // Launch the subprocess using 'exec' style so that quotes can
-      // be properly handled.
-      vector<string> argv;
-      string path = path::join(healthCheckDir, "mesos-health-check");
-      argv.push_back(path);
-      argv.push_back("--executor=" + stringify(self()));
-      argv.push_back("--health_check_json=" + stringify(json));
-      argv.push_back("--task_id=" + task.task_id().value());
-
-      string cmd = strings::join(" ", argv);
-      cout << "Launching health check process: " << cmd << endl;
-
-      Try<Subprocess> healthProcess =
-        process::subprocess(
-          path,
-          argv,
-          // Intentionally not sending STDIN to avoid health check
-          // commands that expect STDIN input to block.
-          Subprocess::PATH("/dev/null"),
-          Subprocess::FD(STDOUT_FILENO),
-          Subprocess::FD(STDERR_FILENO));
-
-      if (healthProcess.isError()) {
-        cerr << "Unable to launch health process: "
-             << healthProcess.error() << endl;
-      } else {
-        healthPid = healthProcess.get().pid();
-
-        cout << "Health check process launched at pid: "
-             << stringify(healthPid) << endl;
+      foreach (const string& argument, command.arguments()) {
+        argv.push_back(argument);
       }
     }
+
+    healthCheck.mutable_command()->set_shell(true);
+    healthCheck.mutable_command()->clear_arguments();
+    healthCheck.mutable_command()->set_value(strings::join(" ", argv));
+
+    JSON::Object json = JSON::protobuf(healthCheck);
+
+    const string path = path::join(healthCheckDir, "mesos-health-check");
+
+    // Launch the subprocess using 'exec' style so that quotes can
+    // be properly handled.
+    argv.push_back(path);
+    argv.push_back("--executor=" + stringify(self()));
+    argv.push_back("--health_check_json=" + stringify(json));
+    argv.push_back("--task_id=" + task.task_id().value());
+
+    const string cmd = strings::join(" ", argv);
+
+    cout << "Launching health check process: " << cmd << endl;
+
+    Try<Subprocess> healthProcess =
+      process::subprocess(
+        path,
+        argv,
+        // Intentionally not sending STDIN to avoid health check
+        // commands that expect STDIN input to block.
+        Subprocess::PATH("/dev/null"),
+        Subprocess::FD(STDOUT_FILENO),
+        Subprocess::FD(STDERR_FILENO));
+
+    if (healthProcess.isError()) {
+      cerr << "Unable to launch health process: "
+           << healthProcess.error() << endl;
+      return;
+    }
+
+    healthPid = healthProcess.get().pid();
+
+    cout << "Health check process launched at pid: "
+         << stringify(healthPid) << endl;
   }
 
+  // TODO(alexr): Introduce a state enum and document transitions,
+  // see MESOS-5252.
   bool killed;
   bool killedByHealthCheck;
+  bool terminated;
+
   pid_t healthPid;
   string healthCheckDir;
   Owned<Docker> docker;
   string containerName;
   string sandboxDirectory;
   string mappedDirectory;
-  Duration stopTimeout;
-  Option<Future<Nothing>> run;
+  Duration shutdownGracePeriod;
+  map<string, string> taskEnvironment;
+
+  Option<KillPolicy> killPolicy;
+  Option<Future<Option<int>>> run;
   Future<Nothing> stop;
   Future<Nothing> inspect;
   Option<ExecutorDriver*> driver;
@@ -447,16 +577,18 @@ public:
       const string& container,
       const string& sandboxDirectory,
       const string& mappedDirectory,
-      const Duration& stopTimeout,
-      const string& healthCheckDir)
+      const Duration& shutdownGracePeriod,
+      const string& healthCheckDir,
+      const map<string, string>& taskEnvironment)
   {
     process = Owned<DockerExecutorProcess>(new DockerExecutorProcess(
         docker,
         container,
         sandboxDirectory,
         mappedDirectory,
-        stopTimeout,
-        healthCheckDir));
+        shutdownGracePeriod,
+        healthCheckDir,
+        taskEnvironment));
 
     spawn(process.get());
   }
@@ -541,7 +673,7 @@ int main(int argc, char** argv)
   mesos::internal::docker::Flags flags;
 
   // Load flags from environment and command line.
-  Try<Nothing> load = flags.load(None(), &argc, &argv);
+  Try<flags::Warnings> load = flags.load(None(), &argc, &argv);
 
   if (load.isError()) {
     cerr << flags.usage(load.error()) << endl;
@@ -551,6 +683,11 @@ int main(int argc, char** argv)
   std::cout << stringify(flags) << std::endl;
 
   mesos::internal::logging::initialize(argv[0], flags, true); // Catch signals.
+
+  // Log any flag warnings (after logging is initialized).
+  foreach (const flags::Warning& warning, load->warnings) {
+    LOG(WARNING) << warning.message;
+  }
 
   if (flags.help) {
     cout << flags.usage() << endl;
@@ -579,9 +716,62 @@ int main(int argc, char** argv)
     return EXIT_FAILURE;
   }
 
-  if (flags.stop_timeout.isNone()) {
-    cerr << flags.usage("Missing required option --stop_timeout") << endl;
-    return EXIT_FAILURE;
+  map<string, string> taskEnvironment;
+  if (flags.task_environment.isSome()) {
+    // Parse the string as JSON.
+    Try<JSON::Object> json =
+      JSON::parse<JSON::Object>(flags.task_environment.get());
+
+    if (json.isError()) {
+      cerr << flags.usage("Failed to parse --task_environment: " + json.error())
+           << endl;
+      return EXIT_FAILURE;
+    }
+
+    // Convert from JSON to map.
+    foreachpair (
+        const std::string& key,
+        const JSON::Value& value,
+        json->values) {
+      if (!value.is<JSON::String>()) {
+        cerr << flags.usage(
+            "Value of key '" + key +
+            "' in --task_environment is not a string")
+             << endl;
+        return EXIT_FAILURE;
+      }
+
+      // Save the parsed and validated key/value.
+      taskEnvironment[key] = value.as<JSON::String>().value;
+    }
+  }
+
+  // Get executor shutdown grace period from the environment.
+  //
+  // NOTE: We avoided introducing a docker executor flag for this
+  // because the docker executor exits if it sees an unknown flag.
+  // This makes it difficult to add or remove docker executor flags
+  // that are unconditionally set by the agent.
+  Duration shutdownGracePeriod =
+    mesos::internal::slave::DEFAULT_EXECUTOR_SHUTDOWN_GRACE_PERIOD;
+  Option<string> value = os::getenv("MESOS_EXECUTOR_SHUTDOWN_GRACE_PERIOD");
+  if (value.isSome()) {
+    Try<Duration> parse = Duration::parse(value.get());
+    if (parse.isError()) {
+      cerr << "Failed to parse value '" << value.get() << "'"
+           << " of 'MESOS_EXECUTOR_SHUTDOWN_GRACE_PERIOD': " << parse.error();
+      return EXIT_FAILURE;
+    }
+
+    shutdownGracePeriod = parse.get();
+  }
+
+  // If the deprecated flag is set, respect it and choose the bigger value.
+  //
+  // TODO(alexr): Remove this after the deprecation cycle (started in 1.0).
+  if (flags.stop_timeout.isSome() &&
+      flags.stop_timeout.get() > shutdownGracePeriod) {
+    shutdownGracePeriod = flags.stop_timeout.get();
   }
 
   if (flags.launcher_dir.isNone()) {
@@ -607,8 +797,9 @@ int main(int argc, char** argv)
       flags.container.get(),
       flags.sandbox_directory.get(),
       flags.mapped_directory.get(),
-      flags.stop_timeout.get(),
-      flags.launcher_dir.get());
+      shutdownGracePeriod,
+      flags.launcher_dir.get(),
+      taskEnvironment);
 
   mesos::MesosExecutorDriver driver(&executor);
   return driver.run() == mesos::DRIVER_STOPPED ? EXIT_SUCCESS : EXIT_FAILURE;

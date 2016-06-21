@@ -30,7 +30,11 @@
 #include <mesos/resources.hpp>
 #include <mesos/type_utils.hpp>
 
+#include <mesos/agent/agent.hpp>
+
 #include <mesos/executor/executor.hpp>
+
+#include <mesos/master/detector.hpp>
 
 #include <mesos/module/authenticatee.hpp>
 
@@ -42,8 +46,10 @@
 #include <process/http.hpp>
 #include <process/future.hpp>
 #include <process/owned.hpp>
+#include <process/limiter.hpp>
 #include <process/process.hpp>
 #include <process/protobuf.hpp>
+#include <process/shared.hpp>
 
 #include <stout/bytes.hpp>
 #include <stout/linkedhashmap.hpp>
@@ -62,8 +68,6 @@
 
 #include "internal/evolve.hpp"
 
-#include "master/detector.hpp"
-
 #include "messages/messages.hpp"
 
 #include "slave/constants.hpp"
@@ -71,7 +75,6 @@
 #include "slave/flags.hpp"
 #include "slave/gc.hpp"
 #include "slave/metrics.hpp"
-#include "slave/monitor.hpp"
 #include "slave/paths.hpp"
 #include "slave/state.hpp"
 
@@ -82,9 +85,11 @@
 #endif // __WINDOWS__
 
 namespace mesos {
-namespace internal {
 
-class MasterDetector; // Forward declaration.
+// Forward declarations.
+class Authorizer;
+
+namespace internal {
 
 namespace slave {
 
@@ -101,13 +106,14 @@ class Slave : public ProtobufProcess<Slave>
 public:
   Slave(const std::string& id,
         const Flags& flags,
-        MasterDetector* detector,
+        mesos::master::detector::MasterDetector* detector,
         Containerizer* containerizer,
         Files* files,
         GarbageCollector* gc,
         StatusUpdateManager* statusUpdateManager,
         mesos::slave::ResourceEstimator* resourceEstimator,
-        mesos::slave::QoSController* qosController);
+        mesos::slave::QoSController* qosController,
+        const Option<Authorizer*>& authorizer);
 
   virtual ~Slave();
 
@@ -145,8 +151,7 @@ public:
   // Made 'virtual' for Slave mocking.
   virtual void killTask(
       const process::UPID& from,
-      const FrameworkID& frameworkId,
-      const TaskID& taskId);
+      const KillTaskMessage& killTaskMessage);
 
   void shutdownExecutor(
       const process::UPID& from,
@@ -396,7 +401,14 @@ public:
           mesos::slave::QoSCorrection>>& correction);
 
   // Returns the resource usage information for all executors.
-  process::Future<ResourceUsage> usage();
+  virtual process::Future<ResourceUsage> usage();
+
+  // Handle the second phase of shutting down an executor for those
+  // executors that have not properly shutdown within a timeout.
+  void shutdownExecutorTimeout(
+      const FrameworkID& frameworkId,
+      const ExecutorID& executorId,
+      const ContainerID& containerId);
 
 private:
   void _authenticate();
@@ -409,31 +421,39 @@ private:
   // exited.
   void _shutdownExecutor(Framework* framework, Executor* executor);
 
-  // Handle the second phase of shutting down an executor for those
-  // executors that have not properly shutdown within a timeout.
-  void shutdownExecutorTimeout(
+  process::Future<bool> authorizeLogAccess(
+      const Option<std::string>& principal);
+
+  Future<bool> authorizeSandboxAccess(
+      const Option<std::string>& principal,
       const FrameworkID& frameworkId,
-      const ExecutorID& executorId,
-      const ContainerID& containerId);
+      const ExecutorID& executorId);
 
   // Inner class used to namespace HTTP route handlers (see
   // slave/http.cpp for implementations).
   class Http
   {
   public:
-    explicit Http(Slave* _slave) : slave(_slave) {}
+    explicit Http(Slave* _slave)
+    : slave(_slave), statisticsLimiter(new RateLimiter(2, Seconds(1))) {}
 
     // Logs the request, route handlers can compose this with the
     // desired request handler to get consistent request logging.
     static void log(const process::http::Request& request);
 
-    // /slave/api/v1/executor
+    // /api/v1
+    process::Future<process::http::Response> api(
+        const process::http::Request& request,
+        const Option<std::string>& principal) const;
+
+    // /api/v1/executor
     process::Future<process::http::Response> executor(
         const process::http::Request& request) const;
 
     // /slave/flags
     process::Future<process::http::Response> flags(
-        const process::http::Request& request) const;
+        const process::http::Request& request,
+        const Option<std::string>& principal) const;
 
     // /slave/health
     process::Future<process::http::Response> health(
@@ -441,15 +461,92 @@ private:
 
     // /slave/state
     process::Future<process::http::Response> state(
-        const process::http::Request& request) const;
+        const process::http::Request& request,
+        const Option<std::string>& /* principal */) const;
 
+    // /slave/monitor/statistics
+    // /slave/monitor/statistics.json
+    process::Future<process::http::Response> statistics(
+        const process::http::Request& request,
+        const Option<std::string>& principal) const;
+
+    // /slave/containers
+    process::Future<process::http::Response> containers(
+        const process::http::Request& request,
+        const Option<std::string>& principal) const;
+
+    static std::string API_HELP();
     static std::string EXECUTOR_HELP();
     static std::string FLAGS_HELP();
     static std::string HEALTH_HELP();
     static std::string STATE_HELP();
+    static std::string STATISTICS_HELP();
+    static std::string CONTAINERS_HELP();
 
   private:
+    JSON::Object _flags() const;
+
+    // Make continuation for `statistics` `static` as it might
+    // execute when the invoking `Http` is already destructed.
+    process::http::Response _statistics(
+        const ResourceUsage& usage,
+        const process::http::Request& request) const;
+
+    // Continuation for `/containers` endpoint
+    process::Future<process::http::Response> _containers(
+        const process::http::Request& request) const;
+
+    // Helper routines for endpoint authorization.
+    Try<std::string> extractEndpoint(const process::http::URL& url) const;
+
+    // Authorizes access to an HTTP endpoint. The `method` parameter
+    // determines which ACL action will be used in the authorization.
+    // It is expected that the caller has validated that `method` is
+    // supported by this function. Currently "GET" is supported.
+    //
+    // TODO(nfnt): Prefer types instead of strings
+    // for `endpoint` and `method`, see MESOS-5300.
+    process::Future<bool> authorizeEndpoint(
+        const Option<std::string>& principal,
+        const std::string& endpoint,
+        const std::string& method) const;
+
+    // Agent API handlers.
+
+    process::Future<process::http::Response> getFlags(
+        const mesos::agent::Call& call,
+        const Option<std::string>& principal,
+        ContentType contentType) const;
+
+    process::Future<process::http::Response> getHealth(
+        const mesos::agent::Call& call,
+        const Option<std::string>& principal,
+        ContentType contentType) const;
+
+    process::Future<process::http::Response> getVersion(
+        const mesos::agent::Call& call,
+        const Option<std::string>& principal,
+        ContentType contentType) const;
+
+    process::Future<process::http::Response> getMetrics(
+        const mesos::agent::Call& call,
+        const Option<std::string>& principal,
+        ContentType contentType) const;
+
+    process::Future<process::http::Response> getLoggingLevel(
+        const mesos::agent::Call& call,
+        const Option<std::string>& principal,
+        ContentType contentType) const;
+
+    process::Future<process::http::Response> setLoggingLevel(
+        const mesos::agent::Call& call,
+        const Option<std::string>& principal,
+        ContentType contentType) const;
+
     Slave* slave;
+
+    // Used to rate limit the statistics endpoint.
+    Shared<RateLimiter> statisticsLimiter;
   };
 
   friend struct Framework;
@@ -499,6 +596,8 @@ private:
 
   const Flags flags;
 
+  const Http http;
+
   SlaveInfo info;
 
   // Resources that are checkpointed by the slave.
@@ -510,7 +609,7 @@ private:
 
   boost::circular_buffer<process::Owned<Framework>> completedFrameworks;
 
-  MasterDetector* detector;
+  mesos::master::detector::MasterDetector* detector;
 
   Containerizer* containerizer;
 
@@ -529,8 +628,6 @@ private:
   process::Time startTime;
 
   GarbageCollector* gc;
-
-  ResourceMonitor monitor;
 
   StatusUpdateManager* statusUpdateManager;
 
@@ -577,6 +674,8 @@ private:
   mesos::slave::ResourceEstimator* resourceEstimator;
 
   mesos::slave::QoSController* qosController;
+
+  const Option<Authorizer*> authorizer;
 
   // The most recent estimate of the total amount of oversubscribed
   // (allocated and oversubscribable) resources.
@@ -676,6 +775,16 @@ struct Executor
   friend std::ostream& operator<<(
       std::ostream& stream,
       const Executor& executor);
+
+// Undefine NetBios preprocessor macros used by the `State` enum.
+#ifdef REGISTERING
+#undef REGISTERING
+#endif // REGISTERING
+
+#ifdef REGISTERED
+#undef REGISTERED
+#endif // REGISTERED
+
 
   enum State
   {

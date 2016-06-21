@@ -16,6 +16,10 @@
 
 #include <gtest/gtest.h>
 
+#include <mesos/authentication/http/basic_authenticator_factory.hpp>
+
+#include <mesos/authorizer/authorizer.hpp>
+
 #include <process/future.hpp>
 #include <process/http.hpp>
 #include <process/owned.hpp>
@@ -28,16 +32,61 @@
 
 #include "tests/mesos.hpp"
 
+namespace authentication = process::http::authentication;
+
+using mesos::http::authentication::BasicAuthenticatorFactory;
+
 using mesos::internal::master::Master;
 using mesos::internal::slave::Slave;
 
+using mesos::master::detector::MasterDetector;
+
 using process::Owned;
+
+using process::http::authorization::AuthorizationCallbacks;
 
 namespace mesos {
 namespace internal {
 namespace tests {
 
-class MetricsTest : public mesos::internal::tests::MesosTest {};
+class MetricsTest : public mesos::internal::tests::MesosTest
+{
+protected:
+  void setBasicHttpAuthenticator(
+      const std::string& realm,
+      const Credentials& credentials)
+  {
+    Try<authentication::Authenticator*> authenticator =
+      BasicAuthenticatorFactory::create(realm, credentials);
+
+    ASSERT_SOME(authenticator);
+
+    // Add this realm to the set of realms which will be unset during teardown.
+    realms.insert(realm);
+
+    // Pass ownership of the authenticator to libprocess.
+    AWAIT_READY(authentication::setAuthenticator(
+        realm,
+        Owned<authentication::Authenticator>(authenticator.get())));
+  }
+
+  virtual void TearDown()
+  {
+    foreach (const std::string& realm, realms) {
+      // We need to wait in order to ensure that the operation completes before
+      // we leave `TearDown`. Otherwise, we may leak a mock object.
+      AWAIT_READY(authentication::unsetAuthenticator(realm));
+    }
+
+    realms.clear();
+
+    MesosTest::TearDown();
+  }
+
+private:
+  hashset<std::string> realms;
+};
+
 
 TEST_F(MetricsTest, Master)
 {
@@ -216,6 +265,144 @@ TEST_F(MetricsTest, Slave)
   EXPECT_EQ(1u, stats.values.count("slave/disk_total"));
   EXPECT_EQ(1u, stats.values.count("slave/disk_used"));
   EXPECT_EQ(1u, stats.values.count("slave/disk_percent"));
+}
+
+
+// Tests that the `/metrics/snapshot` endpoint will reject unauthenticated
+// requests when HTTP authentication is enabled on the master.
+TEST_F(MetricsTest, MasterAuthenticationEnabled)
+{
+  Credentials credentials;
+  credentials.add_credentials()->CopyFrom(DEFAULT_CREDENTIAL);
+
+  // Create a basic HTTP authenticator with the specified credentials and set it
+  // as the authenticator for `DEFAULT_HTTP_AUTHENTICATION_REALM`.
+  setBasicHttpAuthenticator(DEFAULT_HTTP_AUTHENTICATION_REALM, credentials);
+
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  // Get the snapshot.
+  process::UPID upid("metrics", process::address());
+
+  process::Future<process::http::Response> response =
+      process::http::get(upid, "snapshot");
+
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(
+      process::http::Unauthorized({}).status, response);
+}
+
+
+// Tests that the `/metrics/snapshot` endpoint will reject unauthenticated
+// requests when HTTP authentication is enabled on the agent.
+TEST_F(MetricsTest, AgentAuthenticationEnabled)
+{
+  Credentials credentials;
+  credentials.add_credentials()->CopyFrom(DEFAULT_CREDENTIAL);
+
+  // Create a basic HTTP authenticator with the specified credentials and set it
+  // as the authenticator for `DEFAULT_HTTP_AUTHENTICATION_REALM`.
+  setBasicHttpAuthenticator(DEFAULT_HTTP_AUTHENTICATION_REALM, credentials);
+
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> agent = StartSlave(detector.get());
+  ASSERT_SOME(agent);
+
+  // Get the snapshot.
+  process::UPID upid("metrics", process::address());
+
+  process::Future<process::http::Response> response =
+      process::http::get(upid, "snapshot");
+
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(
+      process::http::Unauthorized({}).status, response);
+}
+
+
+// Tests that the `/metrics/snapshot` endpoint will reject unauthorized requests
+// when authentication and authorization are enabled on the master.
+TEST_F(MetricsTest, MasterAuthorizationEnabled)
+{
+  Credentials credentials;
+  credentials.add_credentials()->CopyFrom(DEFAULT_CREDENTIAL);
+
+  // Create a basic HTTP authenticator with the specified credentials and set it
+  // as the authenticator for `DEFAULT_HTTP_AUTHENTICATION_REALM`.
+  setBasicHttpAuthenticator(DEFAULT_HTTP_AUTHENTICATION_REALM, credentials);
+
+  ACLs acls;
+
+  // This ACL asserts that the principal of `DEFAULT_CREDENTIAL` can GET any
+  // HTTP endpoints that are authorized with the `GetEndpoint` ACL.
+  mesos::ACL::GetEndpoint* acl = acls.add_get_endpoints();
+  acl->mutable_principals()->add_values(DEFAULT_CREDENTIAL.principal());
+  acl->mutable_paths()->set_type(mesos::ACL::Entity::NONE);
+
+  // Create a master.
+  master::Flags masterFlags = CreateMasterFlags();
+  masterFlags.acls = acls;
+
+  Try<Owned<cluster::Master>> master = StartMaster(masterFlags);
+  ASSERT_SOME(master);
+
+  // Get the snapshot.
+  process::UPID upid("metrics", process::address());
+
+  process::Future<process::http::Response> response = process::http::get(
+      upid,
+      "snapshot",
+      None(),
+      createBasicAuthHeaders(DEFAULT_CREDENTIAL));
+
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(
+      process::http::Forbidden().status, response);
+}
+
+
+// Tests that the `/metrics/snapshot` endpoint will reject unauthorized requests
+// when authentication and authorization are enabled on the agent.
+TEST_F(MetricsTest, AgentAuthorizationEnabled)
+{
+  Credentials credentials;
+  credentials.add_credentials()->CopyFrom(DEFAULT_CREDENTIAL);
+
+  // Create a basic HTTP authenticator with the specified credentials and set it
+  // as the authenticator for `DEFAULT_HTTP_AUTHENTICATION_REALM`.
+  setBasicHttpAuthenticator(DEFAULT_HTTP_AUTHENTICATION_REALM, credentials);
+
+  ACLs acls;
+
+  // This ACL asserts that the principal of `DEFAULT_CREDENTIAL` can GET any
+  // HTTP endpoints that are authorized with the `GetEndpoint` ACL.
+  mesos::ACL::GetEndpoint* acl = acls.add_get_endpoints();
+  acl->mutable_principals()->add_values(DEFAULT_CREDENTIAL.principal());
+  acl->mutable_paths()->set_type(mesos::ACL::Entity::NONE);
+
+  // Create an agent.
+  slave::Flags agentFlags = CreateSlaveFlags();
+  agentFlags.acls = acls;
+
+  Try<Owned<cluster::Master>> master = StartMaster();
+  ASSERT_SOME(master);
+
+  Owned<MasterDetector> detector = master.get()->createDetector();
+  Try<Owned<cluster::Slave>> agent = StartSlave(detector.get(), agentFlags);
+  ASSERT_SOME(agent);
+
+  // Get the snapshot.
+  process::UPID upid("metrics", process::address());
+
+  process::Future<process::http::Response> response = process::http::get(
+      upid,
+      "snapshot",
+      None(),
+      createBasicAuthHeaders(DEFAULT_CREDENTIAL));
+
+  AWAIT_EXPECT_RESPONSE_STATUS_EQ(
+      process::http::Forbidden().status, response);
 }
 
 } // namespace tests {

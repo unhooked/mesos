@@ -29,18 +29,27 @@ scripting languages without forcing those dependencies into the project.
 Finally, modules provide an easy way for third parties to easily extend Mesos
 without having to know all the internal details.
 
+## Where can Mesos modules be used?
+Modules can be specified for master, agent and tests. Modules can also be used
+with schedulers that link against libmesos. Currently, modules can not be
+used with executors.
 
 ## <a name="Invoking"></a>Invoking Mesos modules
+There are two ways to specify a list of modules to be loaded and be available to
+the internal subsystems.
 
-The command-line flag `--modules` is available for Mesos master, slave, and
-tests to specify a list of modules to be loaded and be available to the internal
-subsystems.
-
-Use `--modules=filepath` to specify the list of modules via a
-file containing a JSON-formatted string. 'filepath' can be
-of the form 'file:///path/to/file' or '/path/to/file'.
+* `--modules=filepath` to specify the list of modules via a manifest file
+  containing a JSON-formatted string. 'filepath' can be of the form
+  'file:///path/to/file' or '/path/to/file'.
 
 Use `--modules="{...}"` to specify the list of modules inline.
+
+* `--modules_dir=dirpath`to specify a directory name that contains several
+  module manifest files. Each file must contain a valid JSON-formatted
+  string containing module description. The module manifest files are processed
+  in alphabetical order.
+
+NOTE: Only one of `--modules` or `--modules_dir` flag can be used at time.
 
 
 ### Example JSON strings:
@@ -143,7 +152,7 @@ directly add or inject data into Mesos core either.
 
 Anonymous modules do not require any specific selectors (flags) as
 they are immediately instantiated when getting loaded via the
-`--modules` flag by the Mesos master or slave.
+`--modules` flag by the Mesos master or agent.
 
 ### Authentication
 
@@ -201,10 +210,10 @@ To load a hook into Mesos, you need to
 
 - select it as a hook module via the `--hooks` flag.
 
-For example, the following command will run the Mesos slave with the
+For example, the following command will run the Mesos agent with the
 `TestTaskHook` hook:
 
-    ./bin/mesos-slave.sh --master=<IP>:<PORT> --modules="file://<path-to-modules-config>.json" --hooks=TestTaskHook
+    ./bin/mesos-agent.sh --master=<IP>:<PORT> --modules="file://<path-to-modules-config>.json" --hooks=TestTaskHook
 
 
 ### Isolator
@@ -276,7 +285,7 @@ mesos::modules::Module<TestModule> org_apache_mesos_TestModule(
     g++ -lmesos -fpic -o test_module.o test_module.cpp
     $ gcc -shared -o libtest_module.so test_module.o
 
-### Testing a modules
+### Testing a module
 
 Apart from testing the module by hand with explicit use of --modules flag, one
 can run the entire mesos test suite with the given module. For example, the
@@ -352,23 +361,23 @@ must exist between the various versions:
 </tr>
 
 <tr>
-<td>0.29.0 </td> <td> 0.18.0 </td> <td> 0.18.0  </td> <td> yes </td> <td> </td>
+<td>1.0.0 </td> <td> 0.18.0 </td> <td> 0.18.0  </td> <td> yes </td> <td> </td>
 </tr>
 
 <tr>
-<td>0.29.0 </td> <td> 0.18.0 </td> <td> 0.21.0  </td> <td> yes </td> <td> </td>
+<td>1.0.0 </td> <td> 0.18.0 </td> <td> 0.21.0  </td> <td> yes </td> <td> </td>
 </tr>
 
 <tr>
-<td>0.18.0 </td> <td> 0.18.0 </td> <td> 0.29.0  </td> <td> NO </td> <td> Library compiled against a newer Mesos release.                </td>
+<td>0.18.0 </td> <td> 0.18.0 </td> <td> 1.0.0  </td> <td> NO </td> <td> Library compiled against a newer Mesos release.                </td>
 </tr>
 
 <tr>
-<td>0.29.0 </td> <td> 0.21.0 </td> <td> 0.18.0  </td> <td> NO </td> <td> Module/Library older than the kind version supported by Mesos. </td>
+<td>1.0.0 </td> <td> 0.21.0 </td> <td> 0.18.0  </td> <td> NO </td> <td> Module/Library older than the kind version supported by Mesos. </td>
 </tr>
 
 <tr>
-<td>0.29.0 </td> <td> 0.29.0 </td> <td> 0.18.0  </td> <td> NO </td> <td> Module/Library older than the kind version supported by Mesos. </td>
+<td>1.0.0 </td> <td> 1.0.0 </td> <td> 0.18.0  </td> <td> NO </td> <td> Module/Library older than the kind version supported by Mesos. </td>
 </tr>
 </table>
 

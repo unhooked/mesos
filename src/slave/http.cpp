@@ -14,26 +14,38 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <map>
+#include <list>
 #include <memory>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <vector>
-
-#include <mesos/executor/executor.hpp>
-
-#include <mesos/v1/executor/executor.hpp>
 
 #include <mesos/attributes.hpp>
 #include <mesos/type_utils.hpp>
 
+#include <mesos/agent/agent.hpp>
+
+#include <mesos/authorizer/authorizer.hpp>
+
+#include <mesos/executor/executor.hpp>
+
+#include <mesos/v1/agent/agent.hpp>
+
+#include <mesos/v1/executor/executor.hpp>
+
+#include <process/collect.hpp>
 #include <process/help.hpp>
+#include <process/http.hpp>
+#include <process/logging.hpp>
+#include <process/limiter.hpp>
 #include <process/owned.hpp>
 
 #include <process/metrics/metrics.hpp>
 
 #include <stout/foreach.hpp>
 #include <stout/json.hpp>
+#include <stout/jsonify.hpp>
 #include <stout/lambda.hpp>
 #include <stout/net.hpp>
 #include <stout/numify.hpp>
@@ -51,14 +63,17 @@
 #include "slave/slave.hpp"
 #include "slave/validation.hpp"
 
+#include "version/version.hpp"
 
+using process::AUTHENTICATION;
+using process::AUTHORIZATION;
 using process::Clock;
 using process::DESCRIPTION;
 using process::Future;
 using process::HELP;
+using process::Logging;
 using process::Owned;
 using process::TLDR;
-using process::USAGE;
 
 using process::http::Accepted;
 using process::http::BadRequest;
@@ -74,111 +89,102 @@ using process::http::UnsupportedMediaType;
 
 using process::metrics::internal::MetricsProcess;
 
-using std::map;
+using std::list;
 using std::string;
+using std::tuple;
 using std::vector;
 
 
 namespace mesos {
+
+static void json(JSON::ObjectWriter* writer, const TaskInfo& task)
+{
+  writer->field("id", task.task_id().value());
+  writer->field("name", task.name());
+  writer->field("slave_id", task.slave_id().value());
+  writer->field("resources", Resources(task.resources()));
+
+  if (task.has_command()) {
+    writer->field("command", task.command());
+  }
+  if (task.has_executor()) {
+    writer->field("executor_id", task.executor().executor_id().value());
+  }
+  if (task.has_discovery()) {
+    writer->field("discovery", JSON::Protobuf(task.discovery()));
+  }
+}
+
 namespace internal {
 namespace slave {
-
-
-// Pull in defnitions from common.
-using mesos::internal::model;
 
 // Pull in the process definitions.
 using process::http::Response;
 using process::http::Request;
 
 
-JSON::Object model(const TaskInfo& task)
+static void json(JSON::ObjectWriter* writer, const Executor& executor)
 {
-  JSON::Object object;
-  object.values["id"] = task.task_id().value();
-  object.values["name"] = task.name();
-  object.values["slave_id"] = task.slave_id().value();
-  object.values["resources"] = model(task.resources());
+  writer->field("id", executor.id.value());
+  writer->field("name", executor.info.name());
+  writer->field("source", executor.info.source());
+  writer->field("container", executor.containerId.value());
+  writer->field("directory", executor.directory);
+  writer->field("resources", executor.resources);
 
-  if (task.has_command()) {
-    object.values["command"] = model(task.command());
-  }
-  if (task.has_executor()) {
-    object.values["executor_id"] = task.executor().executor_id().value();
-  }
-  if (task.has_discovery()) {
-    object.values["discovery"] = JSON::protobuf(task.discovery());
+  if (executor.info.has_labels()) {
+    writer->field("labels", executor.info.labels());
   }
 
-  return object;
+  writer->field("tasks", [&executor](JSON::ArrayWriter* writer) {
+    foreach (Task* task, executor.launchedTasks.values()) {
+      writer->element(*task);
+    }
+  });
+
+  writer->field("queued_tasks", [&executor](JSON::ArrayWriter* writer) {
+    foreach (const TaskInfo& task, executor.queuedTasks.values()) {
+      writer->element(task);
+    }
+  });
+
+  writer->field("completed_tasks", [&executor](JSON::ArrayWriter* writer) {
+    foreach (const std::shared_ptr<Task>& task, executor.completedTasks) {
+      writer->element(*task);
+    }
+
+    // NOTE: We add 'terminatedTasks' to 'completed_tasks' for
+    // simplicity.
+    // TODO(vinod): Use foreachvalue instead once LinkedHashmap
+    // supports it.
+    foreach (Task* task, executor.terminatedTasks.values()) {
+      writer->element(*task);
+    }
+  });
 }
 
 
-JSON::Object model(const Executor& executor)
+static void json(JSON::ObjectWriter* writer, const Framework& framework)
 {
-  JSON::Object object;
-  object.values["id"] = executor.id.value();
-  object.values["name"] = executor.info.name();
-  object.values["source"] = executor.info.source();
-  object.values["container"] = executor.containerId.value();
-  object.values["directory"] = executor.directory;
-  object.values["resources"] = model(executor.resources);
+  writer->field("id", framework.id().value());
+  writer->field("name", framework.info.name());
+  writer->field("user", framework.info.user());
+  writer->field("failover_timeout", framework.info.failover_timeout());
+  writer->field("checkpoint", framework.info.checkpoint());
+  writer->field("role", framework.info.role());
+  writer->field("hostname", framework.info.hostname());
 
-  JSON::Array tasks;
-  foreach (Task* task, executor.launchedTasks.values()) {
-    tasks.values.push_back(model(*task));
-  }
-  object.values["tasks"] = tasks;
+  writer->field("executors", [&framework](JSON::ArrayWriter* writer) {
+    foreachvalue (Executor* executor, framework.executors) {
+      writer->element(*executor);
+    }
+  });
 
-  JSON::Array queued;
-  foreach (const TaskInfo& task, executor.queuedTasks.values()) {
-    queued.values.push_back(model(task));
-  }
-  object.values["queued_tasks"] = queued;
-
-  JSON::Array completed;
-  foreach (const std::shared_ptr<Task>& task, executor.completedTasks) {
-    completed.values.push_back(model(*task));
-  }
-
-  // NOTE: We add 'terminatedTasks' to 'completed_tasks' for
-  // simplicity.
-  // TODO(vinod): Use foreachvalue instead once LinkedHashmap
-  // supports it.
-  foreach (Task* task, executor.terminatedTasks.values()) {
-    completed.values.push_back(model(*task));
-  }
-  object.values["completed_tasks"] = completed;
-
-  return object;
-}
-
-
-// Returns a JSON object modeled after a Framework.
-JSON::Object model(const Framework& framework)
-{
-  JSON::Object object;
-  object.values["id"] = framework.id().value();
-  object.values["name"] = framework.info.name();
-  object.values["user"] = framework.info.user();
-  object.values["failover_timeout"] = framework.info.failover_timeout();
-  object.values["checkpoint"] = framework.info.checkpoint();
-  object.values["role"] = framework.info.role();
-  object.values["hostname"] = framework.info.hostname();
-
-  JSON::Array executors;
-  foreachvalue (Executor* executor, framework.executors) {
-    executors.values.push_back(model(*executor));
-  }
-  object.values["executors"] = executors;
-
-  JSON::Array completedExecutors;
-  foreach (const Owned<Executor>& executor, framework.completedExecutors) {
-    completedExecutors.values.push_back(model(*executor));
-  }
-  object.values["completed_executors"] = completedExecutors;
-
-  return object;
+  writer->field("completed_executors", [&framework](JSON::ArrayWriter* writer) {
+    foreach (const Owned<Executor>& executor, framework.completedExecutors) {
+      writer->element(*executor);
+    }
+  });
 }
 
 
@@ -198,6 +204,126 @@ void Slave::Http::log(const Request& request)
 }
 
 
+string Slave::Http::API_HELP()
+{
+  return HELP(
+    TLDR(
+        "Endpoint for API calls against the agent."),
+    DESCRIPTION(
+        "Returns 200 OK if the call is successful"),
+    AUTHENTICATION(false));
+}
+
+
+Future<Response> Slave::Http::api(
+    const Request& request,
+    const Option<string>& principal) const
+{
+  // TODO(anand): Add metrics for rejected requests.
+
+  if (slave->state == Slave::RECOVERING) {
+    return ServiceUnavailable("Agent has not finished recovery");
+  }
+
+  if (request.method != "POST") {
+    return MethodNotAllowed({"POST"}, request.method);
+  }
+
+  v1::agent::Call v1Call;
+
+  Option<string> contentType = request.headers.get("Content-Type");
+  if (contentType.isNone()) {
+    return BadRequest("Expecting 'Content-Type' to be present");
+  }
+
+  if (contentType.get() == APPLICATION_PROTOBUF) {
+    if (!v1Call.ParseFromString(request.body)) {
+      return BadRequest("Failed to parse body into Call protobuf");
+    }
+  } else if (contentType.get() == APPLICATION_JSON) {
+    Try<JSON::Value> value = JSON::parse(request.body);
+    if (value.isError()) {
+      return BadRequest("Failed to parse body into JSON: " + value.error());
+    }
+
+    Try<v1::agent::Call> parse =
+      ::protobuf::parse<v1::agent::Call>(value.get());
+
+    if (parse.isError()) {
+      return BadRequest("Failed to convert JSON into Call protobuf: " +
+                        parse.error());
+    }
+
+    v1Call = parse.get();
+  } else {
+    return UnsupportedMediaType(
+        string("Expecting 'Content-Type' of ") +
+        APPLICATION_JSON + " or " + APPLICATION_PROTOBUF);
+  }
+
+  agent::Call call = devolve(v1Call);
+
+  Option<Error> error = validation::agent::call::validate(call);
+
+  if (error.isSome()) {
+    return BadRequest("Failed to validate agent::Call: " + error.get().message);
+  }
+
+  LOG(INFO) << "Processing call " << call.type();
+
+  ContentType acceptType;
+  if (request.acceptsMediaType(APPLICATION_JSON)) {
+    acceptType = ContentType::JSON;
+  } else if (request.acceptsMediaType(APPLICATION_PROTOBUF)) {
+    acceptType = ContentType::PROTOBUF;
+  } else {
+    return NotAcceptable(
+        string("Expecting 'Accept' to allow ") +
+        "'" + APPLICATION_PROTOBUF + "' or '" + APPLICATION_JSON + "'");
+  }
+
+  switch (call.type()) {
+    case agent::Call::UNKNOWN:
+      return NotImplemented();
+
+    case agent::Call::GET_HEALTH:
+      return getHealth(call, principal, acceptType);
+
+    case agent::Call::GET_FLAGS:
+      return getFlags(call, principal, acceptType);
+
+    case agent::Call::GET_VERSION:
+      return getVersion(call, principal, acceptType);
+
+    case agent::Call::GET_METRICS:
+      return getMetrics(call, principal, acceptType);
+
+    case agent::Call::GET_LOGGING_LEVEL:
+      return getLoggingLevel(call, principal, acceptType);
+
+    case agent::Call::SET_LOGGING_LEVEL:
+      return setLoggingLevel(call, principal, acceptType);
+
+    case agent::Call::LIST_FILES:
+      return NotImplemented();
+
+    case agent::Call::READ_FILE:
+      return NotImplemented();
+
+    case agent::Call::GET_STATE:
+      return NotImplemented();
+
+    case agent::Call::GET_RESOURCE_STATISTICS:
+      return NotImplemented();
+
+    case agent::Call::GET_CONTAINERS:
+      return NotImplemented();
+  }
+
+  UNREACHABLE();
+}
+
+
 string Slave::Http::EXECUTOR_HELP() {
   return HELP(
     TLDR(
@@ -210,7 +336,8 @@ string Slave::Http::EXECUTOR_HELP() {
         "transfer encoding. The executors can process the response",
         "incrementally.",
         "Returns 202 Accepted for all other Call messages iff the",
-        "request is accepted."));
+        "request is accepted."),
+    AUTHENTICATION(false));
 }
 
 
@@ -219,8 +346,7 @@ Future<Response> Slave::Http::executor(const Request& request) const
   // TODO(anand): Add metrics for rejected requests.
 
   if (request.method != "POST") {
-    return MethodNotAllowed(
-        {"POST"}, "Expecting 'POST', received '" + request.method + "'");
+    return MethodNotAllowed({"POST"}, request.method);
   }
 
   v1::executor::Call v1Call;
@@ -264,15 +390,15 @@ Future<Response> Slave::Http::executor(const Request& request) const
                       error.get().message);
   }
 
-  ContentType responseContentType;
+  ContentType acceptType;
 
   if (call.type() == executor::Call::SUBSCRIBE) {
     // We default to JSON since an empty 'Accept' header
     // results in all media types considered acceptable.
     if (request.acceptsMediaType(APPLICATION_JSON)) {
-      responseContentType = ContentType::JSON;
+      acceptType = ContentType::JSON;
     } else if (request.acceptsMediaType(APPLICATION_PROTOBUF)) {
-      responseContentType = ContentType::PROTOBUF;
+      acceptType = ContentType::PROTOBUF;
     } else {
       return NotAcceptable(
           string("Expecting 'Accept' to allow ") +
@@ -287,12 +413,12 @@ Future<Response> Slave::Http::executor(const Request& request) const
   // We consolidate the framework/executor lookup logic here because
   // it is common for all the call handlers.
   Framework* framework = slave->getFramework(call.framework_id());
-  if (framework == NULL) {
+  if (framework == nullptr) {
     return BadRequest("Framework cannot be found");
   }
 
   Executor* executor = framework->getExecutor(call.executor_id());
-  if (executor == NULL) {
+  if (executor == nullptr) {
     return BadRequest("Executor cannot be found");
   }
 
@@ -305,12 +431,12 @@ Future<Response> Slave::Http::executor(const Request& request) const
     case executor::Call::SUBSCRIBE: {
       Pipe pipe;
       OK ok;
-      ok.headers["Content-Type"] = stringify(responseContentType);
+      ok.headers["Content-Type"] = stringify(acceptType);
 
       ok.type = Response::PIPE;
       ok.reader = pipe.reader();
 
-      HttpConnection http {pipe.writer(), responseContentType};
+      HttpConnection http {pipe.writer(), acceptType};
       slave->subscribe(http, call.subscribe(), framework, executor);
 
       return ok;
@@ -336,37 +462,85 @@ Future<Response> Slave::Http::executor(const Request& request) const
       return Accepted();
     }
 
-    default:
-      // Should be caught during call validation above.
-      LOG(FATAL) << "Unexpected " << call.type() << " call";
+    case executor::Call::UNKNOWN: {
+      LOG(WARNING) << "Received 'UNKNOWN' call";
+      return NotImplemented();
+    }
   }
 
-  return NotImplemented();
+  UNREACHABLE();
 }
 
 
 string Slave::Http::FLAGS_HELP()
 {
-  return HELP(TLDR("Exposes the agent's flag configuration."));
+  return HELP(
+    TLDR("Exposes the agent's flag configuration."),
+    None(),
+    AUTHENTICATION(true),
+    AUTHORIZATION(
+        "The request principal should be authorized to query this endpoint.",
+        "See the authorization documentation for details."));
 }
 
 
-Future<Response> Slave::Http::flags(const Request& request) const
+Future<Response> Slave::Http::flags(
+    const Request& request,
+    const Option<string>& principal) const
+{
+  // TODO(nfnt): Remove check for enabled
+  // authorization as part of MESOS-5346.
+  if (request.method != "GET" && slave->authorizer.isSome()) {
+    return MethodNotAllowed({"GET"}, request.method);
+  }
+
+  Try<string> endpoint = extractEndpoint(request.url);
+  if (endpoint.isError()) {
+    return Failure("Failed to extract endpoint: " + endpoint.error());
+  }
+
+  return authorizeEndpoint(principal, endpoint.get(), request.method)
+    .then(defer(
+        slave->self(),
+        [this, request](bool authorized) -> Future<Response> {
+          if (!authorized) {
+            return Forbidden();
+          }
+
+          return OK(_flags(), request.url.query.get("jsonp"));
+        }));
+}
+
+
+JSON::Object Slave::Http::_flags() const
 {
   JSON::Object object;
 
   {
     JSON::Object flags;
-    foreachpair (const string& name, const flags::Flag& flag, slave->flags) {
+    foreachvalue (const flags::Flag& flag, slave->flags) {
       Option<string> value = flag.stringify(slave->flags);
       if (value.isSome()) {
-        flags.values[name] = value.get();
+        flags.values[flag.effective_name().value] = value.get();
       }
     }
     object.values["flags"] = std::move(flags);
   }
 
-  return OK(object, request.url.query.get("jsonp"));
+  return object;
+}
+
+
+Future<Response> Slave::Http::getFlags(
+    const agent::Call& call,
+    const Option<string>& principal,
+    ContentType contentType) const
+{
+  CHECK_EQ(agent::Call::GET_FLAGS, call.type());
+
+  return OK(serialize(contentType,
+                      evolve<v1::agent::Response::GET_FLAGS>(_flags())),
+            stringify(contentType));
 }
 
 
@@ -374,10 +548,11 @@ string Slave::Http::HEALTH_HELP()
 {
   return HELP(
     TLDR(
-        "Health check of the Slave."),
+        "Health check of the Agent."),
     DESCRIPTION(
-        "Returns 200 OK iff the Slave is healthy.",
-        "Delayed responses are also indicative of poor health."));
+        "Returns 200 OK iff the Agent is healthy.",
+        "Delayed responses are also indicative of poor health."),
+    AUTHENTICATION(false));
 }
 
 
@@ -387,13 +562,108 @@ Future<Response> Slave::Http::health(const Request& request) const
 }
 
 
+Future<Response> Slave::Http::getHealth(
+    const agent::Call& call,
+    const Option<string>& principal,
+    ContentType contentType) const
+{
+  CHECK_EQ(agent::Call::GET_HEALTH, call.type());
+
+  agent::Response response;
+  response.set_type(agent::Response::GET_HEALTH);
+  response.mutable_get_health()->set_healthy(true);
+
+  return OK(serialize(contentType, evolve(response)),
+            stringify(contentType));
+}
+
+
+Future<Response> Slave::Http::getVersion(
+    const agent::Call& call,
+    const Option<string>& principal,
+    ContentType contentType) const
+{
+  CHECK_EQ(agent::Call::GET_VERSION, call.type());
+
+  return OK(serialize(contentType,
+                      evolve<v1::agent::Response::GET_VERSION>(version())),
+            stringify(contentType));
+}
+
+
+Future<Response> Slave::Http::getMetrics(
+    const agent::Call& call,
+    const Option<string>& principal,
+    ContentType contentType) const
+{
+  CHECK_EQ(agent::Call::GET_METRICS, call.type());
+  CHECK(call.has_get_metrics());
+
+  Option<Duration> timeout;
+  if (call.get_metrics().has_timeout()) {
+    timeout = Nanoseconds(call.get_metrics().timeout().nanoseconds());
+  }
+
+  return process::metrics::snapshot(timeout)
+      .then([contentType](const hashmap<string, double>& metrics) -> Response {
+        agent::Response response;
+        response.set_type(agent::Response::GET_METRICS);
+        agent::Response::GetMetrics* _getMetrics =
+          response.mutable_get_metrics();
+
+        foreachpair (const string& key, double value, metrics) {
+          Metric* metric = _getMetrics->add_metrics();
+          metric->set_name(key);
+          metric->set_value(value);
+        }
+
+        return OK(serialize(contentType, response), stringify(contentType));
+      });
+}
+
+
+Future<Response> Slave::Http::getLoggingLevel(
+    const agent::Call& call,
+    const Option<string>& principal,
+    ContentType contentType) const
+{
+  CHECK_EQ(agent::Call::GET_LOGGING_LEVEL, call.type());
+
+  agent::Response response;
+  response.set_type(agent::Response::GET_LOGGING_LEVEL);
+  response.mutable_get_logging_level()->set_level(FLAGS_v);
+
+  return OK(serialize(contentType, evolve(response)),
+            stringify(contentType));
+}
+
+
+Future<Response> Slave::Http::setLoggingLevel(
+    const agent::Call& call,
+    const Option<string>& principal,
+    ContentType /*contentType*/) const
+{
+  CHECK_EQ(agent::Call::SET_LOGGING_LEVEL, call.type());
+  CHECK(call.has_set_logging_level());
+
+  uint32_t level = call.set_logging_level().level();
+  Duration duration =
+    Nanoseconds(call.set_logging_level().duration().nanoseconds());
+
+  return dispatch(process::logging(), &Logging::set_level, level, duration)
+      .then([]() -> Response {
+        return OK();
+      });
+}
+
+
 string Slave::Http::STATE_HELP() {
   return HELP(
     TLDR(
-        "Information about state of the Slave."),
+        "Information about state of the Agent."),
     DESCRIPTION(
         "This endpoint shows information about the frameworks, executors",
-        "and the slave's master as a JSON object.",
+        "and the agent's master as a JSON object.",
         "",
         "Example (**Note**: this is not exhaustive):",
         "",
@@ -477,78 +747,398 @@ string Slave::Http::STATE_HELP() {
         "         \"version\" : \"false\"",
         "    },",
         "}",
-        "```"));
+        "```"),
+    AUTHENTICATION(true));
 }
 
 
-Future<Response> Slave::Http::state(const Request& request) const
+Future<Response> Slave::Http::state(
+    const Request& request,
+    const Option<string>& /* principal */) const
 {
   if (slave->state == Slave::RECOVERING) {
     return ServiceUnavailable("Agent has not finished recovery");
   }
 
-  JSON::Object object;
-  object.values["version"] = MESOS_VERSION;
+  auto state = [this](JSON::ObjectWriter* writer) {
+    writer->field("version", MESOS_VERSION);
 
-  if (build::GIT_SHA.isSome()) {
-    object.values["git_sha"] = build::GIT_SHA.get();
+    if (build::GIT_SHA.isSome()) {
+      writer->field("git_sha", build::GIT_SHA.get());
+    }
+
+    if (build::GIT_BRANCH.isSome()) {
+      writer->field("git_branch", build::GIT_BRANCH.get());
+    }
+
+    if (build::GIT_TAG.isSome()) {
+      writer->field("git_tag", build::GIT_TAG.get());
+    }
+
+    writer->field("build_date", build::DATE);
+    writer->field("build_time", build::TIME);
+    writer->field("build_user", build::USER);
+    writer->field("start_time", slave->startTime.secs());
+
+    writer->field("id", slave->info.id().value());
+    writer->field("pid", string(slave->self()));
+    writer->field("hostname", slave->info.hostname());
+
+    writer->field("resources", Resources(slave->info.resources()));
+    writer->field("attributes", Attributes(slave->info.attributes()));
+
+    if (slave->master.isSome()) {
+      Try<string> hostname = net::getHostname(slave->master.get().address.ip);
+      if (hostname.isSome()) {
+        writer->field("master_hostname", hostname.get());
+      }
+    }
+
+    if (slave->flags.log_dir.isSome()) {
+      writer->field("log_dir", slave->flags.log_dir.get());
+    }
+
+    if (slave->flags.external_log_file.isSome()) {
+      writer->field("external_log_file", slave->flags.external_log_file.get());
+    }
+
+    writer->field("frameworks", [this](JSON::ArrayWriter* writer) {
+      foreachvalue (Framework* framework, slave->frameworks) {
+        writer->element(*framework);
+      }
+    });
+
+    // Model all of the completed frameworks.
+    writer->field("completed_frameworks", [this](JSON::ArrayWriter* writer) {
+      foreach (const Owned<Framework>& framework, slave->completedFrameworks) {
+        writer->element(*framework);
+      }
+    });
+
+    writer->field("flags", [this](JSON::ObjectWriter* writer) {
+      foreachvalue (const flags::Flag& flag, slave->flags) {
+        Option<string> value = flag.stringify(slave->flags);
+        if (value.isSome()) {
+          writer->field(flag.effective_name().value, value.get());
+        }
+      }
+    });
+  };
+
+  return OK(jsonify(state), request.url.query.get("jsonp"));
+}
+
+
+string Slave::Http::STATISTICS_HELP()
+{
+  return HELP(
+      TLDR(
+          "Retrieve resource monitoring information."),
+      DESCRIPTION(
+          "Returns the current resource consumption data for containers",
+          "running under this agent.",
+          "",
+          "Example:",
+          "",
+          "```",
+          "[{",
+          "    \"executor_id\":\"executor\",",
+          "    \"executor_name\":\"name\",",
+          "    \"framework_id\":\"framework\",",
+          "    \"source\":\"source\",",
+          "    \"statistics\":",
+          "    {",
+          "        \"cpus_limit\":8.25,",
+          "        \"cpus_nr_periods\":769021,",
+          "        \"cpus_nr_throttled\":1046,",
+          "        \"cpus_system_time_secs\":34501.45,",
+          "        \"cpus_throttled_time_secs\":352.597023453,",
+          "        \"cpus_user_time_secs\":96348.84,",
+          "        \"mem_anon_bytes\":4845449216,",
+          "        \"mem_file_bytes\":260165632,",
+          "        \"mem_limit_bytes\":7650410496,",
+          "        \"mem_mapped_file_bytes\":7159808,",
+          "        \"mem_rss_bytes\":5105614848,",
+          "        \"timestamp\":1388534400.0",
+          "    }",
+          "}]",
+          "```"),
+      AUTHENTICATION(true),
+      AUTHORIZATION(
+          "The request principal should be authorized to query this endpoint.",
+          "See the authorization documentation for details."));
+}
+
+
+Future<Response> Slave::Http::statistics(
+    const Request& request,
+    const Option<string>& principal) const
+{
+  // TODO(nfnt): Remove check for enabled
+  // authorization as part of MESOS-5346.
+  if (request.method != "GET" && slave->authorizer.isSome()) {
+    return MethodNotAllowed({"GET"}, request.method);
   }
 
-  if (build::GIT_BRANCH.isSome()) {
-    object.values["git_branch"] = build::GIT_BRANCH.get();
+  Try<string> endpoint = extractEndpoint(request.url);
+  if (endpoint.isError()) {
+    return Failure("Failed to extract endpoint: " + endpoint.error());
   }
 
-  if (build::GIT_TAG.isSome()) {
-    object.values["git_tag"] = build::GIT_TAG.get();
-  }
+  return authorizeEndpoint(principal, endpoint.get(), request.method)
+    .then(defer(
+        slave->self(),
+        [this, request](bool authorized) -> Future<Response> {
+          if (!authorized) {
+            return Forbidden();
+          }
 
-  object.values["build_date"] = build::DATE;
-  object.values["build_time"] = build::TIME;
-  object.values["build_user"] = build::USER;
-  object.values["start_time"] = slave->startTime.secs();
-  object.values["id"] = slave->info.id().value();
-  object.values["pid"] = string(slave->self());
-  object.values["hostname"] = slave->info.hostname();
-  object.values["resources"] = model(slave->info.resources());
-  object.values["attributes"] = model(slave->info.attributes());
+          return statisticsLimiter->acquire()
+            .then(defer(slave->self(), &Slave::usage))
+            .then(defer(slave->self(),
+                  [this, request](const ResourceUsage& usage) {
+              return _statistics(usage, request);
+            }));
+        }));
+}
 
-  if (slave->master.isSome()) {
-    Try<string> hostname = net::getHostname(slave->master.get().address.ip);
-    if (hostname.isSome()) {
-      object.values["master_hostname"] = hostname.get();
+
+Response Slave::Http::_statistics(
+    const ResourceUsage& usage,
+    const Request& request) const
+{
+  JSON::Array result;
+
+  foreach (const ResourceUsage::Executor& executor, usage.executors()) {
+    if (executor.has_statistics()) {
+      const ExecutorInfo info = executor.executor_info();
+
+      JSON::Object entry;
+      entry.values["framework_id"] = info.framework_id().value();
+      entry.values["executor_id"] = info.executor_id().value();
+      entry.values["executor_name"] = info.name();
+      entry.values["source"] = info.source();
+      entry.values["statistics"] = JSON::protobuf(executor.statistics());
+
+      result.values.push_back(entry);
     }
   }
 
-  if (slave->flags.log_dir.isSome()) {
-    object.values["log_dir"] = slave->flags.log_dir.get();
+  return OK(result, request.url.query.get("jsonp"));
+}
+
+
+string Slave::Http::CONTAINERS_HELP()
+{
+  return HELP(
+      TLDR(
+          "Retrieve container status and usage information."),
+      DESCRIPTION(
+          "Returns the current resource consumption data and status for",
+          "containers running under this slave.",
+          "",
+          "Example (**Note**: this is not exhaustive):",
+          "",
+          "```",
+          "[{",
+          "    \"container_id\":\"container\",",
+          "    \"container_status\":",
+          "    {",
+          "        \"network_infos\":",
+          "        [{\"ip_addresses\":[{\"ip_address\":\"192.168.1.1\"}]}]",
+          "    }",
+          "    \"executor_id\":\"executor\",",
+          "    \"executor_name\":\"name\",",
+          "    \"framework_id\":\"framework\",",
+          "    \"source\":\"source\",",
+          "    \"statistics\":",
+          "    {",
+          "        \"cpus_limit\":8.25,",
+          "        \"cpus_nr_periods\":769021,",
+          "        \"cpus_nr_throttled\":1046,",
+          "        \"cpus_system_time_secs\":34501.45,",
+          "        \"cpus_throttled_time_secs\":352.597023453,",
+          "        \"cpus_user_time_secs\":96348.84,",
+          "        \"mem_anon_bytes\":4845449216,",
+          "        \"mem_file_bytes\":260165632,",
+          "        \"mem_limit_bytes\":7650410496,",
+          "        \"mem_mapped_file_bytes\":7159808,",
+          "        \"mem_rss_bytes\":5105614848,",
+          "        \"timestamp\":1388534400.0",
+          "    }",
+          "}]",
+          "```"),
+      AUTHENTICATION(true),
+      AUTHORIZATION(
+          "The request principal should be authorized to query this endpoint.",
+          "See the authorization documentation for details."));
+}
+
+
+Future<Response> Slave::Http::containers(
+    const Request& request,
+    const Option<string>& principal) const
+{
+  // TODO(a10gupta): Remove check for enabled
+  // authorization as part of MESOS-5346.
+  if (request.method != "GET" && slave->authorizer.isSome()) {
+    return MethodNotAllowed({"GET"}, request.method);
   }
 
-  if (slave->flags.external_log_file.isSome()) {
-    object.values["external_log_file"] = slave->flags.external_log_file.get();
+  Try<string> endpoint = extractEndpoint(request.url);
+  if (endpoint.isError()) {
+    return Failure("Failed to extract endpoint: " + endpoint.error());
   }
 
-  JSON::Array frameworks;
-  foreachvalue (Framework* framework, slave->frameworks) {
-    frameworks.values.push_back(model(*framework));
-  }
-  object.values["frameworks"] = frameworks;
+  return authorizeEndpoint(principal, endpoint.get(), request.method)
+    .then(defer(
+        slave->self(),
+        [this, request](bool authorized) -> Future<Response> {
+          if (!authorized) {
+            return Forbidden();
+          }
 
-  JSON::Array completedFrameworks;
-  foreach (const Owned<Framework>& framework, slave->completedFrameworks) {
-    completedFrameworks.values.push_back(model(*framework));
-  }
-  object.values["completed_frameworks"] = completedFrameworks;
+          return _containers(request);
+        }));
+}
 
-  JSON::Object flags;
-  foreachpair (const string& name, const flags::Flag& flag, slave->flags) {
-    Option<string> value = flag.stringify(slave->flags);
-    if (value.isSome()) {
-      flags.values[name] = value.get();
+
+Future<Response> Slave::Http::_containers(const Request& request) const
+{
+  Owned<list<JSON::Object>> metadata(new list<JSON::Object>());
+  list<Future<ContainerStatus>> statusFutures;
+  list<Future<ResourceStatistics>> statsFutures;
+
+  foreachvalue (const Framework* framework, slave->frameworks) {
+    foreachvalue (const Executor* executor, framework->executors) {
+      const ExecutorInfo& info = executor->info;
+      const ContainerID& containerId = executor->containerId;
+
+      JSON::Object entry;
+      entry.values["framework_id"] = info.framework_id().value();
+      entry.values["executor_id"] = info.executor_id().value();
+      entry.values["executor_name"] = info.name();
+      entry.values["source"] = info.source();
+      entry.values["container_id"] = containerId.value();
+
+      metadata->push_back(entry);
+      statusFutures.push_back(slave->containerizer->status(containerId));
+      statsFutures.push_back(slave->containerizer->usage(containerId));
     }
   }
-  object.values["flags"] = flags;
 
-  return OK(object, request.url.query.get("jsonp"));
+  return await(await(statusFutures), await(statsFutures)).then(
+      [metadata, request](const tuple<
+          Future<list<Future<ContainerStatus>>>,
+          Future<list<Future<ResourceStatistics>>>>& t)
+          -> Future<Response> {
+        const list<Future<ContainerStatus>>& status = std::get<0>(t).get();
+        const list<Future<ResourceStatistics>>& stats = std::get<1>(t).get();
+        CHECK_EQ(status.size(), stats.size());
+        CHECK_EQ(status.size(), metadata->size());
+
+        JSON::Array result;
+
+        auto statusIter = status.begin();
+        auto statsIter = stats.begin();
+        auto metadataIter = metadata->begin();
+
+        while (statusIter != status.end() &&
+               statsIter != stats.end() &&
+               metadataIter != metadata->end()) {
+          JSON::Object& entry= *metadataIter;
+
+          if (statusIter->isReady()) {
+            entry.values["status"] = JSON::protobuf(statusIter->get());
+          } else {
+            LOG(WARNING) << "Failed to get container status for executor '"
+                         << entry.values["executor_id"] << "'"
+                         << " of framework "
+                         << entry.values["framework_id"] << ": "
+                         << (statusIter->isFailed()
+                              ? statusIter->failure()
+                              : "discarded");
+          }
+
+          if (statsIter->isReady()) {
+            entry.values["statistics"] = JSON::protobuf(statsIter->get());
+          } else {
+            LOG(WARNING) << "Failed to get resource statistics for executor '"
+                         << entry.values["executor_id"] << "'"
+                         << " of framework "
+                         << entry.values["framework_id"] << ": "
+                         << (statsIter->isFailed()
+                              ? statsIter->failure()
+                              : "discarded");
+          }
+
+          result.values.push_back(entry);
+
+          statusIter++;
+          statsIter++;
+          metadataIter++;
+        }
+
+        return process::http::OK(result, request.url.query.get("jsonp"));
+      })
+      .repair([](const Future<Response>& future) {
+        LOG(WARNING) << "Could not collect container status and statistics: "
+                     << future.failure();
+
+        return InternalServerError();
+      });
+}
+
+
+Try<string> Slave::Http::extractEndpoint(const process::http::URL& url) const
+{
+  // Paths are of the form "/slave(n)/endpoint". We're only interested
+  // in the part after "/slave(n)" and tokenize the path accordingly.
+  //
+  // TODO(alexr): In the long run, absolute paths for
+  // endpoins should be supported, see MESOS-5369.
+  const vector<string> pathComponents = strings::tokenize(url.path, "/", 2);
+
+  if (pathComponents.size() < 2u ||
+      pathComponents[0] != slave->self().id) {
+    return Error("Unexpected path '" + url.path + "'");
+  }
+
+  return "/" + pathComponents[1];
+}
+
+
+Future<bool> Slave::Http::authorizeEndpoint(
+    const Option<string>& principal,
+    const string& endpoint,
+    const string& method) const
+{
+  if (slave->authorizer.isNone()) {
+    return true;
+  }
+
+  authorization::Request request;
+
+  // TODO(nfnt): Add an additional case when POST requests
+  // need to be authorized separately from GET requests.
+  if (method == "GET") {
+    request.set_action(authorization::GET_ENDPOINT_WITH_PATH);
+  } else {
+    return Failure("Unexpected request method '" + method + "'");
+  }
+
+  if (principal.isSome()) {
+    request.mutable_subject()->set_value(principal.get());
+  }
+
+  request.mutable_object()->set_value(endpoint);
+
+  LOG(INFO) << "Authorizing principal '"
+            << (principal.isSome() ? principal.get() : "ANY")
+            << "' to " <<  method
+            << " the '" << endpoint << "' endpoint";
+
+  return slave->authorizer.get()->authorized(request);
 }
 
 } // namespace slave {

@@ -86,6 +86,7 @@ TEST(HTTPTest, ModelTask)
   taskInfo.mutable_task_id()->CopyFrom(taskId);
   taskInfo.mutable_slave_id()->CopyFrom(slaveId);
   taskInfo.mutable_command()->set_value("echo hello");
+  taskInfo.mutable_command()->set_user("user1");
   taskInfo.mutable_discovery()->CopyFrom(discovery);
 
   Task task = createTask(taskInfo, state, frameworkId);
@@ -103,6 +104,7 @@ TEST(HTTPTest, ModelTask)
       "  {"
       "    \"cpus\":0,"
       "    \"disk\":0,"
+      "    \"gpus\":0,"
       "    \"mem\":0"
       "  },"
       "  \"slave_id\":\"s\","
@@ -137,7 +139,8 @@ TEST(HTTPTest, ModelTask)
       "     ]"
       "   },"
       "   \"visibility\":\"CLUSTER\""
-      " }"
+      " },"
+      " \"user\":\"user1\""
       "}");
 
   ASSERT_SOME(expected);
@@ -153,17 +156,20 @@ TEST(HTTPTest, ModelResources)
   // Resources of mixed types, roles, duplicate names; standard (
   // e.g., 'cpus') and custom (i.e., 'bar').
   Resources nonRevocable = Resources::parse(
-      "cpus:1;cpus(foo):1;mem:512;disk:1024;ports(foo):[1-10];bar:1").get();
+      "cpus:1;cpus(foo):1;gpus:1;mem:512;"
+      "disk:1024;ports(foo):[1-10];bar:1").get();
 
   Resource revocableCpus = Resources::parse("cpus", "1.1", "*").get();
   revocableCpus.mutable_revocable();
+  Resource revocableGpus = Resources::parse("gpus", "2", "*").get();
+  revocableGpus.mutable_revocable();
   Resource revocableMem = Resources::parse("mem", "513", "*").get();
   revocableMem.mutable_revocable();
   Resource revocableDisk = Resources::parse("disk", "1025", "*").get();
   revocableDisk.mutable_revocable();
 
   Resources total =
-    nonRevocable + revocableCpus + revocableMem + revocableDisk;
+    nonRevocable + revocableCpus + revocableGpus + revocableMem + revocableDisk;
 
   JSON::Value object = model(total);
 
@@ -174,6 +180,8 @@ TEST(HTTPTest, ModelResources)
       "  \"cpus_revocable\":1.1,"
       "  \"disk\":1024,"
       "  \"disk_revocable\":1025,"
+      "  \"gpus\":1,"
+      "  \"gpus_revocable\":2,"
       "  \"mem\":512,"
       "  \"mem_revocable\":513,"
       "  \"ports\":\"[1-10]\""
@@ -204,14 +212,16 @@ TEST(HTTP, ModelRoleResources)
       "  {"
       "    \"cpus\":1,"
       "    \"disk\":0,"
+      "    \"gpus\":0,"
       "    \"mem\":0,"
       "    \"ports\":\"[1-10]\""
       "  },"
       "  \"bar\":"
       "  {"
       "    \"cpus\":0,"
-      "    \"mem\":512,"
-      "    \"disk\":1024"
+      "    \"disk\":1024,"
+      "    \"gpus\":0,"
+      "    \"mem\":512"
       "  }"
       "}");
 
@@ -227,8 +237,6 @@ TEST(HTTP, SerializeNetworkInfo)
   NetworkInfo::IPAddress* address = networkInfo.add_ip_addresses();
   address->set_protocol(NetworkInfo::IPv4);
   address->set_ip_address("10.0.0.1");
-  networkInfo.set_protocol(NetworkInfo::IPv6);
-  networkInfo.set_ip_address("10.0.0.2");
   networkInfo.add_groups("foo");
   networkInfo.add_groups("bar");
 
@@ -243,8 +251,6 @@ TEST(HTTP, SerializeNetworkInfo)
       "      \"ip_address\": \"10.0.0.1\""
       "    }"
       "  ],"
-      "  \"protocol\": \"IPv6\","
-      "  \"ip_address\": \"10.0.0.2\","
       "  \"groups\": ["
       "    \"foo\","
       "    \"bar\""

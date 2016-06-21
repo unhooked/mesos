@@ -56,6 +56,8 @@ using mesos::internal::slave::DockerContainerizerProcess;
 using mesos::internal::slave::Fetcher;
 using mesos::internal::slave::Slave;
 
+using mesos::master::detector::MasterDetector;
+
 using mesos::slave::ContainerLogger;
 
 using std::list;
@@ -285,8 +287,8 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_Launch_Executor)
 
 // This test verifies that a custom executor can be launched and
 // registered with the slave with docker bridge network enabled.
-// We're assuming that the custom executor is registering it's public
-// ip instead of 0.0.0.0 or equivelent to the slave as that's the
+// We're assuming that the custom executor is registering its public
+// ip instead of 0.0.0.0 or equivalent to the slave as that's the
 // default behavior for libprocess.
 //
 // Currently this test fails on ubuntu and centos since the slave is
@@ -523,10 +525,15 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_Launch)
   Result<JSON::Value> find = parse.get().find<JSON::Value>(
       "frameworks[0].tasks[0].container.docker.privileged");
 
-  EXPECT_SOME_EQ(false, find);
+  EXPECT_SOME_FALSE(find);
 
   // Check if container information is exposed through slave's state endpoint.
-  response = http::get(slave.get()->pid, "state");
+  response = http::get(
+      slave.get()->pid,
+      "state",
+      None(),
+      createBasicAuthHeaders(DEFAULT_CREDENTIAL));
+
   AWAIT_EXPECT_RESPONSE_STATUS_EQ(process::http::OK().status, response);
 
   parse = JSON::parse<JSON::Object>(response.get().body);
@@ -535,13 +542,12 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_Launch)
   find = parse.get().find<JSON::Value>(
       "frameworks[0].executors[0].tasks[0].container.docker.privileged");
 
-  EXPECT_SOME_EQ(false, find);
+  EXPECT_SOME_FALSE(find);
 
   // Now verify that the TaskStatus contains the container IP address.
   ASSERT_TRUE(statusRunning.get().has_container_status());
   EXPECT_EQ(1, statusRunning.get().container_status().network_infos().size());
-  EXPECT_TRUE(
-      statusRunning.get().container_status().network_infos(0).has_ip_address());
+  EXPECT_EQ(1, statusRunning.get().container_status().network_infos(0).ip_addresses().size()); // NOLINT(whitespace/line_length)
 
   ASSERT_TRUE(exists(docker, slaveId, containerId.get()));
 
@@ -1139,11 +1145,6 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_Recover)
       Owned<ContainerLogger>(logger.get()),
       docker);
 
-  Future<string> stoppedContainer;
-  EXPECT_CALL(*mockDocker, stop(_, _, _))
-    .WillOnce(DoAll(FutureArg<0>(&stoppedContainer),
-                    Return(Nothing())));
-
   SlaveID slaveId;
   slaveId.set_value("s1");
   ContainerID containerId;
@@ -1171,16 +1172,15 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_Recover)
   CommandInfo commandInfo;
   commandInfo.set_value("sleep 1000");
 
-  Future<Nothing> d1 =
-    docker->run(
-        containerInfo,
-        commandInfo,
-        container1,
-        flags.work_dir,
-        flags.sandbox_directory,
-        resources);
+  docker->run(
+      containerInfo,
+      commandInfo,
+      container1,
+      flags.work_dir,
+      flags.sandbox_directory,
+      resources);
 
-  Future<Nothing> d2 =
+  Future<Option<int>> orphanRun =
     docker->run(
         containerInfo,
         commandInfo,
@@ -1236,7 +1236,143 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_Recover)
 
   AWAIT_FAILED(dockerContainerizer.wait(reapedContainerId));
 
-  AWAIT_EQ(inspect.get().id, stoppedContainer);
+  // Expect the orphan to be stopped!
+  AWAIT_READY(orphanRun);
+  ASSERT_SOME(orphanRun.get());
+  EXPECT_TRUE(WIFEXITED(orphanRun->get())) << orphanRun->get();
+  EXPECT_EQ(128 + SIGKILL, WEXITSTATUS(orphanRun->get())) << orphanRun->get();
+}
+
+
+// This test ensures that orphaned docker containers unknown to the current
+// agent instance are properly cleaned up.
+TEST_F(DockerContainerizerTest, ROOT_DOCKER_KillOrphanContainers)
+{
+  MockDocker* mockDocker =
+    new MockDocker(tests::flags.docker, tests::flags.docker_socket);
+
+  Shared<Docker> docker(mockDocker);
+
+  slave::Flags flags = CreateSlaveFlags();
+
+  Fetcher fetcher;
+
+  Try<ContainerLogger*> logger =
+    ContainerLogger::create(flags.container_logger);
+
+  ASSERT_SOME(logger);
+
+  MockDockerContainerizer dockerContainerizer(
+      flags,
+      &fetcher,
+      Owned<ContainerLogger>(logger.get()),
+      docker);
+
+  SlaveID slaveId;
+  slaveId.set_value("s1");
+
+  SlaveID oldSlaveId;
+  oldSlaveId.set_value("old-agent-id");
+
+  ContainerID containerId;
+  containerId.set_value(UUID::random().toString());
+
+  ContainerID orphanContainerId;
+  orphanContainerId.set_value(UUID::random().toString());
+
+  string container1 = containerName(slaveId, containerId);
+
+  // Start the orphan container with the old slave id.
+  string container2 = containerName(oldSlaveId, orphanContainerId);
+
+  // Clean up artifacts if containers still exists.
+  ASSERT_TRUE(docker->rm(container1, true).await(Seconds(30)));
+  ASSERT_TRUE(docker->rm(container2, true).await(Seconds(30)));
+
+  Resources resources = Resources::parse("cpus:1;mem:512").get();
+
+  ContainerInfo containerInfo;
+  containerInfo.set_type(ContainerInfo::DOCKER);
+
+  // TODO(tnachen): Use local image to test if possible.
+  ContainerInfo::DockerInfo dockerInfo;
+  dockerInfo.set_image("alpine");
+
+  containerInfo.mutable_docker()->CopyFrom(dockerInfo);
+
+  CommandInfo commandInfo;
+  commandInfo.set_value("sleep 1000");
+
+  docker->run(
+      containerInfo,
+      commandInfo,
+      container1,
+      flags.work_dir,
+      flags.sandbox_directory,
+      resources);
+
+  Future<Option<int>> orphanRun =
+    docker->run(
+        containerInfo,
+        commandInfo,
+        container2,
+        flags.work_dir,
+        flags.sandbox_directory,
+        resources);
+
+  ASSERT_TRUE(
+    exists(docker, slaveId, containerId, ContainerState::RUNNING));
+
+  ASSERT_TRUE(
+    exists(docker, oldSlaveId, orphanContainerId, ContainerState::RUNNING));
+
+  SlaveState slaveState;
+  slaveState.id = slaveId;
+
+  FrameworkState frameworkState;
+
+  ExecutorID execId;
+  execId.set_value("e1");
+
+  ExecutorState execState;
+  ExecutorInfo execInfo;
+
+  execState.info = execInfo;
+  execState.latest = containerId;
+
+  Try<process::Subprocess> wait =
+    process::subprocess(tests::flags.docker + " wait " + container1);
+
+  ASSERT_SOME(wait);
+
+  FrameworkID frameworkId;
+
+  RunState runState;
+  runState.id = containerId;
+  runState.forkedPid = wait.get().pid();
+
+  execState.runs.put(containerId, runState);
+  frameworkState.executors.put(execId, execState);
+
+  slaveState.frameworks.put(frameworkId, frameworkState);
+
+  Future<Nothing> recover = dockerContainerizer.recover(slaveState);
+
+  AWAIT_READY(recover);
+
+  Future<containerizer::Termination> termination =
+    dockerContainerizer.wait(containerId);
+
+  ASSERT_FALSE(termination.isFailed());
+
+  // The orphaned container should be correctly cleaned up.
+  AWAIT_FAILED(dockerContainerizer.wait(orphanContainerId));
+  ASSERT_FALSE(exists(docker, oldSlaveId, orphanContainerId));
+
+  AWAIT_READY(orphanRun);
+  ASSERT_SOME(orphanRun.get());
+  EXPECT_TRUE(WIFEXITED(orphanRun->get())) << orphanRun->get();
+  EXPECT_EQ(128 + SIGKILL, WEXITSTATUS(orphanRun->get())) << orphanRun->get();
 }
 
 
@@ -1367,7 +1503,10 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_LaunchWithPersistentVolumes)
     Megabytes(64),
     "role1",
     "id1",
-    "path1");
+    "path1",
+    None(),
+    None(),
+    frameworkInfo.principal());
 
   TaskInfo task;
   task.set_name("");
@@ -1524,7 +1663,10 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_RecoverPersistentVolumes)
     Megabytes(64),
     "role1",
     "id1",
-    "path1");
+    "path1",
+    None(),
+    None(),
+    frameworkInfo.principal());
 
   TaskInfo task;
   task.set_name("");
@@ -1683,7 +1825,10 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_RecoverOrphanedPersistentVolumes)
     Megabytes(64),
     "role1",
     "id1",
-    "path1");
+    "path1",
+    None(),
+    None(),
+    frameworkInfo.principal());
 
   TaskInfo task;
   task.set_name("");
@@ -2483,7 +2628,7 @@ TEST_F(DockerContainerizerTest, ROOT_DOCKER_SlaveRecoveryTaskContainer)
 // inside the image mesosphere/test-executor does not properly set the
 // executor PID that is uses during registration, so when the new
 // slave recovers it can't reconnect and instead destroys that
-// container. In particular, it uses '0' for it's IP which we properly
+// container. In particular, it uses '0' for its IP which we properly
 // parse and can even properly use for sending other messages, but the
 // current implementation of 'UPID::operator bool()' fails if the IP
 // component of a PID is '0'.

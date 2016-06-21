@@ -167,7 +167,7 @@ public:
           cout << "Received an ACKNOWLEDGED event" << endl;
 
           // Remove the corresponding update.
-          updates.erase(UUID::fromBytes(event.acknowledged().uuid()));
+          updates.erase(UUID::fromBytes(event.acknowledged().uuid()).get());
 
           // Remove the corresponding task.
           tasks.erase(event.acknowledged().task_id());
@@ -186,6 +186,11 @@ public:
 
         case Event::ERROR: {
           cout << "Received an ERROR event" << endl;
+          break;
+        }
+
+        case Event::UNKNOWN: {
+          LOG(WARNING) << "Received an UNKNOWN event and ignored";
           break;
         }
       }
@@ -229,13 +234,15 @@ int main()
 
   value = os::getenv("MESOS_FRAMEWORK_ID");
   if (value.isNone()) {
-    EXIT(1) << "Expecting 'MESOS_FRAMEWORK_ID' to be set in the environment";
+    EXIT(EXIT_FAILURE)
+      << "Expecting 'MESOS_FRAMEWORK_ID' to be set in the environment";
   }
   frameworkId.set_value(value.get());
 
   value = os::getenv("MESOS_EXECUTOR_ID");
   if (value.isNone()) {
-    EXIT(1) << "Expecting 'MESOS_EXECUTOR_ID' to be set in the environment";
+    EXIT(EXIT_FAILURE)
+      << "Expecting 'MESOS_EXECUTOR_ID' to be set in the environment";
   }
   executorId.set_value(value.get());
 

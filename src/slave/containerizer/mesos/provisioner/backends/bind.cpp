@@ -90,7 +90,8 @@ BindBackend::BindBackend(Owned<BindBackendProcess> _process)
 
 Future<Nothing> BindBackend::provision(
     const vector<string>& layers,
-    const string& rootfs)
+    const string& rootfs,
+    const string& backendDir)
 {
   return dispatch(
       process.get(), &BindBackendProcess::provision, layers, rootfs);
@@ -128,7 +129,7 @@ Future<Nothing> BindBackendProcess::provision(
       rootfs,
       None(),
       MS_BIND,
-      NULL);
+      nullptr);
 
   if (mount.isError()) {
     return Failure(
@@ -142,7 +143,7 @@ Future<Nothing> BindBackendProcess::provision(
       rootfs,
       None(),
       MS_BIND | MS_RDONLY | MS_REMOUNT,
-      NULL);
+      nullptr);
 
   if (mount.isError()) {
     return Failure(
@@ -156,7 +157,7 @@ Future<Nothing> BindBackendProcess::provision(
       rootfs,
       None(),
       MS_SLAVE,
-      NULL);
+      nullptr);
 
   if (mount.isError()) {
     return Failure(
@@ -169,7 +170,7 @@ Future<Nothing> BindBackendProcess::provision(
       rootfs,
       None(),
       MS_SHARED,
-      NULL);
+      nullptr);
 
   if (mount.isError()) {
     return Failure(
